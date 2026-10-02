@@ -107,13 +107,19 @@ def _read_meta(slug: str) -> dict[str, Any]:
                             "published": False, "date": "", "description": ""}
     if not path.exists():
         return meta
+    current_key: str | None = None
     for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- ") and current_key == "tags":
+            meta["tags"].append(stripped[2:].strip().strip("'\""))
+            continue
         if ":" not in line:
             continue
         key, _, raw = line.partition(":")
         key, raw = key.strip(), raw.strip()
-        if key == "tags":
-            continue
+        current_key = key
+        if raw == "":
+            continue  # block list or nested value; items handled above
         if raw.startswith("[") and raw.endswith("]"):
             meta[key] = [t.strip().strip("'\"") for t in raw[1:-1].split(",") if t.strip()]
         elif raw.lower() in ("true", "false"):
