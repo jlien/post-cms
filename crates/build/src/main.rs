@@ -101,10 +101,11 @@ fn main() -> Result<()> {
     render_rss(&root, &dist, &posts)?;
     render_sitemap(&root, &dist, &posts)?;
     render_robots(&dist)?;
+    render_llms_txt(&root, &dist, &posts)?;
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
-        "built dist/: {} posts ({} drafts skipped), index, 404, rss.xml, sitemap.xml, robots.txt",
+        "built dist/: {} posts ({} drafts skipped), index, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
         posts.len() - drafts,
         drafts
     );
@@ -279,6 +280,32 @@ fn render_robots(dist: &Path) -> Result<()> {
         "User-agent: *\nAllow: /\nSitemap: /sitemap.xml\n",
     )
     .context("write robots.txt")?;
+    Ok(())
+}
+
+/// llms.txt (https://llmstxt.org): a markdown index so LLM clients can
+/// discover the site's content without crawling HTML. Published posts only.
+fn render_llms_txt(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+    let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
+    let site_base = site_base_url(root);
+    let mut out = String::new();
+    out.push_str("# Post-CMS\n\n");
+    out.push_str(
+        "> A git-based publishing stack: content as files, static Rust build, \
+         no CMS. This file is a machine-readable index of all published posts.\n\n",
+    );
+    out.push_str("## Posts\n\n");
+    for post in published {
+        out.push_str(&format!(
+            "- [{title}]({base}{path}): {desc} ({date})\n",
+            title = post.meta.title,
+            base = site_base,
+            path = post.url_path(),
+            desc = post.meta.description,
+            date = post.meta.date,
+        ));
+    }
+    fs::write(dist.join("llms.txt"), out).context("write llms.txt")?;
     Ok(())
 }
 

@@ -1,0 +1,9 @@
+title: "Caching: The Only Metric That Matters"
+slug: "caching-strategy"
+tags:
+  - cdn
+  - performance
+lang: en
+published: true
+date: 2026-09-25
+description: "Static HTML, aggressive Cache-Control headers, and a purge hook on every merge."

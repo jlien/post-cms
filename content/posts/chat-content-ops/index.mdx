@@ -1,0 +1,35 @@
+---
+title: "Content Ops Through a Chat Window"
+slug: "chat-content-ops"
+tags:
+  - mcp
+  - workflow
+lang: en
+published: true
+date: 2026-09-23
+description: "The Slack thread is the editorial calendar. The agent is the workflow engine."
+---
+
+Every CMS feature you'd pay for collapses into a prompt when the agent has
+tool access. Here's the entire editorial workflow for this site:
+
+## Drafting
+
+A writer (or the agent itself) says: *draft a post about X from this
+recording.* The agent calls `create_draft`, which writes a `meta.yaml` +
+`index.mdx` pair with `published: false` and commits it to git.
+
+## Review
+
+The reviewer sees a rendered HTML artifact — the real page, not a CMS
+simulation. Feedback lands in the thread: *tighten the intro, fix the
+stat.* The agent patches the files and re-renders.
+
+## Publish
+
+The publish gate is a human confirm on an idempotent tool call. Approve →
+`published: true` → build → deploy hook → CDN purge. The Slack thread *is*
+the audit trail: timestamped, attributed, permanent.
+
+> The CMS was never a product. It was a bundle of UI over a database.
+> Chat + tools replaces the UI; git keeps the database.

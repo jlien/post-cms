@@ -1,0 +1,39 @@
+---
+title: "Caching: The Only Metric That Matters"
+slug: "caching-strategy"
+tags:
+  - cdn
+  - performance
+lang: en
+published: true
+date: 2026-09-25
+description: "Static HTML, aggressive Cache-Control headers, and a purge hook on every merge."
+---
+
+Once rendering is a build step instead of a request handler, your server's
+job is to be *boring*. The CDN does the actual work.
+
+## Header policy
+
+| Content type | Cache-Control |
+|---|---|
+| HTML pages | `public, max-age=300, s-maxage=3600` |
+| CSS / assets | `public, max-age=31536000, immutable` (content-hashed) |
+| RSS / sitemap | `public, max-age=900` |
+
+## The purge loop
+
+The one real risk in a static-first stack is **stale pages after a
+frequent publishes**. The fix is a 20-line webhook:
+
+1. Agent merges the publish PR.
+2. CI builds `dist/` and rsyncs to the origin.
+3. A `purge.sh` call clears the CDN's HTML cache.
+
+Miss that step and reviewers see yesterday's site. It has to exist from
+day one — but it's a script, not a platform feature.
+
+## Result
+
+99%+ of requests never reach the origin. The $5 VPS could be a Raspberry
+Pi in a closet and nobody would notice.

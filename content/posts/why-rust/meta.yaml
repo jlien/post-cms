@@ -1,0 +1,9 @@
+title: "Why Rust for the Origin Server"
+slug: "why-rust"
+tags:
+  - rust
+  - architecture
+lang: en
+published: true
+date: 2026-09-21
+description: "A tiny Axum binary, ~10MB RSS, and p99 latency that doesn't move under load."

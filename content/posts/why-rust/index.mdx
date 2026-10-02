@@ -1,0 +1,36 @@
+---
+title: "Why Rust for the Origin Server"
+slug: "why-rust"
+tags:
+  - rust
+  - architecture
+lang: en
+published: true
+date: 2026-09-21
+description: "A tiny Axum binary, ~10MB RSS, and p99 latency that doesn't move under load."
+---
+
+The origin server for this site is a single Rust binary built on Axum. It
+serves HTML, RSS, and a sitemap — and under normal traffic it idles near
+zero CPU, because almost everything is cached at the CDN edge.
+
+## The numbers that matter
+
+- **Footprint:** ~10–50MB resident, versus 200MB–1GB for a Node process.
+- **Cold start:** milliseconds. A crashed server is back before your
+  monitoring notices.
+- **P99 latency:** flat. No GC pauses, no event-loop head-of-line blocking.
+
+## What you give up
+
+You rebuild some things the Node ecosystem hands you for free:
+
+1. Image optimization — solved at *build time* with `libvips`, not at runtime.
+2. Incremental caching — solved by making everything static and cacheable.
+3. React hydration — deliberately absent. The site ships no client JS.
+
+## The punchline
+
+For a content site, the language barely matters *if you architect correctly*.
+Static output plus a CDN means the origin sees 1–5% of traffic. Rust just
+makes that residual slice essentially free.

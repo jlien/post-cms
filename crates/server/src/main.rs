@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
         .route("/rss.xml", get(rss))
         .route("/sitemap.xml", get(sitemap))
         .route("/robots.txt", get(robots))
+        .route("/llms.txt", get(llms_txt))
         .route("/posts/{slug}", get(post_page))
         .fallback(get(not_found_handler))
         .with_state(state);
@@ -151,6 +152,12 @@ async fn robots(
     axum::extract::State(StaticDir(root)): axum::extract::State<StaticDir>,
 ) -> Response {
     file_response(&root.join("robots.txt"), "text/plain", XML_CACHE_CONTROL)
+}
+
+async fn llms_txt(
+    axum::extract::State(StaticDir(root)): axum::extract::State<StaticDir>,
+) -> Response {
+    file_response(&root.join("llms.txt"), "text/plain", XML_CACHE_CONTROL)
 }
 
 async fn post_page(
