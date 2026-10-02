@@ -1,0 +1,10 @@
+title: "The Media Pipeline: Binaries Live Elsewhere"
+slug: "media-pipeline"
+tags: 
+  - media
+  - r2
+  - architecture
+lang: "en"
+published: false
+date: "2026-10-02"
+description: "Images, video, and audio upload to an S3-compatible bucket at publish time; git stays text-only."
