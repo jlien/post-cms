@@ -1,21 +1,17 @@
-title: About
-slug: about
-description: What this site is and how it works.
-published: true
----
-
 This site is built with **Post-CMS** — a git-based publishing stack.
 
-There is no CMS database and no hosting platform in the middle: every page you
-are reading started as a markdown file in a git repository. A small Rust build
-crate compiles the markdown to static HTML, inlines a Tailwind theme, and
-deploys plain files.
+There is no CMS database and no hosted platform. Posts and pages are files in a
+git repository; a Rust crate builds them to static HTML; an MCP server handles
+content operations and commits every mutation.
 
-What that buys:
+What that buys you:
 
-- **Speed** — static HTML, one inline stylesheet, zero JavaScript.
-- **Ownership** — content lives in git; leave any time with `git clone`.
-- **Durability** — no plugin rot, no PHP to patch, no database to back up.
+- **Ownership.** The content is a git repo — forkable, greppable, diffable.
+- **Speed.** Static HTML with inlined, minified CSS. No runtime, no plugins.
+- **Cost.** Static files on any host, media on object storage. No per-seat
+  pricing, no hosting tiers.
+- **AI-friendly.** The whole stack is text an agent can read and edit — this
+  page included.
 
-If you want to change something, edit a file and commit. That is the whole
-workflow.
+Want the details? Every post under [the blog](/blog/) was written, built, and
+published through the same pipeline you are reading right now.

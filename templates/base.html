@@ -8,7 +8,7 @@
   <title>{% block title %}{{ site_title }}{% endblock %}</title>
   <style>{{ style | safe }}</style>
 </head>
-<body class="min-h-screen bg-bg text-fg font-sans leading-relaxed">
+<body class="min-h-screen flex flex-col bg-bg text-fg font-sans leading-relaxed">
   <header class="border-b border-line px-5 py-4 flex justify-between items-center">
     <a href="/" class="text-fg no-underline font-semibold">{{ site_title }}</a>
     <nav class="text-sm">
@@ -18,7 +18,7 @@
       <a href="/contact/" class="text-muted hover:text-fg no-underline ml-4">Contact</a>
     </nav>
   </header>
-  <main class="max-w-2xl mx-auto px-5 pt-10 pb-16">
+  <main class="flex-1 w-full max-w-2xl mx-auto px-5 pt-10 pb-16">
     {% block content %}{% endblock %}
   </main>
   <footer class="border-t border-line text-center px-5 py-6 text-sm">
