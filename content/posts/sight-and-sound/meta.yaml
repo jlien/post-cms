@@ -4,6 +4,6 @@ tags:
   - media
   - html
 lang: "en"
-published: false
+published: true
 date: "2026-10-02"
 description: "Native video and audio elements, no client JS, no plugin — just URLs from the bucket."
