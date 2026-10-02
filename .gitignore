@@ -3,3 +3,5 @@ dist/
 deploy-target/
 ci/purge.log
 .DS_Store
+.minio-data/
+mcp/__pycache__/

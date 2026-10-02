@@ -84,6 +84,23 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "add_media",
+        "description": (
+            "Upload a binary file (image/video/audio/pdf) to the media bucket at "
+            "upload-time with resized variants for images; returns markdown/HTML "
+            "snippets to embed in a post. Binaries never go in git."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Post slug to namespace media under."},
+                "file_path": {"type": "string", "description": "Local path of the file to upload."},
+                "alt": {"type": "string", "description": "Alt text / link label."},
+            },
+            "required": ["slug", "file_path"],
+        },
+    },
+    {
         "name": "publish_status",
         "description": "Counts and lists of live vs pending (draft) posts.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -282,12 +299,23 @@ def tool_publish_status(_args: dict[str, Any]) -> dict[str, Any]:
             "pending": {"count": len(pending), "posts": pending}}
 
 
+def tool_add_media(args: dict[str, Any]) -> dict[str, Any]:
+    import media as media_mod
+
+    if not _post_dir(args["slug"]).is_dir():
+        raise ValueError(f"post not found: {args['slug']} (create the draft first)")
+    return media_mod.add_media(
+        args["slug"], args["file_path"], args.get("alt", "")
+    )
+
+
 HANDLERS = {
     "list_posts": tool_list_posts,
     "get_post": tool_get_post,
     "create_draft": tool_create_draft,
     "update_post": tool_update_post,
     "build_site": tool_build_site,
+    "add_media": tool_add_media,
     "publish_status": tool_publish_status,
 }
 
