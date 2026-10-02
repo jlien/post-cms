@@ -1,0 +1,9 @@
+title: "This Architecture: Files In, HTML Out"
+slug: "this-architecture"
+tags:
+  - architecture
+  - git
+lang: en
+published: true
+date: 2026-09-25
+description: "How the Post-CMS pipeline turns git content into a static origin served behind a simulated CDN."

@@ -1,0 +1,39 @@
+---
+title: "This Architecture: Files In, HTML Out"
+slug: "this-architecture"
+tags:
+  - architecture
+  - git
+lang: en
+published: true
+date: 2026-09-25
+description: "How the Post-CMS pipeline turns git content into a static origin served behind a simulated CDN."
+---
+
+# This Architecture: Files In, HTML Out
+
+The stack has four moving parts, none of which is a CMS:
+
+```text
+git (content) → build (Rust) → dist/ → origin (axum) → CDN (simulated)
+```
+
+## The build step
+
+`cargo run -p build` walks `content/posts/`, parses `meta.yaml` + `index.mdx`,
+and emits plain HTML, an RSS feed, a sitemap, and `robots.txt` into `dist/`.
+Deterministic input, deterministic output — the same tree always renders the
+same bytes.
+
+## The origin
+
+A tiny axum server serves `dist/` with strict `Cache-Control` headers. HTML is
+marked `max-age=0, s-maxage=86400, stale-while-revalidate=604800`: browsers
+revalidate, but the CDN edge caches for a day and can serve stale while it
+refetches.
+
+## The agent layer
+
+An MCP server speaks JSON-RPC over stdio. Tools operate on content files and
+shell out to `cargo run -p build`. Every mutation is a git commit, so the
+audit log *is* the repo history.

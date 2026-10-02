@@ -1,0 +1,32 @@
+---
+title: "Static-First Rendering"
+slug: "static-first-rendering"
+tags:
+  - rendering
+  - performance
+lang: en
+published: true
+date: 2026-09-28
+description: "Why rendering once at build time beats rendering per request, and what it costs."
+---
+
+# Static-First Rendering
+
+Render at build time, not request time. A request that touches no compute is
+the cheapest request there is.
+
+## The trade
+
+Static output means anything per-user has to move: no personalized snippets,
+no server-side sessions. What you get back is trivial caching, negligible
+origin load, and pages that keep working when the backend is down.
+
+## Practice
+
+In this stack, the cost of "dynamic" is a rebuild: edit a file, run
+`cargo run -p build`, and the origin picks up the new `dist/` on the next
+request. For a publication cadence measured in minutes, not milliseconds,
+that trade is easy to win.
+
+Styling is inlined and content-hashed, so each page is fully self-contained:
+system fonts, no external CSS, no third-party requests.

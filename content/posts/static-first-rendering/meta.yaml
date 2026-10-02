@@ -1,0 +1,9 @@
+title: "Static-First Rendering"
+slug: "static-first-rendering"
+tags:
+  - rendering
+  - performance
+lang: en
+published: true
+date: 2026-09-28
+description: "Why rendering once at build time beats rendering per request, and what it costs."

@@ -1,0 +1,9 @@
+title: "Welcome to Post-CMS"
+slug: "welcome"
+tags:
+  - meta
+  - welcome
+lang: en
+published: true
+date: 2026-09-20
+description: "An introduction to a git-based publishing stack with no CMS in sight."

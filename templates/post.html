@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Post-CMS{% endblock %}
+{% block content %}
+<article>
+  <h1>{{ title }}</h1>
+  <p class="meta">
+    {{ date }} · lang: {{ lang }}
+    <span class="tags">{% for tag in tags %}<span class="tag">{{ tag }}</span>{% endfor %}</span>
+  </p>
+  {{ body | safe }}
+</article>
+{% endblock %}

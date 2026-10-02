@@ -1,0 +1,17 @@
+# Welcome to Post-CMS
+
+This site has no database, no admin UI, and no CMS. Every post you see is a
+pair of files in a git repository: a `meta.yaml` describing it and an
+`index.mdx` holding the body.
+
+## Why files?
+
+Files are the most durable CMS ever invented. They diff cleanly, they review
+like code, and they survive platform migrations intact. Git gives us history,
+branches, and rollbacks for free.
+
+## What can an agent do here?
+
+Everything. A small MCP tool server exposes `create_draft`, `update_post`,
+`build_site`, and `publish_status` — so an AI assistant can draft, edit, and
+build the site on your behalf, while you keep the publish gate.
