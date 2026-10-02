@@ -4,7 +4,7 @@
 /* Theme font — SIL OFL, see assets/fonts/LICENSE-OFL.txt */
 @font-face {
   font-family: "Source Sans 3";
-  src: url("/assets/sydney/fonts/sourcesans3.ttf") format("truetype");
+  src: url("/assets/sydney/fonts/sourcesans3.woff2") format("woff2");
   font-weight: 200 900;
   font-style: normal;
   font-display: swap;

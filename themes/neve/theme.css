@@ -4,7 +4,7 @@
 /* Theme font — SIL OFL, see assets/fonts/LICENSE-OFL.txt */
 @font-face {
   font-family: "Open Sans";
-  src: url("/assets/neve/fonts/opensans.ttf") format("truetype");
+  src: url("/assets/neve/fonts/opensans.woff2") format("woff2");
   font-weight: 300 800;
   font-style: normal;
   font-display: swap;

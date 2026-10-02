@@ -5,7 +5,7 @@
 /* Theme font — SIL OFL, see assets/fonts/LICENSE-OFL.txt */
 @font-face {
   font-family: "Inter";
-  src: url("/assets/default/fonts/inter.ttf") format("truetype");
+  src: url("/assets/default/fonts/inter.woff2") format("woff2");
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
