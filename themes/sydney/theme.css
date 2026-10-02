@@ -1,6 +1,16 @@
 /* Sydney port — business feel, strong dark headings, warm coral accent (approx.). */
 @import "tailwindcss";
 
+/* Theme font — SIL OFL, see assets/fonts/LICENSE-OFL.txt */
+@font-face {
+  font-family: "Source Sans 3";
+  src: url("/assets/sydney/fonts/sourcesans3.ttf") format("truetype");
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+
 @theme {
   --color-bg: #ffffff;
   --color-fg: #474747;
@@ -10,7 +20,7 @@
   --color-accent: #d64a52;
   --color-heading: #1c1c1c;
   --color-card: #f4f4f4;
-  --font-sans: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', sans-serif;
+  --font-sans: 'Source Sans 3', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
 /* Markdown body styling — same contract as the default theme. */

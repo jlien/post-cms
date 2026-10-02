@@ -6,6 +6,7 @@
   <!-- Cache-Control guidance: serve this HTML with `Cache-Control: public, max-age=0, s-maxage=86400, stale-while-revalidate=604800` -->
   <!-- css-sha256: {{ css_hash }} -->
   <title>{% block title %}{{ site_title }}{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/{{ theme }}/images/favicon.svg">
   <style>{{ style | safe }}</style>
 </head>
 <body class="min-h-screen flex flex-col bg-bg text-fg font-sans leading-relaxed">

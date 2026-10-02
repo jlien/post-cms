@@ -123,6 +123,7 @@ impl SiteConfig {
         ctx.insert("css_hash", &style.hash);
         ctx.insert("style", &style.css);
         ctx.insert("site_title", &self.title);
+        ctx.insert("theme", &style.theme);
         ctx.insert("lang", "en");
         ctx
     }
@@ -206,7 +207,10 @@ fn main() -> Result<()> {
     let styling = Styling {
         css: style,
         hash: css_hash,
+        theme: theme_name.clone(),
     };
+    // Theme asset kit (fonts, icons, images) → dist/assets/<theme>/
+    copy_theme_assets(&theme_dir, &dist, &theme_name)?;
 
     let cfg = SiteConfig::load(&root);
     let posts = load_posts(&root.join("content/posts"))?;
@@ -242,6 +246,32 @@ fn main() -> Result<()> {
 struct Styling {
     css: String,
     hash: String,
+    theme: String,
+}
+
+/// Recursively copy themes/<name>/assets/ → dist/assets/<name>/.
+/// Missing assets dir is fine (themes are not required to ship assets).
+fn copy_theme_assets(theme_dir: &Path, dist: &Path, theme: &str) -> Result<()> {
+    let src = theme_dir.join("assets");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let dst_root = dist.join("assets").join(theme);
+    fn walk(src: &Path, dst: &Path) -> Result<()> {
+        fs::create_dir_all(dst).with_context(|| format!("mkdir {}", dst.display()))?;
+        for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                walk(&from, &to)?;
+            } else {
+                fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
+            }
+        }
+        Ok(())
+    }
+    walk(&src, &dst_root)
 }
 
 fn read_site_theme(root: &Path) -> Option<String> {

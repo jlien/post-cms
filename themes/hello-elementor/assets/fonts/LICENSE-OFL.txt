@@ -1,0 +1,4 @@
+Roboto — Copyright (c) The Roboto Project Authors
+Licensed under the SIL Open Font License, Version 1.1
+https://openfontlicense.org — https://github.com/google/fonts
+This font file is shipped unmodified from the google/fonts repository.

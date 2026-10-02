@@ -2,6 +2,16 @@
    only the token values differ — that's the whole point of the plugin system. */
 @import "tailwindcss";
 
+/* Theme font — SIL OFL, see assets/fonts/LICENSE-OFL.txt */
+@font-face {
+  font-family: "Lora";
+  src: url("/assets/paper/fonts/lora.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+
 @theme {
   --color-bg: #faf8f3;
   --color-fg: #2b2a27;
@@ -11,7 +21,7 @@
   --color-accent: #8a5a2b;
   --color-heading: #1d1c19;
   --color-card: #f1ede4;
-  --font-sans: Georgia, "Times New Roman", serif;
+  --font-sans: 'Lora', Georgia, 'Times New Roman', serif;
 }
 
 @layer components {
