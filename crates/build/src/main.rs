@@ -79,25 +79,59 @@ fn main() -> Result<()> {
     }
     fs::create_dir_all(&dist).with_context(|| format!("mkdir {}", dist.display()))?;
 
+    // ---- theme plugin system -------------------------------------------
+    // Priority: SITE_THEME env > site.yaml `theme:` > "default".
+    let theme_name = std::env::var("SITE_THEME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_site_theme(&root))
+        .unwrap_or_else(|| "default".to_string());
+    let theme_dir = root.join("themes").join(&theme_name);
+    if !theme_dir.is_dir() {
+        bail!(
+            "theme {:?} not found under themes/ (available: {:?})",
+            theme_name,
+            available_themes(&root)
+        );
+    }
     let templates_dir = root.join("templates");
-    let tera = Tera::new(
+    let mut tera = Tera::new(
         templates_dir
             .join("**/*.html")
             .to_str()
             .context("templates path is not valid UTF-8")?,
     )
     .context("failed to compile templates")?;
-
-    let css_hash = hash_file(&templates_dir.join("base.html"))?;
+    // Theme template overrides win over the repo defaults.
+    let theme_templates = theme_dir.join("templates");
+    if theme_templates.is_dir() {
+        for entry in fs::read_dir(&theme_templates)
+            .with_context(|| format!("read_dir {}", theme_templates.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .context("theme template file name is not valid UTF-8")?
+                    .to_string();
+                tera.add_template_file(&path, Some(&name))
+                    .with_context(|| format!("load theme template {}", path.display()))?;
+            }
+        }
+    }
+    let style = compile_theme_css(&root, &theme_dir, &theme_name)?;
+    let css_hash = sha256_hex(style.as_bytes());
+    let styling = Styling { css: style, hash: css_hash };
 
     let posts = load_posts(&root.join("content/posts"))?;
     if posts.is_empty() {
         bail!("no posts found under content/posts");
     }
 
-    render_posts(&tera, &dist, &posts, &css_hash)?;
-    render_index(&tera, &dist, &posts, &css_hash)?;
-    render_404(&tera, &dist, &css_hash)?;
+    render_posts(&tera, &dist, &posts, &styling)?;
+    render_index(&tera, &dist, &posts, &styling)?;
+    render_404(&tera, &dist, &styling)?;
     render_rss(&root, &dist, &posts)?;
     render_sitemap(&root, &dist, &posts)?;
     render_robots(&dist)?;
@@ -105,11 +139,87 @@ fn main() -> Result<()> {
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
-        "built dist/: {} posts ({} drafts skipped), index, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
+        "built dist/: {} posts ({} drafts skipped), theme={:?}, index, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
         posts.len() - drafts,
-        drafts
+        drafts,
+        theme_name
     );
     Ok(())
+}
+
+/// Compiled CSS + its content hash, threaded through every render step.
+struct Styling {
+    css: String,
+    hash: String,
+}
+
+fn read_site_theme(root: &Path) -> Option<String> {
+    let raw = fs::read_to_string(root.join("site.yaml")).ok()?;
+    let val: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    val.get("theme")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn available_themes(root: &Path) -> Vec<String> {
+    let dir = root.join("themes");
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Compile the theme CSS with the Tailwind CLI (`@import "tailwindcss"` +
+/// @theme tokens + component layers). Falls back to inlining the raw CSS if
+/// the CLI is missing or fails, so a build never hard-fails on styling.
+fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<String> {
+    let input = theme_dir.join("theme.css");
+    let raw = fs::read_to_string(&input)
+        .with_context(|| format!("read {}", input.display()))?;
+    let output = std::env::temp_dir().join(format!("postcms-theme-{}.css", theme));
+    let res = std::process::Command::new("tailwindcss")
+        .arg("-i")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--minify")
+        .current_dir(root) // v4 auto-detects template content from cwd
+        .output();
+    match res {
+        Ok(o) if o.status.success() && output.exists() => {
+            let compiled = fs::read_to_string(&output)
+                .with_context(|| format!("read {}", output.display()))?;
+            if compiled.trim().is_empty() {
+                eprintln!("warning: tailwindcss produced empty CSS; inlining raw theme.css");
+                return Ok(raw);
+            }
+            eprintln!(
+                "theme {:?}: tailwindcss minified {} → {} bytes",
+                theme,
+                raw.len(),
+                compiled.len()
+            );
+            Ok(compiled)
+        }
+        _ => {
+            let why = match res {
+                Ok(o) => format!("exit {}", o.status),
+                Err(e) => format!("{e}"),
+            };
+            eprintln!(
+                "warning: tailwindcss CLI unavailable ({why}); inlining raw theme.css"
+            );
+            Ok(raw)
+        }
+    }
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -166,12 +276,7 @@ fn render_markdown(input: &str) -> Result<String> {
     Ok(out)
 }
 
-fn render_posts(
-    tera: &Tera,
-    dist: &Path,
-    posts: &[Post],
-    css_hash: &str,
-) -> Result<()> {
+fn render_posts(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Result<()> {
     for post in posts {
         // Drafts are invisible on the site: no HTML page is emitted until
         // published flips to true (see agents/CONVENTIONS.md).
@@ -182,7 +287,8 @@ fn render_posts(
             .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
         let body = render_markdown(&md)?;
         let mut ctx = post.meta.to_context(&body);
-        ctx.insert("css_hash", css_hash);
+        ctx.insert("css_hash", &style.hash);
+        ctx.insert("style", &style.css);
         let html = tera
             .render("post.html", &ctx)
             .context("render post.html")?;
@@ -195,7 +301,7 @@ fn render_posts(
     Ok(())
 }
 
-fn render_index(tera: &Tera, dist: &Path, posts: &[Post], css_hash: &str) -> Result<()> {
+fn render_index(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Result<()> {
     let listed: Vec<serde_json::Value> = posts
         .iter()
         .filter(|p| p.meta.published)
@@ -203,16 +309,18 @@ fn render_index(tera: &Tera, dist: &Path, posts: &[Post], css_hash: &str) -> Res
         .collect();
     let mut ctx = TeraContext::new();
     ctx.insert("posts", &listed);
-    ctx.insert("css_hash", css_hash);
+    ctx.insert("css_hash", &style.hash);
+    ctx.insert("style", &style.css);
     ctx.insert("lang", "en");
     let html = tera.render("index.html", &ctx).context("render index.html")?;
     fs::write(dist.join("index.html"), html).context("write index.html")?;
     Ok(())
 }
 
-fn render_404(tera: &Tera, dist: &Path, css_hash: &str) -> Result<()> {
+fn render_404(tera: &Tera, dist: &Path, style: &Styling) -> Result<()> {
     let mut ctx = TeraContext::new();
-    ctx.insert("css_hash", css_hash);
+    ctx.insert("css_hash", &style.hash);
+    ctx.insert("style", &style.css);
     ctx.insert("lang", "en");
     let html = tera.render("404.html", &ctx).context("render 404.html")?;
     fs::write(dist.join("404.html"), html).context("write 404.html")?;
@@ -324,12 +432,6 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-/// SHA-256 hex digest of a file, used as the content-hash CSS marker.
-fn hash_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(sha256_hex(&bytes))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

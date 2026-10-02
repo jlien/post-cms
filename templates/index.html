@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Post-CMS{% endblock %}
 {% block content %}
-<h1>Latest posts</h1>
-<ul class="posts">
+<h1 class="text-3xl font-bold text-heading leading-tight">Latest posts</h1>
+<ul class="list-none p-0 mt-8 space-y-6">
   {% for post in posts %}
   <li>
-    <a href="/posts/{{ post.slug }}">{{ post.title }}</a>
-    <span class="date">· {{ post.date }}</span>
-    <p class="desc">{{ post.description }}</p>
+    <a href="/posts/{{ post.slug }}" class="text-accent">{{ post.title }}</a>
+    <span class="text-xs text-faint">· {{ post.date }}</span>
+    <p class="text-muted mt-1">{{ post.description }}</p>
   </li>
   {% endfor %}
 </ul>

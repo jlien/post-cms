@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- css-sha256: {{ css_hash }} -->
+  <title>{% block title %}Post-CMS{% endblock %}</title>
+  <style>{{ style | safe }}</style>
+</head>
+<body class="min-h-screen bg-bg text-fg font-sans leading-relaxed">
+  <header class="text-center pt-12 pb-6 border-b border-line px-5">
+    <a href="/" class="text-heading no-underline text-2xl font-bold tracking-wide">Post-CMS</a>
+    <nav class="mt-2 text-sm">
+      <a href="/rss.xml" class="text-muted hover:text-fg no-underline">RSS</a>
+      <span class="text-faint mx-2">·</span>
+      <a href="/sitemap.xml" class="text-muted hover:text-fg no-underline">Sitemap</a>
+    </nav>
+  </header>
+  <main class="max-w-2xl mx-auto px-5 pt-10 pb-16">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="border-t border-line text-muted text-center px-5 py-6 text-sm italic">Set in serif · built from git</footer>
+</body>
+</html>

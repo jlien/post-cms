@@ -2,11 +2,11 @@
 {% block title %}{{ title }} — Post-CMS{% endblock %}
 {% block content %}
 <article>
-  <h1>{{ title }}</h1>
-  <p class="meta">
+  <h1 class="text-3xl font-bold text-heading leading-tight">{{ title }}</h1>
+  <p class="text-muted text-sm mb-8 mt-2">
     {{ date }} · lang: {{ lang }}
-    <span class="tags">{% for tag in tags %}<span class="tag">{{ tag }}</span>{% endfor %}</span>
+    <span>{% for tag in tags %}<span class="inline-block bg-card border border-line rounded-full px-2.5 text-xs text-muted mr-1.5">{{ tag }}</span>{% endfor %}</span>
   </p>
-  {{ body | safe }}
+  <div class="prose">{{ body | safe }}</div>
 </article>
 {% endblock %}

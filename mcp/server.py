@@ -101,6 +101,20 @@ TOOLS = [
         },
     },
     {
+        "name": "set_theme",
+        "description": (
+            "Switch the active theme (a directory under themes/), writes site.yaml, "
+            "and rebuilds. Returns the new theme and available themes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "theme": {"type": "string", "description": "Theme name, e.g. 'default' or 'paper'."},
+            },
+            "required": ["theme"],
+        },
+    },
+    {
         "name": "publish_status",
         "description": "Counts and lists of live vs pending (draft) posts.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -309,6 +323,25 @@ def tool_add_media(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def tool_set_theme(args: dict[str, Any]) -> dict[str, Any]:
+    theme = args["theme"]
+    themes_dir = ROOT / "themes"
+    available = sorted(p.name for p in themes_dir.iterdir() if p.is_dir()) if themes_dir.is_dir() else []
+    if theme not in available:
+        raise ValueError(f"unknown theme {theme!r}; available: {available}")
+    site_cfg = ROOT / "site.yaml"
+    if site_cfg.exists():
+        lines = [ln for ln in site_cfg.read_text().splitlines()
+                 if not ln.strip().startswith("theme:")]
+    else:
+        lines = []
+    lines.append(f"theme: {theme}")
+    site_cfg.write_text("\n".join(lines) + "\n")
+    git_commit(f"theme: switch to {theme}")
+    build = tool_build_site({})
+    return {"theme": theme, "available": available, "build": build}
+
+
 HANDLERS = {
     "list_posts": tool_list_posts,
     "get_post": tool_get_post,
@@ -316,6 +349,7 @@ HANDLERS = {
     "update_post": tool_update_post,
     "build_site": tool_build_site,
     "add_media": tool_add_media,
+    "set_theme": tool_set_theme,
     "publish_status": tool_publish_status,
 }
 
