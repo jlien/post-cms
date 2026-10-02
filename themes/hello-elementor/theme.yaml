@@ -1,0 +1,9 @@
+name: hello-elementor
+description: >
+  Port of Hello Elementor (PageSpeed 100 per Hostinger 2026) — deliberately a
+  blank canvas: near-invisible chrome, no decoration, default browser feel.
+  Approximation, not the theme's GPL code.
+source:
+  article: https://www.hostinger.com/tutorials/fastest-wordpress-theme/
+  pagespeed_insights: 100
+  gtmetrix: 99%

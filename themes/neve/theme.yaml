@@ -1,0 +1,9 @@
+name: neve
+description: >
+  Port of Neve's default look (PageSpeed 100 per Hostinger 2026) — the fastest
+  on their list. Minimal white canvas, cool-gray text, GitHub-blue links.
+  Approximation of the theme's customizer defaults, not its GPL code.
+source:
+  article: https://www.hostinger.com/tutorials/fastest-wordpress-theme/
+  pagespeed_insights: 100
+  gtmetrix: 98%

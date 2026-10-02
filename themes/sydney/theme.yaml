@@ -1,0 +1,9 @@
+name: sydney
+description: >
+  Port of Sydney's default look (PageSpeed 95 per Hostinger 2026) — business
+  feel: strong dark headings, warm coral accent, roomier line-height.
+  Approximation of the theme's customizer defaults, not its GPL code.
+source:
+  article: https://www.hostinger.com/tutorials/fastest-wordpress-theme/
+  pagespeed_insights: 95
+  gtmetrix: 97%

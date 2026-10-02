@@ -1,0 +1,51 @@
+/* Hello Elementor port — deliberately blank-canvas: gray-on-white, no decoration (approx.). */
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #ffffff;
+  --color-fg: #54595f;
+  --color-muted: #7a7a7a;
+  --color-faint: #a0a4a8;
+  --color-line: #eeeeee;
+  --color-accent: #6d7882;
+  --color-heading: #333333;
+  --color-card: #fafafa;
+  --font-sans: Roboto, 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+/* Markdown body styling — same contract as the default theme. */
+@layer components {
+  .prose { line-height: 1.65; }
+  .prose h1, .prose h2, .prose h3 { line-height: 1.25; color: var(--color-heading); margin: 1.6em 0 0.6em; }
+  .prose h1 { font-size: 1.9rem; }
+  .prose h2 { font-size: 1.4rem; }
+  .prose h3 { font-size: 1.15rem; }
+  .prose p, .prose ul, .prose ol { margin: 0.9em 0; }
+  .prose ul { list-style: disc; padding-left: 1.5rem; }
+  .prose ol { list-style: decimal; padding-left: 1.5rem; }
+  .prose a { color: var(--color-accent); }
+  .prose code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--color-card);
+    border: 1px solid var(--color-line);
+    border-radius: 0px;
+    padding: 0.1em 0.35em;
+    font-size: 0.9em;
+  }
+  .prose pre {
+    background: var(--color-card);
+    border: 1px solid var(--color-line);
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+  }
+  .prose pre code { background: none; border: none; padding: 0; }
+  .prose blockquote {
+    margin: 1rem 0;
+    padding: 0.25rem 1rem;
+    border-left: 3px solid var(--color-line);
+    color: var(--color-muted);
+  }
+  .prose img { max-width: 100%; height: auto; border-radius: 0px; }
+  .prose video, .prose audio { width: 100%; margin: 1rem 0; }
+}
