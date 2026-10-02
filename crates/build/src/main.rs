@@ -118,12 +118,13 @@ impl SiteConfig {
             contact_email: default_contact_email(),
         }
     }
-    fn base_ctx(&self, style: &Styling) -> TeraContext {
+    fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
         let mut ctx = TeraContext::new();
         ctx.insert("css_hash", &style.hash);
         ctx.insert("style", &style.css);
         ctx.insert("site_title", &self.title);
         ctx.insert("theme", &style.theme);
+        ctx.insert("root", root);
         ctx.insert("lang", "en");
         ctx
     }
@@ -177,31 +178,7 @@ fn main() -> Result<()> {
         );
     }
     let templates_dir = root.join("templates");
-    let mut tera = Tera::new(
-        templates_dir
-            .join("**/*.html")
-            .to_str()
-            .context("templates path is not valid UTF-8")?,
-    )
-    .context("failed to compile templates")?;
-    // Theme template overrides win over the repo defaults.
-    let theme_templates = theme_dir.join("templates");
-    if theme_templates.is_dir() {
-        for entry in fs::read_dir(&theme_templates)
-            .with_context(|| format!("read_dir {}", theme_templates.display()))?
-        {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("html") {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .context("theme template file name is not valid UTF-8")?
-                    .to_string();
-                tera.add_template_file(&path, Some(&name))
-                    .with_context(|| format!("load theme template {}", path.display()))?;
-            }
-        }
-    }
+    let tera = load_tera(&root, &theme_dir, &templates_dir)?;
     let style = compile_theme_css(&root, &theme_dir, &theme_name)?;
     let css_hash = sha256_hex(style.as_bytes());
     let styling = Styling {
@@ -220,16 +197,76 @@ fn main() -> Result<()> {
     // Default pages (about, privacy, terms, ...) — optional directory.
     let pages = load_pages(&root.join("content/pages")).unwrap_or_default();
 
-    render_posts(&tera, &dist, &posts, &styling, &cfg)?;
-    render_pages(&tera, &dist, &pages, &styling, &cfg)?;
-    render_home(&tera, &dist, &posts, &styling, &cfg)?;
-    render_blog(&tera, &dist, &posts, &styling, &cfg)?;
-    render_contact(&tera, &dist, &styling, &cfg)?;
-    render_404(&tera, &dist, &styling, &cfg)?;
+    // Live site renders at the site root.
+    render_posts(&tera, &dist, &posts, &styling, &cfg, "")?;
+    render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
+    render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
+    render_blog(&tera, &dist, &posts, &styling, &cfg, "")?;
+    render_contact(&tera, &dist, &styling, &cfg, "")?;
+    render_404(&tera, &dist, &styling, &cfg, "")?;
     render_rss(&root, &dist, &posts)?;
     render_sitemap(&root, &dist, &posts, &pages)?;
     render_robots(&dist)?;
     render_llms_txt(&root, &dist, &posts)?;
+
+    // ---- theme previews ------------------------------------------------
+    // SITE_PREVIEW_THEMES=all (or a comma list) builds the whole site once per
+    // theme under dist/preview/<theme>/, so every theme is browsable without
+    // flipping the live site. Interactive links are root-prefixed via {{ root }}.
+    if let Some(spec) = std::env::var("SITE_PREVIEW_THEMES")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let wanted: Vec<String> = if spec.trim() == "all" {
+            available_themes(&root)
+        } else {
+            spec.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let preview_dir = dist.join("preview");
+        let mut built: Vec<String> = Vec::new();
+        for name in &wanted {
+            let tdir = root.join("themes").join(name);
+            if !tdir.is_dir() {
+                eprintln!("preview: skip unknown theme {name:?}");
+                continue;
+            }
+            let root_prefix = format!("/preview/{name}");
+            let out = preview_dir.join(name);
+            let ttera = load_tera(&root, &tdir, &templates_dir)?;
+            let tcss = compile_theme_css(&root, &tdir, name)?;
+            let tcss_hash = sha256_hex(tcss.as_bytes());
+            let tstyle = Styling {
+                css: tcss,
+                hash: tcss_hash,
+                theme: name.clone(),
+            };
+            copy_theme_assets(&tdir, &out, name)?;
+            render_posts(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
+            render_pages(&ttera, &out, &pages, &tstyle, &cfg, &root_prefix)?;
+            render_home(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
+            render_blog(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
+            render_contact(&ttera, &out, &tstyle, &cfg, &root_prefix)?;
+            render_404(&ttera, &out, &tstyle, &cfg, &root_prefix)?;
+            built.push(name.clone());
+        }
+        // A lightweight picker page listing the previews.
+        let mut idx = String::from(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Theme previews</title></head><body style=\"font-family:system-ui,-apple-system,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem\"><h1>Theme previews</h1><ul>",
+        );
+        for n in &built {
+            idx.push_str(&format!("<li><a href=\"/preview/{n}/\">{n}</a></li>"));
+        }
+        idx.push_str("</ul><p><a href=\"/\">Back to the live site</a></p></body></html>");
+        fs::create_dir_all(&preview_dir)?;
+        fs::write(preview_dir.join("index.html"), idx)?;
+        eprintln!(
+            "theme previews built: {} -> /preview/<theme>/",
+            built.join(", ")
+        );
+    }
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
@@ -240,6 +277,36 @@ fn main() -> Result<()> {
         theme_name
     );
     Ok(())
+}
+
+/// Compile the template set: repo `templates/` plus any `<theme>/templates/*.html`
+/// overrides (which win on name collision).
+fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera> {
+    let mut tera = Tera::new(
+        templates_dir
+            .join("**/*.html")
+            .to_str()
+            .context("templates path is not valid UTF-8")?,
+    )
+    .context("failed to compile templates")?;
+    let theme_templates = theme_dir.join("templates");
+    if theme_templates.is_dir() {
+        for entry in fs::read_dir(&theme_templates)
+            .with_context(|| format!("read_dir {}", theme_templates.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .context("theme template file name is not valid UTF-8")?
+                    .to_string();
+                tera.add_template_file(&path, Some(&name))
+                    .with_context(|| format!("load theme template {}", path.display()))?;
+            }
+        }
+    }
+    Ok(tera)
 }
 
 /// Compiled CSS + its content hash, threaded through every render step.
@@ -403,6 +470,7 @@ fn render_posts(
     posts: &[Post],
     style: &Styling,
     cfg: &SiteConfig,
+    root: &str,
 ) -> Result<()> {
     for post in posts {
         // Drafts are invisible on the site: no HTML page is emitted until
@@ -414,7 +482,7 @@ fn render_posts(
             .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
         let body = render_markdown(&md)?;
         let mut ctx = post.meta.to_context(&body);
-        ctx.extend(cfg.base_ctx(style));
+        ctx.extend(cfg.base_ctx(style, root));
         let html = tera.render("post.html", &ctx).context("render post.html")?;
         let out_dir = dist.join("posts").join(&post.meta.slug);
         fs::create_dir_all(&out_dir)
@@ -432,16 +500,17 @@ fn render_pages(
     pages: &[Page],
     style: &Styling,
     cfg: &SiteConfig,
+    root: &str,
 ) -> Result<()> {
     for page in pages {
         if !page.meta.published {
             continue;
         }
         let md = fs::read_to_string(page.dir.join("index.mdx"))
-            .with_context(|| format!("read {}", page.dir.join("index.mdx").display()))?;
+            .with_context(|| format!("read {}/index.mdx", page.dir.display()))?;
         let body = render_markdown(&md)?;
         let mut ctx = page.meta.to_context(&body);
-        ctx.extend(cfg.base_ctx(style));
+        ctx.extend(cfg.base_ctx(style, root));
         let html = tera.render("page.html", &ctx).context("render page.html")?;
         let out_dir = dist.join(&page.meta.slug);
         fs::create_dir_all(&out_dir)
@@ -459,6 +528,7 @@ fn render_home(
     posts: &[Post],
     style: &Styling,
     cfg: &SiteConfig,
+    root: &str,
 ) -> Result<()> {
     let recent: Vec<serde_json::Value> = posts
         .iter()
@@ -466,7 +536,7 @@ fn render_home(
         .take(3)
         .map(Post::summary)
         .collect();
-    let mut ctx = cfg.base_ctx(style);
+    let mut ctx = cfg.base_ctx(style, root);
     ctx.insert("posts", &recent);
     ctx.insert("tagline", &cfg.tagline);
     let html = tera.render("home.html", &ctx).context("render home.html")?;
@@ -481,13 +551,14 @@ fn render_blog(
     posts: &[Post],
     style: &Styling,
     cfg: &SiteConfig,
+    root: &str,
 ) -> Result<()> {
     let listed: Vec<serde_json::Value> = posts
         .iter()
         .filter(|p| p.meta.published)
         .map(Post::summary)
         .collect();
-    let mut ctx = cfg.base_ctx(style);
+    let mut ctx = cfg.base_ctx(style, root);
     ctx.insert("posts", &listed);
     let html = tera.render("blog.html", &ctx).context("render blog.html")?;
     let out_dir = dist.join("blog");
@@ -498,8 +569,14 @@ fn render_blog(
 
 /// Contact page — template-driven from site.yaml `contact_email` (static-first:
 /// a mailto link, no backend form to run).
-fn render_contact(tera: &Tera, dist: &Path, style: &Styling, cfg: &SiteConfig) -> Result<()> {
-    let mut ctx = cfg.base_ctx(style);
+fn render_contact(
+    tera: &Tera,
+    dist: &Path,
+    style: &Styling,
+    cfg: &SiteConfig,
+    root: &str,
+) -> Result<()> {
+    let mut ctx = cfg.base_ctx(style, root);
     ctx.insert("contact_email", &cfg.contact_email);
     let html = tera
         .render("contact.html", &ctx)
@@ -538,8 +615,14 @@ fn load_pages(dir: &Path) -> Result<Vec<Page>> {
     Ok(pages)
 }
 
-fn render_404(tera: &Tera, dist: &Path, style: &Styling, cfg: &SiteConfig) -> Result<()> {
-    let ctx = cfg.base_ctx(style);
+fn render_404(
+    tera: &Tera,
+    dist: &Path,
+    style: &Styling,
+    cfg: &SiteConfig,
+    root: &str,
+) -> Result<()> {
+    let ctx = cfg.base_ctx(style, root);
     let html = tera.render("404.html", &ctx).context("render 404.html")?;
     fs::write(dist.join("404.html"), html).context("write 404.html")?;
     Ok(())

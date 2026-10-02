@@ -2,5 +2,5 @@
 {% block title %}404 — Post-CMS{% endblock %}
 {% block content %}
 <h1 class="text-3xl font-bold text-heading leading-tight">404 — not found</h1>
-<p class="mt-4">That page does not exist. <a href="/" class="text-accent">Back to the index.</a></p>
+<p class="mt-4">That page does not exist. <a href="{{ root | safe }}/" class="text-accent">Back to the index.</a></p>
 {% endblock %}

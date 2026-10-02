@@ -84,6 +84,19 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "build_preview",
+        "description": (
+            "Build every theme (or a comma list) under /preview/<theme>/ without "
+            "changing the live site. themes: 'all' or e.g. 'astra,neve'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "themes": {"type": "string", "description": "'all' or a comma list of theme names."},
+            },
+        },
+    },
+    {
         "name": "add_media",
         "description": (
             "Upload a binary file (image/video/audio/pdf) to the media bucket at "
@@ -304,6 +317,20 @@ def tool_build_site(_args: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "tail": output.strip().splitlines()[-5:]}
 
 
+def tool_build_preview(args: dict[str, Any]) -> dict[str, Any]:
+    """Build every theme (or a comma list) under /preview/<theme>/ without
+    changing the live site. `themes`: 'all' or e.g. 'astra,neve'."""
+    spec = str(args.get("themes", "all"))
+    env = {**os.environ, "SITE_PREVIEW_THEMES": spec}
+    res = subprocess.run(TEMPLATES_FOR_BUILD, shell=True, cwd=ROOT,
+                         capture_output=True, text=True, timeout=600, env=env)
+    output = (res.stdout + res.stderr)[-2000:]
+    if res.returncode != 0:
+        raise RuntimeError(f"preview build failed (exit {res.returncode}): {output[-500:]}")
+    return {"ok": True, "urls": ["/preview/<theme>/", "/preview/"],
+            "tail": output.strip().splitlines()[-5:]}
+
+
 def tool_publish_status(_args: dict[str, Any]) -> dict[str, Any]:
     slugs = _all_slugs()
     metas = [_read_meta(s) for s in slugs]
@@ -348,6 +375,7 @@ HANDLERS = {
     "create_draft": tool_create_draft,
     "update_post": tool_update_post,
     "build_site": tool_build_site,
+    "build_preview": tool_build_preview,
     "add_media": tool_add_media,
     "set_theme": tool_set_theme,
     "publish_status": tool_publish_status,
