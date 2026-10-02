@@ -1,2 +1,5 @@
 # Site-level config. `theme` names a directory under themes/.
-theme: default
+theme: astra
+title: Post-CMS
+tagline: A git-based publishing stack — posts live in markdown, the build is a Rust crate, and no platform sits in between.
+contact_email: hello@example.com

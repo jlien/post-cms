@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Contact — {{ site_title }}{% endblock %}
+{% block content %}
+<article>
+  <h1 class="text-3xl font-bold text-heading leading-tight">Contact</h1>
+  <div class="prose mt-6">
+    <p>The fastest way to reach us is email: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>.</p>
+    <p>We read everything and usually reply within a couple of business days.</p>
+  </div>
+</article>
+{% endblock %}

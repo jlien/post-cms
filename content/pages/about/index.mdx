@@ -1,0 +1,21 @@
+title: About
+slug: about
+description: What this site is and how it works.
+published: true
+---
+
+This site is built with **Post-CMS** — a git-based publishing stack.
+
+There is no CMS database and no hosting platform in the middle: every page you
+are reading started as a markdown file in a git repository. A small Rust build
+crate compiles the markdown to static HTML, inlines a Tailwind theme, and
+deploys plain files.
+
+What that buys:
+
+- **Speed** — static HTML, one inline stylesheet, zero JavaScript.
+- **Ownership** — content lives in git; leave any time with `git clone`.
+- **Durability** — no plugin rot, no PHP to patch, no database to back up.
+
+If you want to change something, edit a file and commit. That is the whole
+workflow.

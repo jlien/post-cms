@@ -47,6 +47,87 @@ impl Meta {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct PageMeta {
+    title: String,
+    slug: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_lang")]
+    lang: String,
+    #[serde(default = "default_true")]
+    published: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl PageMeta {
+    fn to_context(&self, body: &str) -> TeraContext {
+        let mut ctx = TeraContext::new();
+        ctx.insert("title", &self.title);
+        ctx.insert("slug", &self.slug);
+        ctx.insert("lang", &self.lang);
+        ctx.insert("description", &self.description);
+        ctx.insert("body", body);
+        ctx
+    }
+}
+
+#[derive(Debug)]
+struct Page {
+    meta: PageMeta,
+    dir: PathBuf,
+}
+
+/// site.yaml — theme plus the copy every default page needs.
+#[derive(Debug, Deserialize)]
+struct SiteConfig {
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default = "default_title")]
+    title: String,
+    #[serde(default)]
+    tagline: String,
+    #[serde(default = "default_contact_email")]
+    contact_email: String,
+}
+
+fn default_theme() -> String {
+    "default".to_string()
+}
+fn default_title() -> String {
+    "Post-CMS".to_string()
+}
+fn default_contact_email() -> String {
+    "hello@example.com".to_string()
+}
+
+impl SiteConfig {
+    fn load(root: &Path) -> SiteConfig {
+        let raw = fs::read_to_string(root.join("site.yaml")).ok();
+        raw.and_then(|raw| serde_yaml::from_str(&raw).ok())
+            .unwrap_or_else(SiteConfig::default_theme_config)
+    }
+    fn default_theme_config() -> SiteConfig {
+        SiteConfig {
+            theme: default_theme(),
+            title: default_title(),
+            tagline: String::new(),
+            contact_email: default_contact_email(),
+        }
+    }
+    fn base_ctx(&self, style: &Styling) -> TeraContext {
+        let mut ctx = TeraContext::new();
+        ctx.insert("css_hash", &style.hash);
+        ctx.insert("style", &style.css);
+        ctx.insert("site_title", &self.title);
+        ctx.insert("lang", "en");
+        ctx
+    }
+}
+
 #[derive(Debug)]
 struct Post {
     meta: Meta,
@@ -122,26 +203,36 @@ fn main() -> Result<()> {
     }
     let style = compile_theme_css(&root, &theme_dir, &theme_name)?;
     let css_hash = sha256_hex(style.as_bytes());
-    let styling = Styling { css: style, hash: css_hash };
+    let styling = Styling {
+        css: style,
+        hash: css_hash,
+    };
 
+    let cfg = SiteConfig::load(&root);
     let posts = load_posts(&root.join("content/posts"))?;
     if posts.is_empty() {
         bail!("no posts found under content/posts");
     }
+    // Default pages (about, privacy, terms, ...) — optional directory.
+    let pages = load_pages(&root.join("content/pages")).unwrap_or_default();
 
-    render_posts(&tera, &dist, &posts, &styling)?;
-    render_index(&tera, &dist, &posts, &styling)?;
-    render_404(&tera, &dist, &styling)?;
+    render_posts(&tera, &dist, &posts, &styling, &cfg)?;
+    render_pages(&tera, &dist, &pages, &styling, &cfg)?;
+    render_home(&tera, &dist, &posts, &styling, &cfg)?;
+    render_blog(&tera, &dist, &posts, &styling, &cfg)?;
+    render_contact(&tera, &dist, &styling, &cfg)?;
+    render_404(&tera, &dist, &styling, &cfg)?;
     render_rss(&root, &dist, &posts)?;
-    render_sitemap(&root, &dist, &posts)?;
+    render_sitemap(&root, &dist, &posts, &pages)?;
     render_robots(&dist)?;
     render_llms_txt(&root, &dist, &posts)?;
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
-        "built dist/: {} posts ({} drafts skipped), theme={:?}, index, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
+        "built dist/: {} posts ({} drafts skipped), {} pages, theme={:?}, home, blog, contact, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
         posts.len() - drafts,
         drafts,
+        pages.iter().filter(|p| p.meta.published).count(),
         theme_name
     );
     Ok(())
@@ -276,7 +367,13 @@ fn render_markdown(input: &str) -> Result<String> {
     Ok(out)
 }
 
-fn render_posts(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Result<()> {
+fn render_posts(
+    tera: &Tera,
+    dist: &Path,
+    posts: &[Post],
+    style: &Styling,
+    cfg: &SiteConfig,
+) -> Result<()> {
     for post in posts {
         // Drafts are invisible on the site: no HTML page is emitted until
         // published flips to true (see agents/CONVENTIONS.md).
@@ -287,11 +384,8 @@ fn render_posts(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Re
             .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
         let body = render_markdown(&md)?;
         let mut ctx = post.meta.to_context(&body);
-        ctx.insert("css_hash", &style.hash);
-        ctx.insert("style", &style.css);
-        let html = tera
-            .render("post.html", &ctx)
-            .context("render post.html")?;
+        ctx.extend(cfg.base_ctx(style));
+        let html = tera.render("post.html", &ctx).context("render post.html")?;
         let out_dir = dist.join("posts").join(&post.meta.slug);
         fs::create_dir_all(&out_dir)
             .with_context(|| format!("mkdir {}", out_dir.display()))?;
@@ -301,27 +395,121 @@ fn render_posts(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Re
     Ok(())
 }
 
-fn render_index(tera: &Tera, dist: &Path, posts: &[Post], style: &Styling) -> Result<()> {
+/// Generic content pages from content/pages/<slug>/ → /<slug>/.
+fn render_pages(
+    tera: &Tera,
+    dist: &Path,
+    pages: &[Page],
+    style: &Styling,
+    cfg: &SiteConfig,
+) -> Result<()> {
+    for page in pages {
+        if !page.meta.published {
+            continue;
+        }
+        let md = fs::read_to_string(page.dir.join("index.mdx"))
+            .with_context(|| format!("read {}", page.dir.join("index.mdx").display()))?;
+        let body = render_markdown(&md)?;
+        let mut ctx = page.meta.to_context(&body);
+        ctx.extend(cfg.base_ctx(style));
+        let html = tera.render("page.html", &ctx).context("render page.html")?;
+        let out_dir = dist.join(&page.meta.slug);
+        fs::create_dir_all(&out_dir)
+            .with_context(|| format!("mkdir {}", out_dir.display()))?;
+        fs::write(out_dir.join("index.html"), html)
+            .with_context(|| format!("write {}/index.html", out_dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Landing page at / — hero (site title + tagline) plus the 3 newest posts.
+fn render_home(
+    tera: &Tera,
+    dist: &Path,
+    posts: &[Post],
+    style: &Styling,
+    cfg: &SiteConfig,
+) -> Result<()> {
+    let recent: Vec<serde_json::Value> = posts
+        .iter()
+        .filter(|p| p.meta.published)
+        .take(3)
+        .map(Post::summary)
+        .collect();
+    let mut ctx = cfg.base_ctx(style);
+    ctx.insert("posts", &recent);
+    ctx.insert("tagline", &cfg.tagline);
+    let html = tera.render("home.html", &ctx).context("render home.html")?;
+    fs::write(dist.join("index.html"), html).context("write index.html")?;
+    Ok(())
+}
+
+/// Post list at /blog/ — the old index, relocated.
+fn render_blog(
+    tera: &Tera,
+    dist: &Path,
+    posts: &[Post],
+    style: &Styling,
+    cfg: &SiteConfig,
+) -> Result<()> {
     let listed: Vec<serde_json::Value> = posts
         .iter()
         .filter(|p| p.meta.published)
         .map(Post::summary)
         .collect();
-    let mut ctx = TeraContext::new();
+    let mut ctx = cfg.base_ctx(style);
     ctx.insert("posts", &listed);
-    ctx.insert("css_hash", &style.hash);
-    ctx.insert("style", &style.css);
-    ctx.insert("lang", "en");
-    let html = tera.render("index.html", &ctx).context("render index.html")?;
-    fs::write(dist.join("index.html"), html).context("write index.html")?;
+    let html = tera.render("blog.html", &ctx).context("render blog.html")?;
+    let out_dir = dist.join("blog");
+    fs::create_dir_all(&out_dir).context("mkdir blog/")?;
+    fs::write(out_dir.join("index.html"), html).context("write blog/index.html")?;
     Ok(())
 }
 
-fn render_404(tera: &Tera, dist: &Path, style: &Styling) -> Result<()> {
-    let mut ctx = TeraContext::new();
-    ctx.insert("css_hash", &style.hash);
-    ctx.insert("style", &style.css);
-    ctx.insert("lang", "en");
+/// Contact page — template-driven from site.yaml `contact_email` (static-first:
+/// a mailto link, no backend form to run).
+fn render_contact(tera: &Tera, dist: &Path, style: &Styling, cfg: &SiteConfig) -> Result<()> {
+    let mut ctx = cfg.base_ctx(style);
+    ctx.insert("contact_email", &cfg.contact_email);
+    let html = tera
+        .render("contact.html", &ctx)
+        .context("render contact.html")?;
+    let out_dir = dist.join("contact");
+    fs::create_dir_all(&out_dir).context("mkdir contact/")?;
+    fs::write(out_dir.join("index.html"), html).context("write contact/index.html")?;
+    Ok(())
+}
+
+/// Load content/pages/<slug>/{meta.yaml,index.mdx}. Missing dir → empty vec.
+fn load_pages(dir: &Path) -> Result<Vec<Page>> {
+    let mut pages = Vec::new();
+    if !dir.is_dir() {
+        return Ok(pages);
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let meta_path = path.join("meta.yaml");
+        let md_path = path.join("index.mdx");
+        if !meta_path.exists() || !md_path.exists() {
+            eprintln!("skipping page {} (missing meta.yaml or index.mdx)", path.display());
+            continue;
+        }
+        let raw = fs::read_to_string(&meta_path)
+            .with_context(|| format!("read {}", meta_path.display()))?;
+        let meta: PageMeta =
+            serde_yaml::from_str(&raw).with_context(|| format!("parse {}", meta_path.display()))?;
+        pages.push(Page { meta, dir: path });
+    }
+    Ok(pages)
+}
+
+fn render_404(tera: &Tera, dist: &Path, style: &Styling, cfg: &SiteConfig) -> Result<()> {
+    let ctx = cfg.base_ctx(style);
     let html = tera.render("404.html", &ctx).context("render 404.html")?;
     fs::write(dist.join("404.html"), html).context("write 404.html")?;
     Ok(())
@@ -363,13 +551,19 @@ fn render_rss(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
     Ok(())
 }
 
-fn render_sitemap(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+fn render_sitemap(root: &Path, dist: &Path, posts: &[Post], pages: &[Page]) -> Result<()> {
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
+    let live_pages: Vec<&Page> = pages.iter().filter(|p| p.meta.published).collect();
     let site_base = site_base_url(root);
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
     xml.push_str(&format!("<url><loc>{}/</loc></url>\n", site_base));
+    xml.push_str(&format!("<url><loc>{}/blog/</loc></url>\n", site_base));
+    xml.push_str(&format!("<url><loc>{}/contact/</loc></url>\n", site_base));
+    for page in &live_pages {
+        xml.push_str(&format!("<url><loc>{}/{}/</loc></url>\n", site_base, page.meta.slug));
+    }
     for post in published {
         xml.push_str(&format!(
             "<url><loc>{}</loc><lastmod>{}</lastmod></url>\n",

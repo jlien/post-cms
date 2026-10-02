@@ -5,20 +5,28 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- Cache-Control guidance: serve this HTML with `Cache-Control: public, max-age=0, s-maxage=86400, stale-while-revalidate=604800` -->
   <!-- css-sha256: {{ css_hash }} -->
-  <title>{% block title %}Post-CMS{% endblock %}</title>
+  <title>{% block title %}{{ site_title }}{% endblock %}</title>
   <style>{{ style | safe }}</style>
 </head>
 <body class="min-h-screen bg-bg text-fg font-sans leading-relaxed">
   <header class="border-b border-line px-5 py-4 flex justify-between items-center">
-    <a href="/" class="text-fg no-underline font-semibold">Post-CMS</a>
+    <a href="/" class="text-fg no-underline font-semibold">{{ site_title }}</a>
     <nav class="text-sm">
-      <a href="/rss.xml" class="text-muted hover:text-fg no-underline ml-4">RSS</a>
-      <a href="/sitemap.xml" class="text-muted hover:text-fg no-underline ml-4">Sitemap</a>
+      <a href="/" class="text-muted hover:text-fg no-underline ml-4">Home</a>
+      <a href="/blog/" class="text-muted hover:text-fg no-underline ml-4">Blog</a>
+      <a href="/about/" class="text-muted hover:text-fg no-underline ml-4">About</a>
+      <a href="/contact/" class="text-muted hover:text-fg no-underline ml-4">Contact</a>
     </nav>
   </header>
   <main class="max-w-2xl mx-auto px-5 pt-10 pb-16">
     {% block content %}{% endblock %}
   </main>
-  <footer class="border-t border-line text-muted text-center px-5 py-6 text-sm">Built from git · served static · no CMS</footer>
+  <footer class="border-t border-line text-center px-5 py-6 text-sm">
+    <a href="/privacy/" class="text-muted hover:text-fg no-underline">Privacy</a>
+    <span class="text-faint"> · </span>
+    <a href="/terms/" class="text-muted hover:text-fg no-underline">Terms</a>
+    <span class="text-faint"> · </span>
+    <span class="text-muted">Built from git · served static · no CMS</span>
+  </footer>
 </body>
 </html>
