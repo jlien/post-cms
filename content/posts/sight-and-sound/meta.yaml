@@ -1,0 +1,9 @@
+title: "Sight and Sound: Embeds Without a Plugin"
+slug: "sight-and-sound"
+tags: 
+  - media
+  - html
+lang: "en"
+published: false
+date: "2026-10-02"
+description: "Native video and audio elements, no client JS, no plugin — just URLs from the bucket."
