@@ -213,6 +213,11 @@ fn main() -> Result<()> {
     render_search_index(&root, &dist, &posts)?;
     render_posts_markdown(&dist, &posts)?;
     render_embeddings(&root, &dist, &posts)?;
+    let images_saved = optimize_images(&dist)?;
+    if images_saved > 0 {
+        println!("optimized images: {} bytes saved", images_saved);
+    }
+    lint_contrast(&fs::read_to_string(theme_dir.join("theme.css")).unwrap_or_default())?;
     precompress(&dist)?;
 
     // ---- theme previews ------------------------------------------------
@@ -887,6 +892,194 @@ fn render_llms_txt(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
 
 fn site_base_url(_root: &Path) -> String {
     std::env::var("SITE_BASE_URL").unwrap_or_else(|_| "http://localhost:8787".to_string())
+}
+
+/// Build-time image optimization (replaces hand-running `sips`): walks dist/,
+/// downscales any raster image larger than MAX_DIM on its long edge, and
+/// re-encodes JPEG/PNG in place when the re-encode is actually smaller.
+/// Returns total bytes saved. Only ever overwrites when it wins bytes.
+fn optimize_images(dist: &Path) -> Result<u64> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    const MAX_DIM: u32 = 1600;
+    const JPEG_QUALITY: u8 = 80;
+    let mut saved: u64 = 0;
+    for entry in walk_files(dist) {
+        let ext = entry
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let Some(ext) = ext else { continue };
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+            continue;
+        }
+        let original = fs::read(&entry)?;
+        let Ok(img) = ImageReader::new(Cursor::new(&original))
+            .with_guessed_format()
+            .map_err(|_| anyhow::anyhow!("format probe"))?
+            .decode()
+        else {
+            continue; // not a decodable raster image — leave untouched
+        };
+        let (w, h) = (img.width(), img.height());
+        let img = if w.max(h) > MAX_DIM {
+            let (nw, nh) = if w >= h {
+                (MAX_DIM, (h as f64 * MAX_DIM as f64 / w as f64).round() as u32)
+            } else {
+                ((w as f64 * MAX_DIM as f64 / h as f64).round() as u32, MAX_DIM)
+            };
+            img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+        let encoded: Vec<u8> = match ext.as_str() {
+            "png" => {
+                let mut buf = Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!("png encode: {e}"))?;
+                buf.into_inner()
+            }
+            _ => {
+                let mut buf = Cursor::new(Vec::new());
+                let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY);
+                img.write_with_encoder(enc)
+                    .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+                buf.into_inner()
+            }
+        };
+        // Only overwrite when the optimized bytes are actually smaller.
+        if encoded.len() < original.len() {
+            let delta = (original.len() - encoded.len()) as u64;
+            if delta > 0 {
+                fs::write(&entry, &encoded)
+                    .with_context(|| format!("rewrite {}", entry.display()))?;
+                saved += delta;
+            }
+        }
+    }
+    Ok(saved)
+}
+
+/// Recursive file walker under `dir` (skips dotfiles).
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// WCAG 2.1 contrast lint over the theme's color tokens.
+/// Any text pair below 4.5:1 (AA normal text) prints a warning; below 3.0:1
+/// (unreadable — fails even the large-text AA bar) fails the build.
+/// A production-site exercise shipped a real contrast bug that only Lighthouse
+/// caught after the fact; this moves that check to build time.
+fn lint_contrast(css: &str) -> Result<()> {
+    // Pull `--color-*: #hex` custom properties from the file.
+    let mut tokens: Vec<(String, [f64; 3])> = Vec::new();
+    for line in css.lines() {
+        let line = line.trim();
+        let Some((name, val)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.starts_with("--color-") {
+            continue;
+        }
+        let val = val.trim().trim_end_matches(';').trim();
+        if let Some(rgb) = parse_hex_color(val) {
+            tokens.push((name.trim_start_matches("--color-").to_string(), rgb));
+        }
+    }
+    if tokens.is_empty() {
+        return Ok(()); // no tokens — nothing to lint (e.g. utility-only css)
+    }
+
+    let by_name = |n: &str| tokens.iter().find(|(t, _)| t == n).map(|(_, c)| *c);
+    // Canonical text/background pairs; presence-optional so themes with fewer
+    // tokens lint only the pairs they define.
+    let pairs: [(&str, &str); 7] = [
+        ("fg", "bg"),
+        ("heading", "bg"),
+        ("accent", "bg"),
+        ("muted", "bg"),
+        ("muted", "card"),
+        ("faint", "bg"),
+        ("faint", "card"),
+    ];
+
+    let mut failures = Vec::new();
+    for (fg, bg) in pairs {
+        let (Some(f), Some(b)) = (by_name(fg), by_name(bg)) else {
+            continue;
+        };
+        let ratio = contrast_ratio(f, b);
+        let msg = format!(
+            "contrast: --color-{fg} on --color-{bg} = {ratio:.2}:1 ({} threshold 4.5:1)",
+            if ratio < 3.0 { "FAIL" } else { "warn" }
+        );
+        if ratio < 3.0 {
+            failures.push(msg.clone());
+        }
+        if ratio < 4.5 {
+            eprintln!("warning: {msg}");
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "contrast lint failed (below 3.0:1 — unreadable text):\n{}",
+            failures.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// `#rrggbb` / `#rgb` → linear sRGB components (0..1). Returns None for non-hex.
+fn parse_hex_color(s: &str) -> Option<[f64; 3]> {
+    let s = s.strip_prefix('#')?;
+    let (r, g, b) = match s.len() {
+        3 => (
+            u8::from_str_radix(&s[0..1].repeat(2), 16).ok()?,
+            u8::from_str_radix(&s[1..2].repeat(2), 16).ok()?,
+            u8::from_str_radix(&s[2..3].repeat(2), 16).ok()?,
+        ),
+        6 => (
+            u8::from_str_radix(&s[0..2], 16).ok()?,
+            u8::from_str_radix(&s[2..4], 16).ok()?,
+            u8::from_str_radix(&s[4..6], 16).ok()?,
+        ),
+        _ => return None,
+    };
+    // sRGB → linear channel per WCAG definition.
+    let lin = |c: u8| -> f64 {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    Some([lin(r), lin(g), lin(b)])
+}
+
+/// WCAG contrast ratio between two linear-RGB colors.
+fn contrast_ratio(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let lum = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let (la, lb) = (lum(a), lum(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 /// Write a .gz sibling next to every compressible file in dist, so the server

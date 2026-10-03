@@ -272,6 +272,7 @@ dependencies = [
  "chrono",
  "fastembed",
  "flate2",
+ "image",
  "pulldown-cmark",
  "serde",
  "serde_json",
