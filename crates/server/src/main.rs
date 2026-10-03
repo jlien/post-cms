@@ -4,11 +4,15 @@
 //! posts (/posts/<slug>/), and feed/meta files. Cache-Control headers follow
 //! the CDN guidance baked into the build.
 
+use std::collections::HashMap;
 use std::env;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::OnceLock;
+use std::time::Instant;
 
-use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -79,10 +83,96 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         eprintln!("origin serving dist/ on http://{addr}");
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+// ---- Rate limiting / abuse protection (built into the origin) -----------
+//
+// /api/ask is the expensive path (embedding + LLM call), so it is gated by:
+//   1. a per-client sliding-window rate limit (RATE_LIMIT_PER_MIN, default 10)
+//   2. a global concurrency cap (ASK_MAX_CONCURRENT, default 4) so many
+//      distinct IPs can't stampede the upstream model at once
+// Static routes stay unlimited — they're cheap, immutable-cached files and
+// the CDN absorbs traffic before it reaches this binary anyway.
+
+const RATE_WINDOW_SECS: u64 = 60;
+
+static RATE_BUCKETS: OnceLock<
+    std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+> = OnceLock::new();
+
+/// Requests per minute per client for /api/ask.
+fn rate_limit_per_min() -> u32 {
+    env::var("RATE_LIMIT_PER_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+        .max(1)
+}
+
+/// Global in-flight cap for /api/ask (protects the upstream model).
+fn ask_max_concurrent() -> usize {
+    env::var("ASK_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .max(1)
+}
+
+static ASK_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn ask_semaphore() -> &'static tokio::sync::Semaphore {
+    ASK_SEM.get_or_init(|| tokio::sync::Semaphore::new(ask_max_concurrent()))
+}
+
+/// Best-effort client identity. Behind a CDN/proxy (the normal deploy for this
+/// stack) X-Forwarded-For carries the real client; a direct client that spoofs
+/// XFF only wins itself a fresh bucket — the global semaphore still caps total
+/// load, so spoofing gains nothing.
+fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+    const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
+    if let Some(xff) = headers.get(XFF).and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
+            return ip;
+        }
+    }
+    addr.ip()
+}
+
+/// Fixed-window counter per client IP. Returns (allowed, remaining, retry_after_secs).
+fn rate_limit(ip: IpAddr) -> (bool, u32, u64) {
+    let limit = rate_limit_per_min();
+    let map = RATE_BUCKETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().expect("rate map poisoned");
+    let now = Instant::now();
+    // Opportunistic pruning so the map can't grow unbounded under attack.
+    if map.len() > 10_000 {
+        map.retain(|_, (_, window_start)| now.duration_since(*window_start).as_secs() < RATE_WINDOW_SECS);
+    }
+    let entry = map.entry(ip).and_modify(|(count, start)| {
+        if now.duration_since(*start).as_secs() >= RATE_WINDOW_SECS {
+            *count = 0;
+            *start = now;
+        }
+    });
+    let entry = match entry {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => v.insert((0, now)),
+    };
+    if entry.0 >= limit {
+        let retry = RATE_WINDOW_SECS - now.duration_since(entry.1).as_secs().min(RATE_WINDOW_SECS - 1);
+        (false, 0, retry.max(1))
+    } else {
+        entry.0 += 1;
+        (true, limit - entry.0, 0)
+    }
 }
 
 fn repo_root() -> anyhow::Result<PathBuf> {
@@ -355,11 +445,44 @@ fn inline_corpus(corpus: &[(String, String, String)]) -> (String, Vec<Source>) {
     (content, sources)
 }
 
-async fn ask(State(s): State<StaticDir>, body: Json<AskBody>) -> Response {
+async fn ask(
+    State(s): State<StaticDir>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Json<AskBody>,
+) -> Response {
     let question = body.question.trim();
     if question.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
     }
+
+    // Abuse protection: per-IP fixed window + global in-flight cap.
+    let ip = client_ip(&headers, addr);
+    let (allowed, _remaining, retry_after) = rate_limit(ip);
+    if !allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::RETRY_AFTER, HeaderValue::from(retry_after)),
+                (
+                    header::HeaderName::from_static("x-ratelimit-limit"),
+                    HeaderValue::from(rate_limit_per_min()),
+                ),
+            ],
+            Json(json!({ "error": "rate limit exceeded", "retry_after_seconds": retry_after })),
+        )
+            .into_response();
+    }
+    let _permit = match ask_semaphore().try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server busy, try again shortly" })),
+            )
+                .into_response()
+        }
+    };
     // Keyless endpoints (e.g. a private GLM server on the tailnet) are fine: no auth header.
     // Only a present-but-empty key is an error.
     let key = env::var("LLM_API_KEY").ok().filter(|k| !k.trim().is_empty());
