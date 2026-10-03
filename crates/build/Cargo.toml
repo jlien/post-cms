@@ -18,3 +18,4 @@ pulldown-cmark.workspace = true
 tera.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+fastembed.workspace = true

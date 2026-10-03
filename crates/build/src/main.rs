@@ -212,6 +212,7 @@ fn main() -> Result<()> {
     render_llms_txt(&root, &dist, &posts)?;
     render_search_index(&root, &dist, &posts)?;
     render_posts_markdown(&dist, &posts)?;
+    render_embeddings(&root, &dist, &posts)?;
     precompress(&dist)?;
 
     // ---- theme previews ------------------------------------------------
@@ -515,6 +516,97 @@ fn render_search_index(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
     fs::write(dist.join("search-index.json"), serde_json::to_vec_pretty(&idx)?)
         .with_context(|| "write search-index.json".to_string())?;
     Ok(())
+}
+
+/// Tier 3: embed per-post chunks at build time into dist/embeddings.json.
+/// Uses fastembed (ONNX on CPU, weights cached in ~/.cache) — no API key.
+/// Skips gracefully when the model can't be fetched (offline), leaving
+/// /api/ask in Tier-2 inline mode.
+fn render_embeddings(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+
+    let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
+    if published.is_empty() {
+        return Ok(());
+    }
+
+    let opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
+        .with_cache_dir(embed_cache_dir())
+        .with_show_download_progress(true);
+    let mut model = match TextEmbedding::try_new(opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "embeddings: model unavailable ({e}); skipping dist/embeddings.json (Tier 2 inline mode still works)"
+            );
+            return Ok(());
+        }
+    };
+
+    let site_base = site_base_url(root);
+    let mut rows: Vec<(serde_json::Value, String)> = Vec::new();
+    for post in &published {
+        let md = fs::read_to_string(post.dir.join("index.mdx"))
+            .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
+        let text = markdown_to_text(&md);
+        let title = &post.meta.title;
+        let desc = &post.meta.description;
+        for chunk in chunk_text(&text, 700) {
+            if chunk.chars().count() < 80 {
+                continue;
+            }
+            rows.push((
+                serde_json::json!({
+                    "title": title,
+                    "url": format!("{}{}/", site_base, post.url_path()),
+                }),
+                format!("# {title} — {desc}\n\n{chunk}"),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let docs: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
+    let vecs = model
+        .embed(docs, None)
+        .map_err(|e| anyhow::anyhow!("embed chunks: {e}"))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for ((meta, text), vec) in rows.into_iter().zip(vecs) {
+        out.push(serde_json::json!({ "meta": meta, "text": text, "vec": vec }));
+    }
+    fs::write(dist.join("embeddings.json"), serde_json::to_vec(&out)?)
+        .with_context(|| "write embeddings.json".to_string())?;
+    println!("embedded {} chunks -> embeddings.json", out.len());
+    Ok(())
+}
+
+/// Split plain text into word-boundary chunks of at most `max_chars`.
+fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.chars().count() + word.chars().count() + 1 > max_chars {
+            if !cur.trim().is_empty() {
+                chunks.push(cur.trim().to_string());
+            }
+            cur.clear();
+        }
+        cur.push_str(word);
+        cur.push(' ');
+    }
+    if !cur.trim().is_empty() {
+        chunks.push(cur.trim().to_string());
+    }
+    chunks
+}
+
+/// Where fastembed caches downloaded ONNX weights (shared by build + server).
+fn embed_cache_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".cache").join("post-cms-fastembed")
 }
 
 /// Emit per-post markdown next to each rendered post (posts/<slug>/index.md),

@@ -201,6 +201,82 @@ async fn health() -> Response {
     Json(json!({ "status": "ok" })).into_response()
 }
 
+// ---- Tier 3 retrieval helpers (used when dist/embeddings.json exists) ----
+
+/// Lazily-initialized shared embedding model (one ~100MB ONNX load per process).
+static EMBED: std::sync::OnceLock<std::sync::Mutex<Option<fastembed::TextEmbedding>>> =
+    std::sync::OnceLock::new();
+
+fn embed_model() -> Option<&'static std::sync::Mutex<Option<fastembed::TextEmbedding>>> {
+    let m = EMBED
+        .get_or_init(|| {
+            let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+                .with_cache_dir(embed_cache_dir());
+            std::sync::Mutex::new(match fastembed::TextEmbedding::try_new(opts) {
+                Ok(m) => {
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("embeddings: model unavailable ({e}); /api/ask falls back to inline mode");
+                    None
+                }
+            })
+        });
+    Some(m)
+}
+
+/// Where fastembed caches downloaded ONNX weights (same default as the build crate).
+fn embed_cache_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home).join(".cache").join("post-cms-fastembed")
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+}
+
+/// Embed the question, score all chunks, return the top-k as (context, sources).
+fn retrieve(dist: &StdPath, question: &str) -> anyhow::Result<(String, Vec<Source>)> {
+    let model = embed_model().ok_or_else(|| anyhow::anyhow!("no embedding model"))?;
+    let raw = std::fs::read_to_string(dist.join("embeddings.json"))?;
+    let chunks: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+
+    let mut guard = model.lock().map_err(|_| anyhow::anyhow!("embed mutex poisoned"))?;
+    let model = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no embedding model"))?;
+    let qvec = model
+        .embed(vec![question.to_string()], None)
+        .map_err(|e| anyhow::anyhow!("embed query: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty query embedding"))?;
+
+    let mut scored: Vec<(f32, &serde_json::Value)> = chunks
+        .iter()
+        .filter_map(|c| {
+            let vec = c["vec"].as_array()?;
+            let v: Vec<f32> = vec.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+            Some((cosine(&qvec, &v), c))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut context = String::from("## RETRIEVED SITE EXCERPTS\n\n");
+    let mut sources: Vec<Source> = Vec::new();
+    for (score, c) in scored.iter().take(6) {
+        let title = c["meta"]["title"].as_str().unwrap_or("");
+        let url = c["meta"]["url"].as_str().unwrap_or("");
+        let text = c["text"].as_str().unwrap_or("");
+        context.push_str(&format!("--- {title} (relevance {score:.3}) ---\n{text}\n\n"));
+        if !sources.iter().any(|s| s.url == url) {
+            sources.push(Source { title: title.to_string(), url: url.to_string() });
+        }
+    }
+    Ok((context, sources))
+}
+
 // ---- Tier 2: /api/ask — a thin agent endpoint over the static corpus. ----
 //
 // It reads the per-post markdown the build already emitted (posts/<slug>/index.md),
@@ -262,6 +338,23 @@ fn load_corpus(root: &PathBuf) -> Vec<(String, String, String)> {
     out
 }
 
+/// Tier 2 fallback: inline the whole corpus with all posts as sources.
+fn inline_corpus(corpus: &[(String, String, String)]) -> (String, Vec<Source>) {
+    let mut content = String::from(
+        "You are the find-it-on-this-site agent. Answer the user's question using ONLY the site \
+         content below. Cite each claim's post title. If the answer is not in the content, say so \
+         plainly and do not invent.\n\n## SITE CONTENT\n\n",
+    );
+    let sources: Vec<Source> = corpus
+        .iter()
+        .map(|(t, u, _)| Source { title: t.clone(), url: u.clone() })
+        .collect();
+    for (i, (title, _url, body)) in corpus.iter().enumerate() {
+        content.push_str(&format!("--- POST {i}: {title} ---\n{body}\n\n"));
+    }
+    (content, sources)
+}
+
 async fn ask(State(s): State<StaticDir>, body: Json<AskBody>) -> Response {
     let question = body.question.trim();
     if question.is_empty() {
@@ -283,18 +376,28 @@ async fn ask(State(s): State<StaticDir>, body: Json<AskBody>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "dist/posts has no markdown — rebuild with `cargo run -p build`" }))).into_response();
     }
 
-    let mut content = String::from(
-        "You are the find-it-on-this-site agent. Answer the user's question using ONLY the site \
-         content below. Cite each claim's post title. If the answer is not in the content, say so \
-         plainly and do not invent.\n\n## SITE CONTENT\n\n",
-    );
-    let sources: Vec<Source> = corpus
-        .iter()
-        .map(|(t, u, _)| Source { title: t.clone(), url: u.clone() })
-        .collect();
-    for (i, (title, _url, body)) in corpus.iter().enumerate() {
-        content.push_str(&format!("--- POST {i}: {title} ---\n{body}\n\n"));
-    }
+    // Tier 3 when embeddings exist (retrieve top-k chunks, cite only those
+    // posts); otherwise Tier 2 (inline the whole corpus).
+    let emb_path = s.0.join("embeddings.json");
+    let (content, sources) = if emb_path.is_file() {
+        match retrieve(&s.0, question) {
+            Ok((ctx, srcs)) => {
+                let mut content = String::from(
+                    "You are the find-it-on-this-site agent. Answer the user's question using ONLY \
+                     the retrieved site excerpts below. Cite each claim's post title. If the answer \
+                     is not in the excerpts, say so plainly and do not invent.\n\n",
+                );
+                content.push_str(&ctx);
+                (content, srcs)
+            }
+            Err(e) => {
+                eprintln!("retrieval failed ({e}); falling back to inline corpus");
+                inline_corpus(&corpus)
+            }
+        }
+    } else {
+        inline_corpus(&corpus)
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
