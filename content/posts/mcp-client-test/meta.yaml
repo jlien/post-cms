@@ -1,8 +1,0 @@
-title: "MCP Client Test"
-slug: "mcp-client-test"
-tags: 
-  - test
-lang: "en"
-published: false
-date: "2026-10-03"
-description: "verifies the stdio MCP server"
