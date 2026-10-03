@@ -210,6 +210,8 @@ fn main() -> Result<()> {
     render_sitemap(&root, &dist, &posts, &pages)?;
     render_robots(&dist, &site_base_url(&root))?;
     render_llms_txt(&root, &dist, &posts)?;
+    render_search_index(&root, &dist, &posts)?;
+    render_posts_markdown(&dist, &posts)?;
     precompress(&dist)?;
 
     // ---- theme previews ------------------------------------------------
@@ -465,6 +467,70 @@ fn render_markdown(input: &str) -> Result<String> {
     let mut out = String::new();
     html::push_html(&mut out, parser);
     Ok(out)
+}
+
+/// Strip markdown to plain text for the search index: keep text and code
+/// spans, break on paragraph/heading ends.
+fn markdown_to_text(input: &str) -> String {
+    use pulldown_cmark::{Event, TagEnd};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let mut out = String::new();
+    for ev in Parser::new_ext(input, opts) {
+        match ev {
+            Event::Text(t) => out.push_str(&t),
+            Event::Code(c) => out.push_str(&c),
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Heading(_)) => out.push('\n'),
+            _ => {}
+        }
+    }
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    out.chars().take(6_000).collect()
+}
+
+/// Emit search-index.json: one row per published post with title, description,
+/// url, date, tags and plain-text body — consumed lazily by the client search
+/// widget (Tier 1) and by /api/ask (Tier 2).
+fn render_search_index(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+    let site_base = site_base_url(root);
+    let mut idx = Vec::new();
+    for post in posts {
+        if !post.meta.published {
+            continue;
+        }
+        let md = fs::read_to_string(post.dir.join("index.mdx"))
+            .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
+        idx.push(serde_json::json!({
+            "title": post.meta.title,
+            "description": post.meta.description,
+            "url": format!("{}{}/", site_base, post.url_path()),
+            "date": post.meta.date.to_string(),
+            "tags": post.meta.tags,
+            "body": markdown_to_text(&md),
+        }));
+    }
+    fs::write(dist.join("search-index.json"), serde_json::to_vec_pretty(&idx)?)
+        .with_context(|| "write search-index.json".to_string())?;
+    Ok(())
+}
+
+/// Emit per-post markdown next to each rendered post (posts/<slug>/index.md),
+/// so agents fetching a page get text, not DOM (Tier 2).
+fn render_posts_markdown(dist: &Path, posts: &[Post]) -> Result<()> {
+    for post in posts {
+        if !post.meta.published {
+            continue;
+        }
+        let md = fs::read_to_string(post.dir.join("index.mdx"))
+            .with_context(|| format!("read {}", post.dir.join("index.mdx").display()))?;
+        let head = format!("# {}\n\n> {}\n\n", post.meta.title, post.meta.description);
+        fs::write(dist.join("posts").join(&post.meta.slug).join("index.md"), head + &md)
+            .with_context(|| format!("write {}/index.md", post.meta.slug))?;
+    }
+    Ok(())
 }
 
 fn render_posts(

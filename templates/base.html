@@ -12,11 +12,16 @@
 <body class="min-h-screen flex flex-col bg-bg text-fg font-sans leading-relaxed">
   <header class="border-b border-line px-5 py-4 flex justify-between items-center">
     <a href="{{ root | safe }}/" class="text-fg no-underline font-semibold">{{ site_title }}</a>
-    <nav class="text-sm">
-      <a href="{{ root | safe }}/" class="text-muted hover:text-fg no-underline ml-4">Home</a>
-      <a href="{{ root | safe }}/blog/" class="text-muted hover:text-fg no-underline ml-4">Blog</a>
-      <a href="{{ root | safe }}/about/" class="text-muted hover:text-fg no-underline ml-4">About</a>
-      <a href="{{ root | safe }}/contact/" class="text-muted hover:text-fg no-underline ml-4">Contact</a>
+    <nav class="text-sm flex items-center gap-4">
+      <a href="{{ root | safe }}/" class="text-muted hover:text-fg no-underline">Home</a>
+      <a href="{{ root | safe }}/blog/" class="text-muted hover:text-fg no-underline">Blog</a>
+      <a href="{{ root | safe }}/about/" class="text-muted hover:text-fg no-underline">About</a>
+      <a href="{{ root | safe }}/contact/" class="text-muted hover:text-fg no-underline">Contact</a>
+      <form class="relative" role="search" onsubmit="return false">
+        <input id="q" type="search" name="q" placeholder="Search posts…" aria-label="Search posts" autocomplete="off"
+          class="border border-line rounded px-2 py-1 text-sm w-44">
+        <div id="sr" class="hidden absolute right-0 mt-1 w-80 max-h-96 overflow-auto bg-white border border-line rounded shadow-lg text-left z-10"></div>
+      </form>
     </nav>
   </header>
   <main class="flex-1 w-full max-w-2xl mx-auto px-5 pt-10 pb-16">
@@ -29,5 +34,59 @@
     <span class="text-faint"> · </span>
     <span class="text-muted">Built from git · served static · no CMS</span>
   </footer>
+  <script>
+  // Tier 1 search: lazy-load search-index.json on first keystroke, score in-browser.
+  (function () {
+    var root = {{ root | json_encode | safe }};
+    var index = null, idxLoaded = false;
+    function tokenize(s) { return String(s).toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean); }
+    var q = document.getElementById("q"), box = document.getElementById("sr");
+    q.addEventListener("focus", loadIndex);
+    q.addEventListener("input", run);
+    q.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") { box.classList.add("hidden"); q.blur(); }
+    });
+    document.addEventListener("click", function (e) {
+      if (!box.contains(e.target) && e.target !== q) box.classList.add("hidden");
+    });
+    function loadIndex() {
+      if (idxLoaded) return;
+      idxLoaded = true;
+      fetch(root + "/search-index.json").then(function (r) { return r.json(); })
+        .then(function (d) { index = d; for (var i = 0; i < index.length; i++) index[i].t = tokenize(index[i].title + " " + index[i].description + " " + index[i].tags.join(" ")); })
+        .then(run);
+    }
+    function run() {
+      if (!index) return;
+      var qt = tokenize(q.value);
+      if (!qt.length) { box.classList.add("hidden"); return; }
+      // Small-corpus scoring: weighted token overlap (title 3×, tags 2×, body 1×) + title substring tiebreak.
+      var scores = [];
+      for (var i = 0; i < index.length; i++) {
+        var p = index[i], sc = 0;
+        for (var j = 0; j < qt.length; j++) {
+          for (var k = 0; k < p.t.length; k++) {
+            var w = p.t[k].indexOf(qt[j]) !== -1 ? (k < 13 ? 3 : 1) : 0; // title-prefix words weighted heavily
+            if (w) sc += w;
+          }
+          if (p.body && p.body.toLowerCase().indexOf(qt[j]) !== -1) sc += 1;
+        }
+        if (sc > 0) scores.push({ p: p, sc: sc });
+      }
+      scores.sort(function (a, b) { return b.sc - a.sc; });
+      var hits = scores.slice(0, 8), html = "";
+      for (var i = 0; i < hits.length; i++) {
+        var p = hits[i].p;
+        html += "<a href=\"" + p.url + "\" class=\"block px-3 py-2 hover:bg-gray-100 no-underline\">"
+          + "<span class=\"block font-semibold text-sm\">" + p.title + "</span>"
+          + (p.description ? "<span class=\"block text-xs text-gray-600\">" + p.description.slice(0, 90) + "</span>" : "")
+          + (p.tags.length ? "<span class=\"text-xs text-gray-400\">" + p.tags.join(" · ") + "</span>" : "")
+          + "</a>";
+      }
+      box.innerHTML = hits.length ? html : "<div class=\"px-3 py-2 text-sm text-gray-500\">No matches</div>";
+      box.classList.remove("hidden");
+    }
+  })();
+  </script>
 </body>
 </html>
