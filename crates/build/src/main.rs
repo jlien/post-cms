@@ -123,6 +123,8 @@ impl SiteConfig {
         ctx.insert("css_hash", &style.hash);
         ctx.insert("style", &style.css);
         ctx.insert("site_title", &self.title);
+        // Available to every template (headers/footers), not just home.html.
+        ctx.insert("site_tagline", &self.tagline);
         ctx.insert("theme", &style.theme);
         ctx.insert("root", root);
         ctx.insert("lang", "en");
@@ -206,8 +208,9 @@ fn main() -> Result<()> {
     render_404(&tera, &dist, &styling, &cfg, "")?;
     render_rss(&root, &dist, &posts)?;
     render_sitemap(&root, &dist, &posts, &pages)?;
-    render_robots(&dist)?;
+    render_robots(&dist, &site_base_url(&root))?;
     render_llms_txt(&root, &dist, &posts)?;
+    precompress(&dist)?;
 
     // ---- theme previews ------------------------------------------------
     // SITE_PREVIEW_THEMES=all (or a comma list) builds the whole site once per
@@ -689,10 +692,10 @@ fn render_sitemap(root: &Path, dist: &Path, posts: &[Post], pages: &[Page]) -> R
     Ok(())
 }
 
-fn render_robots(dist: &Path) -> Result<()> {
+fn render_robots(dist: &Path, site_base: &str) -> Result<()> {
     fs::write(
         dist.join("robots.txt"),
-        "User-agent: *\nAllow: /\nSitemap: /sitemap.xml\n",
+        format!("User-agent: *\nAllow: /\nSitemap: {site_base}/sitemap.xml\n"),
     )
     .context("write robots.txt")?;
     Ok(())
@@ -726,6 +729,45 @@ fn render_llms_txt(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
 
 fn site_base_url(_root: &Path) -> String {
     std::env::var("SITE_BASE_URL").unwrap_or_else(|_| "http://localhost:8787".to_string())
+}
+
+/// Write a .gz sibling next to every compressible file in dist, so the server
+/// can serve precompressed bytes at zero runtime CPU cost.
+const PRECOMPRESS_EXTS: [&str; 9] = ["html", "htm", "css", "js", "json", "xml", "txt", "svg", "md"];
+
+fn precompress(dist: &Path) -> Result<()> {
+    fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for e in fs::read_dir(dir)? {
+            let p = e?.path();
+            if p.is_dir() {
+                out.extend(walk(&p)?);
+            } else {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+    for f in walk(dist)? {
+        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !PRECOMPRESS_EXTS.contains(&ext) {
+            continue;
+        }
+        let gz = {
+            let mut s = f.as_os_str().to_os_string();
+            s.push(".gz");
+            PathBuf::from(s)
+        };
+        if gz.exists() {
+            continue;
+        }
+        let raw = fs::read(&f)?;
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw)?;
+        fs::write(gz, enc.finish()?)?;
+    }
+    Ok(())
 }
 
 /// RFC 2822 date, e.g. `Mon, 20 Sep 2026 00:00:00 +0000`

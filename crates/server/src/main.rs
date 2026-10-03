@@ -107,10 +107,19 @@ fn not_found(root: PathBuf) -> Response {
     }
 }
 
+/// Security + CDN headers applied to every successful file response.
+fn harden(resp: &mut Response) {
+    let headers = resp.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+}
+
 /// Serve a file under dist/. A bare path that resolves to a directory is
 /// treated as ".../index.html" (so /about/ and /about both work). Path
-/// traversal is rejected on every segment.
-fn serve(root: &PathBuf, rel: &str) -> Response {
+/// traversal is rejected on every segment. Precompressed .gz siblings are
+/// served when the client sends Accept-Encoding: gzip.
+fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     // Strip surrounding slashes: "/blog/" → "blog".
     let rel = rel.trim_matches('/').to_string();
     if rel.is_empty() {
@@ -128,6 +137,32 @@ fn serve(root: &PathBuf, rel: &str) -> Response {
         file = file.join("index.html");
     }
     let (content_type, cache_control) = content_type_for(&file);
+
+    // Prefer the precompressed sibling when the client can decode gzip.
+    let gz_path = PathBuf::from(format!("{}.gz", file.display()));
+    let compressible = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| {
+            ["html", "htm", "css", "js", "json", "xml", "txt", "svg", "md"].contains(&e)
+        });
+    if accept_gzip && compressible && gz_path.exists() {
+        match std::fs::read(&gz_path) {
+            Ok(bytes) => {
+                let mut resp = (StatusCode::OK, bytes).into_response();
+                let headers = resp.headers_mut();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+                if let Ok(v) = HeaderValue::from_str(cache_control) {
+                    headers.insert(header::CACHE_CONTROL, v);
+                }
+                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                harden(&mut resp);
+                return resp;
+            }
+            Err(_) => return not_found(root.clone()),
+        }
+    }
+
     match std::fs::read(&file) {
         Ok(bytes) => {
             let mut resp = (StatusCode::OK, bytes).into_response();
@@ -136,6 +171,7 @@ fn serve(root: &PathBuf, rel: &str) -> Response {
             if let Ok(v) = HeaderValue::from_str(cache_control) {
                 headers.insert(header::CACHE_CONTROL, v);
             }
+            harden(&mut resp);
             resp
         }
         Err(_) => not_found(root.clone()),
@@ -143,11 +179,16 @@ fn serve(root: &PathBuf, rel: &str) -> Response {
 }
 
 async fn serve_path(State(s): State<StaticDir>, req: Request) -> Response {
-    serve(&s.0, req.uri().path())
+    let gzip = req
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.to_ascii_lowercase().contains("gzip"));
+    serve(&s.0, req.uri().path(), gzip)
 }
 
 async fn index(State(s): State<StaticDir>) -> Response {
-    serve(&s.0, "index.html")
+    serve(&s.0, "index.html", true)
 }
 
 async fn health() -> Response {
