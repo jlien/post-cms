@@ -267,17 +267,15 @@ async fn ask(State(s): State<StaticDir>, body: Json<AskBody>) -> Response {
     if question.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
     }
-    let Ok(key) = env::var("LLM_API_KEY") else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "error": "LLM_API_KEY not set — export LLM_API_KEY (and optionally LLM_BASE_URL, LLM_MODEL) on the origin"
-        }))).into_response();
-    };
-    if key.trim().is_empty() {
+    // Keyless endpoints (e.g. a private GLM server on the tailnet) are fine: no auth header.
+    // Only a present-but-empty key is an error.
+    let key = env::var("LLM_API_KEY").ok().filter(|k| !k.trim().is_empty());
+    if env::var("LLM_API_KEY").map_or(false, |k| k.trim().is_empty()) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "LLM_API_KEY is empty" }))).into_response();
     }
 
-    let base = env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let model = env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let base = env::var("LLM_BASE_URL").unwrap_or_else(|_| "http://100.84.30.114:8000/v1".into());
+    let model = env::var("LLM_MODEL").unwrap_or_else(|_| "glm-5.3-flash".into());
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let corpus = load_corpus(&s.0);
@@ -310,12 +308,11 @@ async fn ask(State(s): State<StaticDir>, body: Json<AskBody>) -> Response {
             { "role": "user", "content": question },
         ],
     });
-    let req = client
-        .post(&url)
-        .bearer_auth(&key)
-        .json(&payload)
-        .send()
-        .await;
+    let mut req = client.post(&url).json(&payload);
+    if let Some(k) = &key {
+        req = req.bearer_auth(k);
+    }
+    let req = req.send().await;
     match req {
         Ok(resp) if resp.status().is_success() => {
             let j: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
