@@ -28,6 +28,30 @@ struct Meta {
     description: String,
 }
 
+/// One item of a typed collection (content/<collection>/<slug>/).
+/// Metadata is kept generic: every key in meta.yaml is passed through to
+/// the template, and the collection's schema.yaml decides what is required.
+#[derive(Debug)]
+struct CollectionItem {
+    slug: String,
+    title: String,
+    description: String,
+    date: Option<NaiveDate>,
+    published: bool,
+    fields: serde_json::Map<String, serde_json::Value>,
+    dir: PathBuf,
+}
+
+/// A typed collection: a folder under content/ with a schema.yaml.
+#[derive(Debug)]
+struct Collection {
+    name: String,
+    title: String,
+    required: Vec<String>,
+    types: std::collections::HashMap<String, String>,
+    items: Vec<CollectionItem>,
+}
+
 fn default_lang() -> String {
     "en".to_string()
 }
@@ -202,6 +226,8 @@ fn main() -> Result<()> {
     // Live site renders at the site root.
     render_posts(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
+    let collections = load_collections(&root.join("content"))?;
+    render_collections(&tera, &dist, &collections, &styling, &cfg, "")?;
     render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_blog(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_contact(&tera, &dist, &styling, &cfg, "")?;
@@ -258,6 +284,7 @@ fn main() -> Result<()> {
             copy_theme_assets(&tdir, &out, name)?;
             render_posts(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
             render_pages(&ttera, &out, &pages, &tstyle, &cfg, &root_prefix)?;
+            render_collections(&ttera, &out, &collections, &tstyle, &cfg, &root_prefix)?;
             render_home(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
             render_blog(&ttera, &out, &posts, &tstyle, &cfg, &root_prefix)?;
             render_contact(&ttera, &out, &tstyle, &cfg, &root_prefix)?;
@@ -462,6 +489,253 @@ fn load_posts(dir: &Path) -> Result<Vec<Post>> {
             .then_with(|| a.meta.slug.cmp(&b.meta.slug))
     });
     Ok(posts)
+}
+
+/// Load typed collections: every directory under content/ other than posts/
+/// pages/ is a collection if it has a schema.yaml. Each item is
+/// content/<collection>/<slug>/ with meta.yaml + index.mdx. Required fields
+/// (and optional type checks) from schema.yaml are enforced at build time —
+/// a missing or wrongly-typed field fails the build naming the exact file.
+fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
+    let mut collections = Vec::new();
+    let entries = fs::read_dir(content_dir)
+        .with_context(|| format!("read_dir {}", content_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("entry in {}", content_dir.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !path.is_dir() || name.starts_with('.') || name == "posts" || name == "pages" {
+            continue;
+        }
+        let schema_path = path.join("schema.yaml");
+        if !schema_path.exists() {
+            continue; // plain folder, not a typed collection
+        }
+        let schema_raw = fs::read_to_string(&schema_path)
+            .with_context(|| format!("read {}", schema_path.display()))?;
+        let schema: serde_yaml::Value = serde_yaml::from_str(&schema_raw)
+            .with_context(|| format!("parse {}", schema_path.display()))?;
+        let title = schema
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name)
+            .to_string();
+        let required: Vec<String> = schema
+            .get("required")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let types: std::collections::HashMap<String, String> = schema
+            .get("types")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut items = Vec::new();
+        for item_entry in fs::read_dir(&path)
+            .with_context(|| format!("read_dir {}", path.display()))?
+        {
+            let item_path = item_entry
+                .with_context(|| format!("entry in {}", path.display()))?
+                .path();
+            if !item_path.is_dir() {
+                continue;
+            }
+            let meta_path = item_path.join("meta.yaml");
+            if !meta_path.exists() {
+                continue; // non-item dirs inside a collection are ignored
+            }
+            let raw = fs::read_to_string(&meta_path)
+                .with_context(|| format!("read {}", meta_path.display()))?;
+            let meta: serde_yaml::Value = serde_yaml::from_str(&raw)
+                .with_context(|| format!("parse {}", meta_path.display()))?;
+            let map = meta
+                .as_mapping()
+                .ok_or_else(|| anyhow::anyhow!("{}: meta.yaml must be a mapping", meta_path.display()))?
+                .clone();
+
+            // ---- schema validation (the "typed" part) ----
+            for field in &required {
+                let val = map
+                    .get(serde_yaml::Value::String(field.clone()))
+                    .unwrap_or(&serde_yaml::Value::Null);
+                let missing = match val {
+                    serde_yaml::Value::Null => true,
+                    serde_yaml::Value::String(s) => s.trim().is_empty(),
+                    serde_yaml::Value::Sequence(s) => s.is_empty(),
+                    _ => false,
+                };
+                if missing {
+                    bail!(
+                        "{}: required field `{}` is missing or empty (schema: {})",
+                        meta_path.display(),
+                        field,
+                        schema_path.display()
+                    );
+                }
+            }
+            if let Some(ty) = types.get("published") {
+                let _ = ty; // types map only covers custom fields below
+            }
+            for (field, ty) in &types {
+                let val = map.get(serde_yaml::Value::String(field.clone()));
+                if let Some(v) = val {
+                    let ok = match ty.as_str() {
+                        "string" => matches!(v, serde_yaml::Value::String(_)),
+                        "number" => matches!(v, serde_yaml::Value::Number(_)),
+                        "boolean" => matches!(v, serde_yaml::Value::Bool(_)),
+                        "list" => matches!(v, serde_yaml::Value::Sequence(_)),
+                        other => bail!(
+                            "{}: schema type `{other}` for field `{field}` is not one of string|number|boolean|list",
+                            schema_path.display()
+                        ),
+                    };
+                    if !ok {
+                        bail!(
+                            "{}: field `{}` must be of type `{}`",
+                            meta_path.display(),
+                            field,
+                            ty
+                        );
+                    }
+                }
+            }
+
+            let slug = item_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let get_str = |k: &str| -> String {
+                map.get(serde_yaml::Value::String(k.to_string()))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let date = map
+                .get(serde_yaml::Value::String("date".to_string()))
+                .and_then(|v| v.as_str())
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+            // Every meta key flows to the template as `fields.<key>`.
+            let mut fields = serde_json::Map::new();
+            for (k, v) in &map {
+                let key = k.as_str().unwrap_or_default().to_string();
+                let json_v = match v {
+                    serde_yaml::Value::String(s) => serde_json::Value::String(s.clone()),
+                    serde_yaml::Value::Number(n) => {
+                        serde_json::Value::Number(serde_json::Number::from_f64(n.as_f64().unwrap_or(0.0)).unwrap_or(serde_json::Number::from(0)))
+                    }
+                    serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
+                    serde_yaml::Value::Sequence(seq) => serde_json::Value::Array(
+                        seq.iter()
+                            .filter_map(|x| x.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                            .collect(),
+                    ),
+                    _ => serde_json::Value::Null,
+                };
+                fields.insert(key, json_v);
+            }
+            items.push(CollectionItem {
+                slug,
+                title: get_str("title"),
+                description: get_str("description"),
+                date,
+                published: map
+                    .get(serde_yaml::Value::String("published".to_string()))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                fields,
+                dir: item_path,
+            });
+        }
+        items.sort_by(|a, b| a.slug.cmp(&b.slug));
+        collections.push(Collection {
+            name: name.to_string(),
+            title,
+            required,
+            types,
+            items,
+        });
+    }
+    collections.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(collections)
+}
+
+/// Render typed collections: per-item pages at /<collection>/<slug>/ and a
+/// collection index at /<collection>/. Draft items (published: false, the
+/// same convention as posts) are invisible on the site.
+fn render_collections(
+    tera: &Tera,
+    dist: &Path,
+    collections: &[Collection],
+    style: &Styling,
+    cfg: &SiteConfig,
+    root: &str,
+) -> Result<()> {
+    for coll in collections {
+        // Item pages first; the index lists the published ones.
+        let mut listed: Vec<serde_json::Value> = Vec::new();
+        for item in coll.items.iter().filter(|i| i.published) {
+            let md_path = item.dir.join("index.mdx");
+            let body = if md_path.exists() {
+                render_markdown(&fs::read_to_string(&md_path).with_context(|| {
+                    format!("read {}", md_path.display())
+                })?)?
+            } else {
+                String::new()
+            };
+            let mut ctx = TeraContext::new();
+            ctx.insert("title", &item.title);
+            ctx.insert("slug", &item.slug);
+            ctx.insert("description", &item.description);
+            if let Some(d) = item.date {
+                ctx.insert("date", &d.to_string());
+            }
+            ctx.insert("fields", &item.fields);
+            ctx.insert("body", &body);
+            ctx.extend(cfg.base_ctx(style, root));
+            let html = tera
+                .render("collection-item.html", &ctx)
+                .with_context(|| format!("render collection-item.html for {}", item.slug))?;
+            let out_dir = dist.join(&coll.name).join(&item.slug);
+            fs::create_dir_all(&out_dir)
+                .with_context(|| format!("mkdir {}", out_dir.display()))?;
+            fs::write(out_dir.join("index.html"), html)
+                .with_context(|| format!("write {}/index.html", out_dir.display()))?;
+
+            let mut row = serde_json::Map::new();
+            for (k, v) in &item.fields {
+                row.insert(k.clone(), v.clone());
+            }
+            listed.push(serde_json::Value::Object(row));
+        }
+        let mut ctx = TeraContext::new();
+        ctx.insert("coll_name", &coll.name);
+        ctx.insert("coll_title", &coll.title);
+        ctx.insert("items", &listed);
+        ctx.extend(cfg.base_ctx(style, root));
+        let html = tera
+            .render("collection.html", &ctx)
+            .with_context(|| format!("render collection.html for {}", coll.name))?;
+        let out_dir = dist.join(&coll.name);
+        fs::create_dir_all(&out_dir)
+            .with_context(|| format!("mkdir {}", out_dir.display()))?;
+        fs::write(out_dir.join("index.html"), html)
+            .with_context(|| format!("write {}/index.html", out_dir.display()))?;
+    }
+    Ok(())
 }
 
 fn render_markdown(input: &str) -> Result<String> {

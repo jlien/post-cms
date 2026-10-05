@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +130,30 @@ TOOLS = [
         },
     },
     {
+        "name": "propose_change",
+        "description": (
+            "Propose a content change WITHOUT touching the shared working "
+            "tree: writes it on an agent/<slug> branch, commits with the "
+            "caller's git identity, pushes to origin and opens a pull "
+            "request with a preview command in the body. Use this instead "
+            "of create_draft/update_post when the repo is shared."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Item slug (new or existing)."},
+                "title": {"type": "string", "description": "Title (required for new items)."},
+                "collection": {"type": "string", "description": "content/ subfolder: 'posts' (default) or a typed collection name."},
+                "description": {"type": "string"},
+                "body": {"type": "string", "description": "Full markdown body to set."},
+                "author_name": {"type": "string", "description": "Git author name for the commit."},
+                "author_email": {"type": "string", "description": "Git author email for the commit."},
+                "merge": {"type": "boolean", "description": "Merge the PR immediately (default false)."},
+            },
+            "required": ["slug", "author_name", "author_email"],
+        },
+    },
+    {
         "name": "publish_status",
         "description": "Counts and lists of live vs pending (draft) posts.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -221,8 +247,135 @@ def _parse_date_or_today() -> str:
 
 # ------------------------------------------------------------------- git
 
-def _git(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+def _git(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = {**os.environ, **(env_extra or {})}
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, env=env)
+
+
+def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
+    """Collaboration flow: one branch + one commit + one PR per change.
+
+    Instead of committing to the shared working tree, this writes the change
+    on an agent/<slug>-<n> branch, commits with the caller's git identity
+    (author_name/author_email — required, so the MR carries a human), pushes
+    to origin and opens a merge request with `gh`. The PR body carries the
+    preview command (build_preview on the branch) so a reviewer can render it
+    locally before merging. `merge: true` merges via gh immediately.
+    """
+    if not (ROOT / ".git").exists():
+        raise ValueError("not a git repository")
+    author_name = (args.get("author_name") or "").strip()
+    author_email = (args.get("author_email") or "").strip()
+    if not author_name or not author_email:
+        raise ValueError("author_name and author_email are required (identity on the MR)")
+    slug = (args.get("slug") or "").strip()
+    if not slug or "/" in slug or ".." in slug:
+        raise ValueError("slug required (existing post slug or new draft slug)")
+    title = (args.get("title") or "").strip() or f"Update {slug}"
+    body_md = args.get("body")  # optional new markdown body
+    description = args.get("description")
+    collection = (args.get("collection") or "posts").strip()
+    if "/" in collection or ".." in collection:
+        raise ValueError("invalid collection")
+
+    # Resolve target files. Existing item → update in place; new → draft item.
+    item_dir = ROOT / "content" / collection / slug
+    meta_path = item_dir / "meta.yaml"
+    md_path = item_dir / "index.mdx"
+    is_new = not item_dir.exists()
+
+    # Branch per change, from current default branch state.
+    existing = _git("rev-parse", "--verify", "--quiet", f"agent/{slug}-1").returncode
+    n = 1
+    while existing == 0:
+        n += 1
+        existing = _git("rev-parse", "--verify", "--quiet",
+                        f"agent/{slug}-{n}").returncode
+    branch = f"agent/{slug}-{n}" if n > 1 else f"agent/{slug}"
+    for step in (["switch", "-c", branch],):
+        res = _git(*step)
+        if res.returncode != 0:
+            raise ValueError(f"git {step[0]} failed: {res.stderr.strip()[:300]}")
+
+    try:
+        if is_new:
+            item_dir.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f'title: "{(args.get("title") or slug).strip()}"',
+                f'slug: "{slug}"',
+                "published: false",
+            ]
+            if description:
+                lines.append(f'description: "{description}"')
+            if collection == "posts":
+                lines.append(f"date: {datetime.now(timezone.utc).date().isoformat()}")
+            meta_path.write_text("\n".join(lines) + "\n")
+            if body_md:
+                md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+            summary = f"propose: new {collection}/{slug} draft"
+        else:
+            summary = f"propose: update {collection}/{slug}"
+            if description is not None:
+                cur = meta_path.read_text()
+                if "description:" in cur:
+                    cur = re.sub(r'(?m)^description:.*$',
+                                 f'description: "{description}"', cur)
+                    meta_path.write_text(cur)
+        if body_md and not is_new:
+            md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+
+        _git("add", str(item_dir))
+        commit_env = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        res = _git("commit", "-m", summary, env_extra=commit_env)
+        if res.returncode != 0:
+            if "nothing to commit" in (res.stdout + res.stderr):
+                raise ValueError(
+                    "nothing to commit — for updates pass body/description; "
+                    "if the item already has this content, no MR is needed")
+            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+
+        push = _git("push", "-u", "origin", branch)
+        if push.returncode != 0:
+            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+
+        preview_cmd = (f"git fetch origin {branch} && git switch {branch} && "
+                       f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
+        pr_body = (f"Agent-authored change by {author_name}.\n\n"
+                   f"Preview: {preview_cmd}")
+        pr = subprocess.run(
+            ["gh", "pr", "create", "--title", title, "--body", pr_body],
+            cwd=ROOT, capture_output=True, text=True)
+        pr_url = pr.stdout.strip().splitlines()[-1] if pr.returncode == 0 else None
+
+        result: dict[str, Any] = {
+            "branch": branch,
+            "proposed": True,
+            "is_new": is_new,
+            "summary": summary,
+            "pr_url": pr_url,
+            "preview_command": preview_cmd,
+        }
+        if pr.returncode != 0:
+            result["pr_error"] = pr.stderr.strip()[:300]
+        if args.get("merge") and pr_url:
+            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
+                                   cwd=ROOT, capture_output=True, text=True)
+            result["merged"] = merge.returncode == 0
+            if merge.returncode != 0:
+                result["merge_error"] = merge.stderr.strip()[:300]
+        # Return to the default branch: the shared working tree must not sit
+        # on an agent branch after proposing.
+        if not args.get("merge"):
+            _git("switch", "-")
+        return result
+    except Exception:
+        _git("switch", "-")
+        raise
 
 
 def git_commit(message: str) -> dict[str, Any]:
@@ -374,6 +527,7 @@ HANDLERS = {
     "get_post": tool_get_post,
     "create_draft": tool_create_draft,
     "update_post": tool_update_post,
+    "propose_change": tool_propose_change,
     "build_site": tool_build_site,
     "build_preview": tool_build_preview,
     "add_media": tool_add_media,

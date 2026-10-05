@@ -1,0 +1,8 @@
+title: "Acme Analytics"
+slug: "acme-analytics"
+vendor: "Acme Corp"
+tier: "verified"
+setup_minutes: 30
+published: true
+date: 2026-10-03
+description: "Product analytics integration with per-event webhooks."

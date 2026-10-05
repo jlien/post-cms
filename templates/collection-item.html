@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Post-CMS{% endblock %}
+{% block content %}
+<article>
+  <h1 class="text-3xl font-bold text-heading leading-tight">{{ title }}</h1>
+  {% if date %}<p class="text-muted text-sm mb-8 mt-2">{{ date }}</p>{% endif %}
+  <div class="prose">{{ body | safe }}</div>
+  <dl class="mt-8 border-t border-line pt-4 text-sm">
+    {% for key, value in fields %}
+    {% if key != "title" and key != "description" and key != "published" and key != "date" %}
+    <div class="flex gap-2 py-1"><dt class="text-muted min-w-32">{{ key }}</dt><dd class="text-fg">{% if value is iterable and value is not string %}{{ value | join(sep=", ") }}{% else %}{{ value }}{% endif %}</dd></div>
+    {% endif %}
+    {% endfor %}
+  </dl>
+</article>
+{% endblock %}

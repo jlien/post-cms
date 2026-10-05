@@ -1,0 +1,12 @@
+# Typed collection schema — enforced by the build (crates/build).
+# Every item (content/integrations/<slug>/meta.yaml) must define all
+# `required` fields, non-empty, with types matching `types` (string|number|
+# boolean|list). Build fails naming the exact offending file otherwise.
+title: Integrations
+required:
+  - title
+  - vendor
+  - tier
+types:
+  tier: string
+  setup_minutes: number
