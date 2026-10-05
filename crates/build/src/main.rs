@@ -210,6 +210,7 @@ fn main() -> Result<()> {
     render_sitemap(&root, &dist, &posts, &pages)?;
     render_robots(&dist, &site_base_url(&root))?;
     render_llms_txt(&root, &dist, &posts)?;
+    render_mcp_card(&root, &dist)?;
     render_search_index(&root, &dist, &posts)?;
     render_posts_markdown(&dist, &posts)?;
     render_embeddings(&root, &dist, &posts)?;
@@ -886,7 +887,42 @@ fn render_llms_txt(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
             date = post.meta.date,
         ));
     }
+    // MCP discovery section: agents reading llms.txt learn there is a
+    // queryable tool endpoint (convention adopted by several MCP toolkits;
+    // no standard makes clients auto-connect from here, but it costs nothing).
+    out.push_str("\n## MCP Servers\n\n");
+    out.push_str(&format!(
+        "- [Post-CMS MCP]({base}/mcp): read-only tools — list_posts, get_post, \
+         search. Query published content without auth.\n",
+        base = site_base,
+    ));
     fs::write(dist.join("llms.txt"), out).context("write llms.txt")?;
+    Ok(())
+}
+
+/// MCP discovery card (proposed SEP-1649/SEP-1960 convention):
+/// dist/.well-known/mcp/server-card.json describes the origin's public
+/// read-only MCP endpoint so tooling that probes /.well-known can find it.
+fn render_mcp_card(root: &Path, dist: &Path) -> Result<()> {
+    use serde_json::json;
+    let base = site_base_url(root).trim_end_matches('/').to_string();
+    let card = json!({
+        "name": "Post-CMS MCP",
+        "description": "Read-only MCP server over this site's published content: list posts, fetch a post as markdown, keyword search.",
+        "endpoint": format!("{base}/mcp"),
+        "protocolVersion": "2024-11-05",
+        "transports": ["streamable-http"],
+        "auth": "none",
+        "readOnly": true,
+        "tools": ["list_posts", "get_post", "search"],
+    });
+    let dir = dist.join(".well-known/mcp");
+    fs::create_dir_all(&dir).context("create .well-known/mcp")?;
+    fs::write(
+        dir.join("server-card.json"),
+        serde_json::to_string_pretty(&card)?,
+    )
+    .context("write server-card.json")?;
     Ok(())
 }
 

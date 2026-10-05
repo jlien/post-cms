@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/api/ask", axum::routing::post(ask))
+        .route("/mcp", axum::routing::post(mcp_endpoint))
         // Everything else (pages, posts, feeds) is a file under dist/.
         .fallback(get(serve_path))
         .with_state(state);
@@ -275,6 +276,206 @@ fn wants_gzip(req: &Request) -> bool {
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .map_or(false, |v| v.to_ascii_lowercase().contains("gzip"))
+}
+
+// ---- Public read-only MCP endpoint --------------------------------------
+//
+// Streamable-HTTP-style JSON-RPC at POST /mcp, unauthenticated by design:
+// every tool is read-only over dist/ output, so nothing here can mutate
+// content or trigger builds. Discovery paths (per the SEP-1649/1960
+// proposal + llms.txt convention, all emitted by the build):
+//   /.well-known/mcp/server-card.json, llms.txt "MCP Servers" section.
+// Registry/directory listings (official MCP Registry, connector dirs) are
+// deployment-side and not automated here.
+
+static SEARCH_INDEX: OnceLock<Option<serde_json::Value>> = OnceLock::new();
+
+/// dist/search-index.json as a vector of entry objects (title/url/description/
+/// date/tags/body per published post).
+fn search_index(state: &StaticDir) -> Vec<serde_json::Value> {
+    SEARCH_INDEX
+        .get_or_init(|| {
+            std::fs::read_to_string(state.0.join("search-index.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        })
+        .clone()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn mcp_tools_manifest() -> serde_json::Value {
+    let schema = |props: serde_json::Value, required: &[&str]| {
+        json!({
+            "type": "object",
+            "properties": props,
+            "required": required,
+        })
+    };
+    json!({
+        "tools": [
+            {
+                "name": "list_posts",
+                "description": "List all published posts with title, URL, description, date, and tags.",
+                "inputSchema": schema(json!({}), &[]),
+            },
+            {
+                "name": "get_post",
+                "description": "Fetch one published post as markdown by slug.",
+                "inputSchema": schema(
+                    json!({ "slug": { "type": "string", "description": "Post slug, e.g. caching-strategy" } }),
+                    &["slug"],
+                ),
+            },
+            {
+                "name": "search",
+                "description": "Keyword search over published posts (weighted: title > tags > body).",
+                "inputSchema": schema(
+                    json!({ "query": { "type": "string", "description": "Space-separated keywords" } }),
+                    &["query"],
+                ),
+            },
+        ]
+    })
+}
+
+/// Slug safety: lowercase alnum + dashes only, no traversal possible.
+fn mcp_slug_ok(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn mcp_call_tool(state: &StaticDir, req: &serde_json::Value) -> Result<serde_json::Value, (i64, String)> {
+    let name = req
+        .pointer("/params/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args = req
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let text_of = |v: serde_json::Value| -> Result<serde_json::Value, (i64, String)> {
+        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }))
+    };
+    match name {
+        "list_posts" => {
+            let posts: Vec<serde_json::Value> = search_index(state)
+                .iter()
+                .map(|e| {
+                    json!({
+                        "title": e.get("title"),
+                        "url": e.get("url"),
+                        "description": e.get("description"),
+                        "date": e.get("date"),
+                        "tags": e.get("tags"),
+                    })
+                })
+                .collect();
+            text_of(json!({ "count": posts.len(), "posts": posts }))
+        }
+        "get_post" => {
+            let slug = args.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            if !mcp_slug_ok(slug) {
+                return Err((-32000, "invalid slug".into()));
+            }
+            let path = state.0.join("posts").join(slug).join("index.md");
+            let body = std::fs::read_to_string(&path)
+                .map_err(|_| (-32000, format!("post not found: {slug}")))?;
+            Ok(json!({ "content": [{ "type": "text", "text": body }] }))
+        }
+        "search" => {
+            let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let tokens: Vec<String> = q
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect();
+            if tokens.is_empty() {
+                return Err((-32000, "empty query".into()));
+            }
+            let index = search_index(state);
+            let mut scored: Vec<(u32, &serde_json::Value)> = index
+                .iter()
+                .map(|e| {
+                    let title = e.get("title").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let body = e.get("body").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let tags: Vec<String> = e
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|t| t.as_str().map(|s| s.to_lowercase()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut score = 0u32;
+                    for t in &tokens {
+                        if title.contains(t.as_str()) {
+                            score += 3;
+                        }
+                        if tags.iter().any(|tag| tag.contains(t.as_str())) {
+                            score += 2;
+                        }
+                        if body.contains(t.as_str()) {
+                            score += 1;
+                        }
+                    }
+                    (score, e)
+                })
+                .filter(|(s, _)| *s > 0)
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let hits: Vec<serde_json::Value> = scored
+                .iter()
+                .take(8)
+                .map(|(score, e)| {
+                    json!({
+                        "title": e.get("title"),
+                        "url": e.get("url"),
+                        "description": e.get("description"),
+                        "date": e.get("date"),
+                        "score": score,
+                    })
+                })
+                .collect();
+            text_of(json!({ "query": q, "hits": hits }))
+        }
+        _ => Err((-32601, format!("unknown tool: {name}"))),
+    }
+}
+
+/// POST /mcp — JSON-RPC 2.0 request in, JSON-RPC response out.
+async fn mcp_endpoint(
+    State(s): State<StaticDir>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let id = req.get("id").cloned();
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    // Notifications take no response body (HTTP 202 per streamable-http).
+    if method.starts_with("notifications/") {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "post-cms", "version": env!("CARGO_PKG_VERSION") },
+        })),
+        "tools/list" => Ok(mcp_tools_manifest()),
+        "tools/call" => mcp_call_tool(&s, &req),
+        _ => Err((-32601, format!("method not found: {method}"))),
+    };
+    match result {
+        Ok(v) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": v })).into_response(),
+        Err((code, message)) => {
+            Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
+                .into_response()
+        }
+    }
 }
 
 async fn serve_path(State(s): State<StaticDir>, req: Request) -> Response {
