@@ -49,6 +49,10 @@ struct Collection {
     title: String,
     required: Vec<String>,
     types: std::collections::HashMap<String, String>,
+    /// Template used for item pages (schema.yaml `item_template`, default collection-item.html).
+    item_template: String,
+    /// Template used for the collection index (schema.yaml `index_template`, default collection.html).
+    index_template: String,
     items: Vec<CollectionItem>,
 }
 
@@ -544,6 +548,16 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
             .unwrap_or_default();
 
         let mut items = Vec::new();
+        let item_template = schema
+            .get("item_template")
+            .and_then(|v| v.as_str())
+            .unwrap_or("collection-item.html")
+            .to_string();
+        let index_template = schema
+            .get("index_template")
+            .and_then(|v| v.as_str())
+            .unwrap_or("collection.html")
+            .to_string();
         for item_entry in fs::read_dir(&path)
             .with_context(|| format!("read_dir {}", path.display()))?
         {
@@ -666,6 +680,8 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
             title,
             required,
             types,
+            item_template,
+            index_template,
             items,
         });
     }
@@ -687,6 +703,17 @@ fn render_collections(
     for coll in collections {
         // Item pages first; the index lists the published ones.
         let mut listed: Vec<serde_json::Value> = Vec::new();
+        // Fail fast with a clear name when a schema points at a missing template.
+        for (tpl, kind) in [(&coll.item_template, "item"), (&coll.index_template, "index")] {
+            if !tera.templates.contains_key(tpl) {
+                bail!(
+                    "collection `{}`: {} template `{}` not found (templates/ or theme overrides)",
+                    coll.name,
+                    kind,
+                    tpl
+                );
+            }
+        }
         for item in coll.items.iter().filter(|i| i.published) {
             let md_path = item.dir.join("index.mdx");
             let body = if md_path.exists() {
@@ -707,8 +734,8 @@ fn render_collections(
             ctx.insert("body", &body);
             ctx.extend(cfg.base_ctx(style, root));
             let html = tera
-                .render("collection-item.html", &ctx)
-                .with_context(|| format!("render collection-item.html for {}", item.slug))?;
+                .render(&coll.item_template, &ctx)
+                .with_context(|| format!("render {} for {}", coll.item_template, item.slug))?;
             let out_dir = dist.join(&coll.name).join(&item.slug);
             fs::create_dir_all(&out_dir)
                 .with_context(|| format!("mkdir {}", out_dir.display()))?;
@@ -727,8 +754,8 @@ fn render_collections(
         ctx.insert("items", &listed);
         ctx.extend(cfg.base_ctx(style, root));
         let html = tera
-            .render("collection.html", &ctx)
-            .with_context(|| format!("render collection.html for {}", coll.name))?;
+            .render(&coll.index_template, &ctx)
+            .with_context(|| format!("render {} for {}", coll.index_template, coll.name))?;
         let out_dir = dist.join(&coll.name);
         fs::create_dir_all(&out_dir)
             .with_context(|| format!("mkdir {}", out_dir.display()))?;

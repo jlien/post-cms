@@ -154,6 +154,28 @@ TOOLS = [
         },
     },
     {
+        "name": "propose_template",
+        "description": (
+            "Create or update a Tera template (templates/<name>.html) via the "
+            "review flow. Validates the template with a real build before "
+            "opening a PR, so a broken template never reaches a merge request. "
+            "Collections select templates with item_template/index_template in "
+            "their schema.yaml."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Template name (no ext) — becomes templates/<name>.html."},
+                "body": {"type": "string", "description": "Full template HTML. Should extend base and define {% block content %}."},
+                "tenant": {"type": "string", "description": "Isolated working copy (.tenants/<tenant>) for multi-tenant simulation."},
+                "author_name": {"type": "string", "description": "Git author name for the commit."},
+                "author_email": {"type": "string", "description": "Git author email for the commit."},
+                "merge": {"type": "boolean", "description": "Merge the PR immediately (default false)."},
+            },
+            "required": ["name", "body", "author_name", "author_email"],
+        },
+    },
+    {
         "name": "publish_status",
         "description": "Counts and lists of live vs pending (draft) posts.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -247,10 +269,150 @@ def _parse_date_or_today() -> str:
 
 # ------------------------------------------------------------------- git
 
-def _git(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _git(*args: str, env_extra: dict[str, str] | None = None,
+         worktree: Path | None = None) -> subprocess.CompletedProcess:
+    """Run git in ROOT or a linked worktree (multi-tenant isolation)."""
     env = {**os.environ, **(env_extra or {})}
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, env=env)
+    base = str(worktree) if worktree else str(ROOT)
+    return subprocess.run(["git", "-C", base, *args], cwd=str(ROOT),
+                          capture_output=True, text=True, env=env)
 
+
+def tenant_worktree(tenant: str) -> Path:
+    """Per-tenant working copy (simulates multi-tenant locally).
+
+    Each tenant gets a persistent git worktree under .tenants/<tenant>/
+    with its own index and checked-out files, so two tenants can propose
+    changes concurrently without touching each other or the shared tree.
+    The worktree is refreshed to the default branch head on every use.
+    """
+    if not tenant or "/" in tenant or ".." in tenant or tenant.startswith("."):
+        raise ValueError("invalid tenant name")
+    if not (ROOT / ".git").exists():
+        raise ValueError("not a git repository")
+    wt = ROOT / ".tenants" / tenant
+    if (wt / ".git").exists():
+        _git("fetch", "origin", worktree=wt)
+        _git("switch", "--detach", "origin/main", worktree=wt)
+        return wt
+    fetch = _git("fetch", "origin")
+    if fetch.returncode != 0:
+        raise ValueError(f"git fetch failed: {fetch.stderr.strip()[:300]}")
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    res = _git("worktree", "add", "--detach", str(wt), "origin/main")
+    if res.returncode != 0:
+        raise ValueError(f"git worktree add failed: {res.stderr.strip()[:300]}")
+    return wt
+
+
+def _reset_worktree(wt: Path, created: list[Path]) -> None:
+    """Undo uncommitted writes in a worktree (new files removed, tracked restored)."""
+    for p in created:
+        p.unlink(missing_ok=True)
+    _git("reset", "--hard", "origin/main", worktree=wt)
+
+
+def _open_pr(wt: Path, branch: str, title: str, pr_body: str) -> tuple[bool, str]:
+    pr = subprocess.run(["gh", "pr", "create", "--title", title, "--body", pr_body],
+                        cwd=str(wt), capture_output=True, text=True)
+    if pr.returncode != 0:
+        return False, pr.stderr.strip()[:300]
+    return True, pr.stdout.strip().splitlines()[-1]
+
+
+def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
+    """Create a Tera template via the review flow.
+
+    Writes templates/<name>.html on an agent/template-<name> branch,
+    validates it by running a real build (a template that does not compile
+    fails before any PR is opened), pushes, and opens a PR with a preview
+    command. Collections select templates via schema.yaml item_template /
+    index_template.
+    """
+    if not (ROOT / ".git").exists():
+        raise ValueError("not a git repository")
+    author_name = (args.get("author_name") or "").strip()
+    author_email = (args.get("author_email") or "").strip()
+    if not author_name or not author_email:
+        raise ValueError("author_name and author_email are required (identity on the MR)")
+    name = (args.get("name") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+        raise ValueError("template name must match [A-Za-z0-9][A-Za-z0-9_-]*")
+    body = args.get("body")
+    if not body or not body.strip():
+        raise ValueError("body (HTML) is required")
+    if "{% block content %}" not in body:
+        raise ValueError("template must extend a base and define a {% block content %}")
+    tenant = (args.get("tenant") or "").strip()
+    wt = tenant_worktree(tenant) if tenant else ROOT
+
+    tpl_rel = Path("templates") / f"{name}.html"
+    tpl_path = wt / tpl_rel
+    existed = tpl_path.exists()
+    if not tpl_path.parent.exists():
+        raise ValueError(f"templates/ directory not found in {'worktree' if tenant else 'repo'}")
+    tpl_path.write_text(body if body.endswith("\n") else body + "\n")
+
+    try:
+        # Validation: a real build compiles every template in templates/.
+        build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            _reset_worktree(wt, [] if existed else [tpl_path])
+            raise ValueError(f"template failed build validation:\n{tail}")
+
+        branch = f"agent/template-{name}"
+        _git("switch", "-C", branch, worktree=wt)
+        commit_env = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        verb = "update" if existed else "add"
+        res = _git("add", str(tpl_rel), worktree=wt)
+        res = _git("commit", "-m", f"propose: {verb} template {name}", env_extra=commit_env,
+                   worktree=wt)
+        if res.returncode != 0:
+            if "nothing to commit" in (res.stdout + res.stderr):
+                _reset_worktree(wt, [] if existed else [tpl_path])
+                raise ValueError("template content unchanged — nothing to propose")
+            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        push = _git("push", "-u", "origin", branch, worktree=wt)
+        if push.returncode != 0:
+            _reset_worktree(wt, [] if existed else [tpl_path])
+            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+
+        root_arg = "" if tenant else "  # or pass the same tenant to render from its worktree"
+        preview_cmd = (f"cd {wt} && cargo run -q -p build && "
+                       f"python3 -m http.server 8000 -d dist{root_arg}")
+        pr_body = (f"Agent-authored template by {author_name}.\n\n"
+                   f"Use: set `item_template: {name}.html` (or index_template) in a "
+                   f"collection's schema.yaml.\n\nPreview: {preview_cmd}")
+        ok, pr_or_err = _open_pr(wt, branch, f"Template: {name}", pr_body)
+
+        result: dict[str, Any] = {
+            "branch": branch,
+            "template": f"templates/{name}.html",
+            "existed": existed,
+            "tenant": tenant or None,
+            "pr_url": pr_or_err if ok else None,
+            "preview_command": preview_cmd,
+        }
+        if not ok:
+            result["pr_error"] = pr_or_err
+        if ok and args.get("merge"):
+            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
+                                   cwd=str(wt), capture_output=True, text=True)
+            result["merged"] = merge.returncode == 0
+            if merge.returncode != 0:
+                result["merge_error"] = merge.stderr.strip()[:300]
+        _reset_worktree(wt, [])
+        return result
+    except Exception:
+        _reset_worktree(wt, [] if existed else [tpl_path])
+        raise
 
 def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     """Collaboration flow: one branch + one commit + one PR per change.
@@ -261,6 +423,10 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     to origin and opens a merge request with `gh`. The PR body carries the
     preview command (build_preview on the branch) so a reviewer can render it
     locally before merging. `merge: true` merges via gh immediately.
+
+    With `tenant`, all writes happen inside that tenant's worktree
+    (.tenants/<tenant>/) instead of the repo root — multiple agents can
+    propose concurrently without touching each other's files.
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
@@ -277,9 +443,11 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     collection = (args.get("collection") or "posts").strip()
     if "/" in collection or ".." in collection:
         raise ValueError("invalid collection")
+    tenant = (args.get("tenant") or "").strip()
+    wt = tenant_worktree(tenant) if tenant else ROOT
 
     # Resolve target files. Existing item → update in place; new → draft item.
-    item_dir = ROOT / "content" / collection / slug
+    item_dir = wt / "content" / collection / slug
     meta_path = item_dir / "meta.yaml"
     md_path = item_dir / "index.mdx"
     is_new = not item_dir.exists()
@@ -292,10 +460,9 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         existing = _git("rev-parse", "--verify", "--quiet",
                         f"agent/{slug}-{n}").returncode
     branch = f"agent/{slug}-{n}" if n > 1 else f"agent/{slug}"
-    for step in (["switch", "-c", branch],):
-        res = _git(*step)
-        if res.returncode != 0:
-            raise ValueError(f"git {step[0]} failed: {res.stderr.strip()[:300]}")
+    res = _git("switch", "-C", branch, worktree=wt)
+    if res.returncode != 0:
+        raise ValueError(f"git switch failed: {res.stderr.strip()[:300]}")
 
     try:
         if is_new:
@@ -324,14 +491,14 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         if body_md and not is_new:
             md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
 
-        _git("add", str(item_dir))
+        _git("add", str(item_dir.relative_to(wt)), worktree=wt)
         commit_env = {
             "GIT_AUTHOR_NAME": author_name,
             "GIT_AUTHOR_EMAIL": author_email,
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
-        res = _git("commit", "-m", summary, env_extra=commit_env)
+        res = _git("commit", "-m", summary, env_extra=commit_env, worktree=wt)
         if res.returncode != 0:
             if "nothing to commit" in (res.stdout + res.stderr):
                 raise ValueError(
@@ -339,42 +506,46 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
                     "if the item already has this content, no MR is needed")
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
 
-        push = _git("push", "-u", "origin", branch)
+        push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
-        preview_cmd = (f"git fetch origin {branch} && git switch {branch} && "
+        preview_cmd = (f"cd {wt} && git fetch origin {branch} && git switch {branch} && "
                        f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
         pr_body = (f"Agent-authored change by {author_name}.\n\n"
                    f"Preview: {preview_cmd}")
-        pr = subprocess.run(
-            ["gh", "pr", "create", "--title", title, "--body", pr_body],
-            cwd=ROOT, capture_output=True, text=True)
-        pr_url = pr.stdout.strip().splitlines()[-1] if pr.returncode == 0 else None
+        ok, pr_or_err = _open_pr(wt, branch, title, pr_body)
 
         result: dict[str, Any] = {
             "branch": branch,
             "proposed": True,
             "is_new": is_new,
+            "tenant": tenant or None,
             "summary": summary,
-            "pr_url": pr_url,
+            "pr_url": pr_or_err if ok else None,
             "preview_command": preview_cmd,
         }
-        if pr.returncode != 0:
-            result["pr_error"] = pr.stderr.strip()[:300]
-        if args.get("merge") and pr_url:
+        if not ok:
+            result["pr_error"] = pr_or_err
+        if ok and args.get("merge"):
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
-                                   cwd=ROOT, capture_output=True, text=True)
+                                   cwd=str(wt), capture_output=True, text=True)
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
-        # Return to the default branch: the shared working tree must not sit
-        # on an agent branch after proposing.
-        if not args.get("merge"):
+        # Reset the worktree to the default branch head: it must be clean for
+        # the next proposal (the repo root is returned to main only when no
+        # tenant was used, since the shared tree must not sit on a branch).
+        if wt != ROOT:
+            _reset_worktree(wt, [])
+        else:
             _git("switch", "-")
         return result
     except Exception:
-        _git("switch", "-")
+        if wt != ROOT:
+            _reset_worktree(wt, [])
+        else:
+            _git("switch", "-")
         raise
 
 
@@ -528,6 +699,7 @@ HANDLERS = {
     "create_draft": tool_create_draft,
     "update_post": tool_update_post,
     "propose_change": tool_propose_change,
+    "propose_template": tool_propose_template,
     "build_site": tool_build_site,
     "build_preview": tool_build_preview,
     "add_media": tool_add_media,

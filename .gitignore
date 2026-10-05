@@ -5,3 +5,6 @@ ci/purge.log
 .DS_Store
 .minio-data/
 mcp/__pycache__/
+
+# multi-tenant simulation worktrees
+.tenants/
