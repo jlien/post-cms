@@ -146,6 +146,7 @@ TOOLS = [
                 "collection": {"type": "string", "description": "content/ subfolder: 'posts' (default) or a typed collection name."},
                 "description": {"type": "string"},
                 "body": {"type": "string", "description": "Full markdown body to set."},
+                "tenant": {"type": "string", "description": "Isolated working copy (.tenants/<tenant>) for multi-tenant simulation."},
                 "author_name": {"type": "string", "description": "Git author name for the commit."},
                 "author_email": {"type": "string", "description": "Git author email for the commit."},
                 "merge": {"type": "boolean", "description": "Merge the PR immediately (default false)."},
