@@ -1590,7 +1590,8 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
             an, ae = _author_of(branch)
             if _is_self_approval(an, ae, ident):
                 raise ValueError(
-                    f"REQUIRE_DISTINCT_APPROVER is set: {s!r} was authored by "
+                    f"distinct approver required (default over HTTP; set "
+                    f"REQUIRE_DISTINCT_APPROVER=0 to disable): {s!r} was authored by "
                     f"{an or ae!r}, the same human now approving it — a proposal "
                     "cannot approve itself"
                 )
