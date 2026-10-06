@@ -8,6 +8,10 @@ plugins:
   - name: hubspot-form
     mounts: [body_end]
     csp_script_src: ["js.hsforms.net", "js.hs-scripts.com"]
-    require_consent: true
-    # per-page component: only dist/contact/ — forms don't belong on every page
+    # Product call (pass 5, item 2): the form is NOT consent-gated — gating
+    # the contact form itself costs conversions. Consent-gate tracking
+    # plugins only (they set require_consent: true and get the banner).
+    require_consent: false
+    # per-page component: only dist/contact/, inside the template's slot
     pages: [contact]
+    anchor: contact-form

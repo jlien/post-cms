@@ -473,6 +473,12 @@ struct PluginCfg {
     /// grants consent (cookie pcms_consent=granted, or a pcms:grant event).
     #[serde(default)]
     require_consent: bool,
+    /// In-content mount: the template places `<div data-pcms-slot="<name>">`
+    /// and the snippet is injected inside it instead of at the head/body_end
+    /// mount (a form below the footer is a bug, not a feature). Falls back
+    /// to the declared mount when the slot is absent from the page.
+    #[serde(default)]
+    anchor: Option<String>,
     /// Restrict injection to pages whose dist path contains this component
     /// (e.g. `pages: [contact]` matches dist/contact/index.html). Empty =
     /// every page. Forms and page-scoped widgets use this; consent-gated
@@ -529,14 +535,27 @@ fn plugin_snippet(root: &Path, p: &PluginCfg, mount: &str) -> Result<String> {
     if !p.require_consent {
         return Ok(raw);
     }
-    let esc = raw.replace('\\', "\\\\").replace('`', "\\`").replace("</", "<\\/");
+    let anchor_js = match &p.anchor {
+        // Mount into the template's slot element when present; else the
+        // declared mount. The slot lookup runs at grant time.
+        Some(a) => format!(
+            "var slot=document.querySelector('[data-pcms-slot=\"{a}\"]');var host=slot||(MOUNT==='head'?document.head:document.body);",
+            a = a
+        ),
+        None => "var host=MOUNT==='head'?document.head:document.body;".to_string(),
+    };
+    let esc = raw
+        .replace('\\', "\\\\")
+        .replace('$', "\\$") // ${...} inside a template literal would EVALUATE
+        .replace('`', "\\`")
+        .replace("</", "<\\/");
     Ok(format!(
         r#"<script>(function(){{
 var MOUNT="{mount}";
+{anchor_js}
 var granted=function(){{return document.cookie.indexOf('pcms_consent=granted')!==-1}};
 var go=function(){{
 if(window.__pcms_{name})return;window.__pcms_{name}=1;
-var host=MOUNT==='head'?document.head:document.body;
 var t=document.createElement('template');t.innerHTML=`{esc}`;
 var root=document.createElement('div');root.setAttribute('data-pcms-plugin','{name}');
 Array.from(t.content.childNodes).forEach(function(n){{
@@ -560,6 +579,7 @@ check();window.addEventListener('pcms:grant',check);
 "#,
         name = p.name,
         mount = mount,
+        anchor_js = anchor_js,
         esc = esc
     ))
 }
@@ -655,25 +675,56 @@ fn render_plugins(root: &Path, dist: &Path) -> Result<usize> {
             plugins.iter().filter(|p| plugin_applies(p, rel)).collect();
         let mut head_parts: Vec<String> = Vec::new();
         let mut end_parts: Vec<String> = Vec::new();
+        // (anchor name, declared mount, snippet) for UNGATED plugins — they
+        // are string-inserted inside the template's slot element.
+        let mut anchored_parts: Vec<(String, String, String)> = Vec::new();
         let mut domains: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for p in &applicable {
             for m in &p.mounts {
                 let snippet = plugin_snippet(root, p, m)?;
-                match m.as_str() {
-                    "head" => head_parts.push(snippet),
-                    "body_end" => end_parts.push(snippet),
-                    _ => unreachable!("mounts validated in load_plugins"),
+                match (&p.anchor, p.require_consent) {
+                    // Gated plugins keep the mount position: their gate JS
+                    // looks the slot up in the DOM at grant time.
+                    (Some(a), false) => anchored_parts.push((a.clone(), m.clone(), snippet)),
+                    _ => match m.as_str() {
+                        "head" => head_parts.push(snippet),
+                        "body_end" => end_parts.push(snippet),
+                        _ => unreachable!("mounts validated in load_plugins"),
+                    },
                 }
             }
             domains.extend(p.csp_script_src.iter().cloned());
         }
         let consent = applicable.iter().any(|p| p.require_consent) && any_consent;
-        if head_parts.is_empty() && end_parts.is_empty() && domains.is_empty() && !consent {
+        if head_parts.is_empty()
+            && end_parts.is_empty()
+            && anchored_parts.is_empty()
+            && domains.is_empty()
+            && !consent
+        {
             return Ok(());
         }
         let html = fs::read_to_string(path)?;
         let mut out = html.clone();
+        // Ungated anchored plugins: inject inside the template's slot
+        // element (after its opening tag). Missing slot → declared mount.
+        for (a, m, snip) in &anchored_parts {
+            let needle = format!("data-pcms-slot=\"{}\"", a);
+            let at = out
+                .find(&needle)
+                .and_then(|i| out[i..].find('>').map(|g| i + g + 1));
+            match at {
+                Some(ins) => out.insert_str(ins, snip),
+                None => {
+                    if m == "head" {
+                        head_parts.push(snip.clone());
+                    } else {
+                        end_parts.push(snip.clone());
+                    }
+                }
+            }
+        }
         if !domains.is_empty() {
             let mut list: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
             list.sort();
