@@ -3,6 +3,8 @@
 {% block content %}
 <article>
   <h1 class="text-3xl font-bold text-heading leading-tight">{{ title }}</h1>
+  {% if draft %}<p class="inline-block bg-card border border-line rounded-full px-2.5 text-xs text-muted mb-3 mt-1">DRAFT PREVIEW — review copy from a proposal; the live site is at /{{ slug }}/</p>{% endif %}
+  {% if draft and agent_notes %}<aside class="agent-notes border border-line rounded p-3 mb-6 text-sm text-muted"><strong class="text-fg">Agent notes:</strong> {{ agent_notes }}</aside>{% endif %}
   <p class="text-muted text-sm mb-8 mt-2">
     {{ date }} · lang: {{ lang }}
     <span>{% for tag in tags %}<span class="inline-block bg-card border border-line rounded-full px-2.5 text-xs text-muted mr-1.5">{{ tag }}</span>{% endfor %}</span>

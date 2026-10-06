@@ -14,8 +14,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -146,12 +148,66 @@ TOOLS = [
                 "collection": {"type": "string", "description": "content/ subfolder: 'posts' (default) or a typed collection name."},
                 "description": {"type": "string"},
                 "body": {"type": "string", "description": "Full markdown body to set."},
+                "agent_notes": {"type": "string", "description": "Agent commentary rendered only in the draft preview (why the draft is written this way, open questions)."},
+                "fields": {"type": "object", "description": "Extra meta keys, e.g. typed-collection fields (vendor, tier). Schema-validated by a real build before the PR opens."},
+                "published": {"type": "boolean", "description": "Target published state of a NEW item (default false). true = publish on approve."},
                 "tenant": {"type": "string", "description": "Isolated working copy (.tenants/<tenant>) for multi-tenant simulation."},
                 "author_name": {"type": "string", "description": "Git author name for the commit."},
                 "author_email": {"type": "string", "description": "Git author email for the commit."},
                 "merge": {"type": "boolean", "description": "Merge the PR immediately (default false)."},
             },
             "required": ["slug", "author_name", "author_email"],
+        },
+    },
+    {
+        "name": "revise_proposal",
+        "description": (
+            "Iterate on an existing proposal: same branch, same PR, version "
+            "N+1. Pass slug plus any of body/title/description/agent_notes/"
+            "fields/collection. The push updates the PR in place — feedback "
+            "revises the artifact instead of opening a new PR."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Slug of the proposed item."},
+                "collection": {"type": "string", "description": "content/ subfolder (default 'posts')."},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "body": {"type": "string"},
+                "agent_notes": {"type": "string"},
+                "fields": {"type": "object", "description": "Extra meta keys to set/overwrite (e.g. {\"published\": true} to publish on approve)."},
+                "author_name": {"type": "string"},
+                "author_email": {"type": "string"},
+            },
+            "required": ["slug", "author_name", "author_email"],
+        },
+    },
+    {
+        "name": "list_proposals",
+        "description": (
+            "The proposal queue: open PRs on agent/* branches with number, "
+            "title, slug, author, URL and the DRAFTS=1 draft-preview command "
+            "for each. The review surface, readable by humans and agents."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "approve_proposal",
+        "description": (
+            "Approve a proposal: records the approver's identity as a PR "
+            "comment, merges the PR, then builds, deploys and purges — "
+            "'approve' means live. deploy=false skips the deploy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Slug of the proposed item."},
+                "approver_name": {"type": "string"},
+                "approver_email": {"type": "string"},
+                "deploy": {"type": "boolean", "description": "Build+deploy+purge after merge (default true)."},
+            },
+            "required": ["slug", "approver_name", "approver_email"],
         },
     },
     {
@@ -230,6 +286,8 @@ def _read_body(slug: str) -> str:
 def _yaml_value(v: Any) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
     if isinstance(v, list):
         if not v:
             return "[]"
@@ -421,13 +479,21 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     Instead of committing to the shared working tree, this writes the change
     on an agent/<slug>-<n> branch, commits with the caller's git identity
     (author_name/author_email — required, so the MR carries a human), pushes
-    to origin and opens a merge request with `gh`. The PR body carries the
-    preview command (build_preview on the branch) so a reviewer can render it
-    locally before merging. `merge: true` merges via gh immediately.
+    to origin and opens a merge request with `gh`. The PR body carries a
+    DRAFTS=1 preview command: it builds unpublished items to
+    dist/preview/drafts/ so the reviewer sees the rendered page (with the
+    proposal's agent_notes embedded) without touching git. `merge: true`
+    merges via gh immediately.
 
     With `tenant`, all writes happen inside that tenant's worktree
     (.tenants/<tenant>/) instead of the repo root — multiple agents can
     propose concurrently without touching each other's files.
+
+    `agent_notes` (string) rides on the item and renders only in the draft
+    preview — the agent's voice next to its work. `fields` (object) writes
+    extra meta keys, e.g. typed-collection fields like vendor/tier; schema
+    validation happens in a real build BEFORE the commit, so a proposal that
+    would fail the build is rejected with the exact error and no PR opens.
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
@@ -438,9 +504,17 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required (existing post slug or new draft slug)")
-    title = (args.get("title") or "").strip() or f"Update {slug}"
+    raw_title = (args.get("title") or "").strip()
+    title = raw_title or f"Update {slug}"
     body_md = args.get("body")  # optional new markdown body
     description = args.get("description")
+    agent_notes = args.get("agent_notes")
+    if agent_notes is not None and not isinstance(agent_notes, str):
+        agent_notes = json.dumps(agent_notes, ensure_ascii=False)
+    fields = args.get("fields") or {}
+    if not isinstance(fields, dict):
+        raise ValueError("fields must be an object of extra meta keys")
+    published = bool(args.get("published"))
     collection = (args.get("collection") or "posts").strip()
     if "/" in collection or ".." in collection:
         raise ValueError("invalid collection")
@@ -469,28 +543,42 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         if is_new:
             item_dir.mkdir(parents=True, exist_ok=True)
             lines = [
-                f'title: "{(args.get("title") or slug).strip()}"',
+                f'title: "{raw_title or slug}"',
                 f'slug: "{slug}"',
-                "published: false",
+                f"published: {str(published).lower()}",
             ]
             if description:
                 lines.append(f'description: "{description}"')
             if collection == "posts":
                 lines.append(f"date: {datetime.now(timezone.utc).date().isoformat()}")
+            if agent_notes is not None:
+                lines.append(f"agent_notes: {_yaml_value(agent_notes)}")
+            for k, v in fields.items():
+                lines.append(f"{k}: {_yaml_value(v)}")
             meta_path.write_text("\n".join(lines) + "\n")
             if body_md:
                 md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
             summary = f"propose: new {collection}/{slug} draft"
         else:
             summary = f"propose: update {collection}/{slug}"
-            if description is not None:
-                cur = meta_path.read_text()
-                if "description:" in cur:
-                    cur = re.sub(r'(?m)^description:.*$',
-                                 f'description: "{description}"', cur)
-                    meta_path.write_text(cur)
+            _apply_meta_edits(meta_path,
+                              title=raw_title or None,
+                              description=description,
+                              agent_notes=agent_notes,
+                              fields=fields or None)
         if body_md and not is_new:
             md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+
+        # Validate with a real build BEFORE committing anything: a schema
+        # violation or broken item fails here with the exact compiler error,
+        # so a proposal never opens a PR it can't render.
+        build = subprocess.run(
+            ["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
+            capture_output=True, text=True,
+            env={**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")})
+        if build.returncode != 0:
+            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            raise ValueError(f"proposal failed build validation:\n{tail}")
 
         _git("add", str(item_dir.relative_to(wt)), worktree=wt)
         commit_env = {
@@ -512,8 +600,11 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
         preview_cmd = (f"cd {wt} && git fetch origin {branch} && git switch {branch} && "
-                       f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
+                       f"DRAFTS=1 cargo run -q -p build && "
+                       f"python3 -m http.server 8000 -d dist")
+        preview_url = f"http://localhost:8000/preview/drafts/{collection}/{slug}/"
         pr_body = (f"Agent-authored change by {author_name}.\n\n"
+                   f"Preview URL (after running the command): {preview_url}\n"
                    f"Preview: {preview_cmd}")
         ok, pr_or_err = _open_pr(wt, branch, title, pr_body)
 
@@ -548,6 +639,239 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         else:
             _git("switch", "-")
         raise
+
+
+def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
+                      description: str | None = None,
+                      agent_notes: str | None = None,
+                      fields: dict[str, Any] | None = None) -> None:
+    """Rewrite keys in an existing item's meta.yaml, appending missing ones."""
+    cur = meta_path.read_text()
+    changed = False
+    for key, val in (("title", title), ("description", description),
+                     ("agent_notes", agent_notes)):
+        if val is None:
+            continue
+        line = f"{key}: {_yaml_value(val)}"
+        if re.search(rf"(?m)^{re.escape(key)}:", cur):
+            cur = re.sub(rf"(?m)^{re.escape(key)}:.*$", line, cur)
+        else:
+            cur = cur.rstrip("\n") + "\n" + line + "\n"
+        changed = True
+    for k, v in (fields or {}).items():
+        line = f"{k}: {_yaml_value(v)}"
+        if re.search(rf"(?m)^{re.escape(k)}:", cur):
+            cur = re.sub(rf"(?m)^{re.escape(k)}:.*$", line, cur)
+        else:
+            cur = cur.rstrip("\n") + "\n" + line + "\n"
+        changed = True
+    if changed:
+        meta_path.write_text(cur)
+
+
+def _proposal_branch(slug: str) -> str | None:
+    """Latest agent/<slug>-<n> (or agent/<slug>) branch, local or on origin."""
+    for n in range(20, 1, -1):
+        name = f"agent/{slug}-{n}"
+        if (_git("rev-parse", "--verify", "--quiet", name).returncode == 0
+                or _git("rev-parse", "--verify", "--quiet",
+                        f"origin/{name}").returncode == 0):
+            return name
+    if (_git("rev-parse", "--verify", "--quiet", f"agent/{slug}").returncode == 0
+            or _git("rev-parse", "--verify", "--quiet",
+                    f"origin/agent/{slug}").returncode == 0):
+        return f"agent/{slug}"
+    return None
+
+
+def _open_pr_for_branch(branch: str) -> str | None:
+    """URL of the open PR whose head is `branch`, or None."""
+    res = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "url", "--limit", "1"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    try:
+        prs = json.loads(res.stdout or "[]")
+        return prs[0]["url"] if prs else None
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Iterate on an existing proposal: same branch, same PR, version N+1.
+
+    This is the artifact-model iteration unit — feedback revises the artifact
+    instead of opening a new PR. Writes happen in a throwaway worktree of the
+    proposal branch, so the shared tree and other tenants are never touched.
+    The push updates the open PR in place; a new DRAFTS=1 preview is available
+    from the same PR body command.
+    """
+    author_name = (args.get("author_name") or "").strip()
+    author_email = (args.get("author_email") or "").strip()
+    if not author_name or not author_email:
+        raise ValueError("author_name and author_email are required (identity on the revision)")
+    slug = (args.get("slug") or "").strip()
+    if not slug or "/" in slug or ".." in slug:
+        raise ValueError("slug required")
+    branch = _proposal_branch(slug)
+    if branch is None:
+        raise ValueError(f"no open proposal branch for slug {slug!r} (propose_change first)")
+    collection = (args.get("collection") or "posts").strip()
+    if "/" in collection or ".." in collection:
+        raise ValueError("invalid collection")
+
+    tmp = ROOT / ".tenants" / f"revise-{slug}-{int(time.time() * 1000)}"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    ref = branch
+    if _git("rev-parse", "--verify", "--quiet", branch).returncode != 0:
+        ref = f"origin/{branch}"
+    res = _git("worktree", "add", "--detach", str(tmp), ref)
+    if res.returncode != 0:
+        raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
+    try:
+        item_dir = tmp / "content" / collection / slug
+        if not item_dir.exists():
+            raise ValueError(f"{collection}/{slug} not on {branch}")
+        meta_path = item_dir / "meta.yaml"
+        md_path = item_dir / "index.mdx"
+        body_md = args.get("body")
+        if body_md:
+            md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+        agent_notes = args.get("agent_notes")
+        if agent_notes is not None and not isinstance(agent_notes, str):
+            agent_notes = json.dumps(agent_notes, ensure_ascii=False)
+        fields = args.get("fields")
+        if not isinstance(fields, dict):
+            fields = None
+        raw_title = (args.get("title") or "").strip() or None
+        _apply_meta_edits(meta_path, title=raw_title,
+                          description=args.get("description"),
+                          agent_notes=agent_notes, fields=fields)
+        _git("add", str(item_dir.relative_to(tmp)), worktree=tmp)
+        env = {"GIT_AUTHOR_NAME": author_name, "GIT_AUTHOR_EMAIL": author_email,
+               "GIT_COMMITTER_NAME": author_name, "GIT_COMMITTER_EMAIL": author_email}
+        res = _git("commit", "-m", f"revise: {collection}/{slug} from review feedback",
+                   env_extra=env, worktree=tmp)
+        if res.returncode != 0 and "nothing to commit" not in (res.stdout + res.stderr):
+            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
+        if push.returncode != 0:
+            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+        return {"revised": True, "branch": branch,
+                "pr_url": _open_pr_for_branch(branch),
+                "preview_command": (f"cd {tmp} && DRAFTS=1 cargo run -q -p build && "
+                                    f"python3 -m http.server 8000 -d dist")}
+    finally:
+        _git("worktree", "remove", "--force", str(tmp))
+        _git("worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def tool_list_proposals(_args: dict[str, Any]) -> dict[str, Any]:
+    """The proposal queue: open PRs whose head branch is agent/*, with the
+    draft-preview command for each. This is the human- and agent-readable
+    review surface git was hiding."""
+    res = subprocess.run(
+        ["gh", "pr", "list", "--state", "open", "--json",
+         "number,title,headRefName,url,author,createdAt"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if res.returncode != 0:
+        raise ValueError(f"gh pr list failed: {res.stderr.strip()[:300]}")
+    try:
+        prs = json.loads(res.stdout or "[]")
+    except ValueError:
+        raise ValueError(f"gh pr list returned non-JSON: {res.stdout[:200]}")
+    proposals = []
+    for p in prs:
+        head = str(p.get("headRefName") or "")
+        if not head.startswith("agent/"):
+            continue
+        slug = head.removeprefix("agent/").rsplit("-", 1)[0]
+        proposals.append({
+            "number": p.get("number"),
+            "title": p.get("title"),
+            "branch": head,
+            "slug": slug,
+            "url": p.get("url"),
+            "author": (p.get("author") or {}).get("name"),
+            "preview_command": f"cd {ROOT} && git fetch origin {head} && "
+                               f"git switch {head} && DRAFTS=1 cargo run -q -p build && "
+                               f"python3 -m http.server 8000 -d dist",
+        })
+    return {"proposals": proposals, "count": len(proposals)}
+
+
+def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Approve a proposal: merge its PR, then build + deploy + purge so
+    'approve' means live, not 'a human will now run scripts'. The approver's
+    identity is recorded as a comment on the PR — the audit receipt."""
+    approver_name = (args.get("approver_name") or "").strip()
+    approver_email = (args.get("approver_email") or "").strip()
+    if not approver_name or not approver_email:
+        raise ValueError("approver_name and approver_email are required (identity on the record)")
+    slug = (args.get("slug") or "").strip()
+    if not slug or "/" in slug or ".." in slug:
+        raise ValueError("slug required")
+    branch = _proposal_branch(slug)
+    if branch is None:
+        raise ValueError(f"no proposal branch for slug {slug!r}")
+    pr_number = None
+    res = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "number", "--limit", "1"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            prs = json.loads(res.stdout or "[]")
+            pr_number = prs[0]["number"] if prs else None
+        except (ValueError, KeyError, IndexError):
+            pr_number = None
+    if pr_number is None:
+        raise ValueError(f"no open PR on {branch} — nothing to approve")
+
+    result: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
+    comment = subprocess.run(
+        ["gh", "pr", "comment", str(pr_number), "--body",
+         f"Approved by {approver_name} <{approver_email}> via approve_proposal."],
+        cwd=str(ROOT), capture_output=True, text=True)
+    result["approval_recorded"] = comment.returncode == 0
+
+    merge = subprocess.run(
+        ["gh", "pr", "merge", str(pr_number), "--merge", "--delete-branch"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if merge.returncode != 0:
+        raise ValueError(f"merge failed: {merge.stderr.strip()[:300]}")
+    result["merged"] = True
+
+    if not args.get("deploy", True):
+        result["deploy"] = "skipped (deploy=false)"
+        return result
+
+    # Bring the shared tree to the merged head, then ship it.
+    _git("fetch", "origin")
+    switch = _git("switch", "main")
+    if switch.returncode != 0:
+        switch = _git("switch", "-")
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty.stdout.strip():
+        result["deploy"] = ("merged, but the shared tree is dirty — run the "
+                            "deploy manually after committing or stashing")
+        result["dirty"] = dirty.stdout.strip()[:200]
+        return result
+    pull = _git("pull", "--ff-only", "origin", "main")
+    if pull.returncode != 0:
+        raise ValueError(f"pull after merge failed: {pull.stderr.strip()[:300]}")
+    deploy = subprocess.run(["bash", "ci/deploy.sh"], cwd=str(ROOT),
+                            capture_output=True, text=True, timeout=600)
+    if deploy.returncode != 0:
+        raise ValueError(f"deploy failed: {(deploy.stdout + deploy.stderr)[-400:]}")
+    result["deploy"] = "ok"
+    purge = subprocess.run(["bash", "ci/purge.sh"], cwd=str(ROOT),
+                           capture_output=True, text=True)
+    result["purge"] = "ok" if purge.returncode == 0 else purge.stderr.strip()[:200]
+    return result
 
 
 def git_commit(message: str) -> dict[str, Any]:
@@ -701,6 +1025,9 @@ HANDLERS = {
     "update_post": tool_update_post,
     "propose_change": tool_propose_change,
     "propose_template": tool_propose_template,
+    "revise_proposal": tool_revise_proposal,
+    "list_proposals": tool_list_proposals,
+    "approve_proposal": tool_approve_proposal,
     "build_site": tool_build_site,
     "build_preview": tool_build_preview,
     "add_media": tool_add_media,

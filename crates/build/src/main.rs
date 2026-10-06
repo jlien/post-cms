@@ -26,6 +26,11 @@ struct Meta {
     date: NaiveDate,
     #[serde(default)]
     description: String,
+    /// Agent commentary carried on drafts and rendered in the preview
+    /// (why the draft is written this way, open questions) — never on the
+    /// live site, where drafts are skipped entirely.
+    #[serde(default)]
+    agent_notes: Option<String>,
 }
 
 /// One item of a typed collection (content/<collection>/<slug>/).
@@ -70,6 +75,9 @@ impl Meta {
         ctx.insert("published", &self.published);
         ctx.insert("date", &self.date.to_string());
         ctx.insert("description", &self.description);
+        if let Some(notes) = &self.agent_notes {
+            ctx.insert("agent_notes", notes);
+        }
         ctx.insert("body", body);
         ctx
     }
@@ -244,6 +252,44 @@ fn main() -> Result<()> {
     render_search_index(&root, &dist, &posts)?;
     render_posts_markdown(&dist, &posts)?;
     render_embeddings(&root, &dist, &posts)?;
+    // ---- draft previews --------------------------------------------------
+    // DRAFTS=1 renders unpublished posts + collection items under
+    // dist/preview/drafts/ with a draft banner and embedded agent_notes, so
+    // a proposal's reviewer sees the rendered page without touching git.
+    // The plain build never produces preview/, so deploys stay clean.
+    let drafts_on = std::env::var("DRAFTS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if drafts_on {
+        let draft_root = dist.join("preview").join("drafts");
+        copy_theme_assets(&theme_dir, &draft_root, &theme_name)?;
+        let mut draft_links = render_draft_posts(
+            &tera, &draft_root, &posts, &styling, &cfg, "/preview/drafts",
+        )?;
+        draft_links.extend(render_draft_collections(
+            &tera, &draft_root, &collections, &styling, &cfg, "/preview/drafts",
+        )?);
+        let mut idx = String::from(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <title>Draft previews</title></head><body \
+             style=\"font-family:system-ui,-apple-system,sans-serif;max-width:40rem;\
+             margin:3rem auto;padding:0 1rem\"><h1>Draft previews</h1>\
+             <p>Unpublished items rendered from the current branch. Not for production.</p><ul>",
+        );
+        for (path, title) in &draft_links {
+            idx.push_str(&format!("<li><a href=\"{}\">{}</a></li>", path, title));
+        }
+        idx.push_str("</ul></body></html>");
+        fs::create_dir_all(&draft_root)?;
+        fs::write(draft_root.join("index.html"), idx)?;
+        eprintln!(
+            "draft previews built: {} items -> /preview/drafts/",
+            draft_links.len()
+        );
+    }
+
     let images_saved = optimize_images(&dist)?;
     if images_saved > 0 {
         println!("optimized images: {} bytes saved", images_saved);
@@ -687,6 +733,101 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
     }
     collections.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(collections)
+}
+
+/// Render preview copies under dist/preview/drafts/ so a reviewer can see
+/// the page as it will appear, with the proposal's agent_notes embedded.
+/// All items are rendered (not just unpublished) so a publish-on-approve
+/// proposal is reviewable too. Only runs when DRAFTS=1 — deploys always
+/// build without it, and ci/deploy.sh excludes preview/ from the rsync.
+fn render_draft_posts(
+    tera: &Tera,
+    out_root: &Path,
+    posts: &[Post],
+    style: &Styling,
+    cfg: &SiteConfig,
+    root: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut listed = Vec::new();
+    for post in posts.iter() {
+        let md_path = post.dir.join("index.mdx");
+        let body = if md_path.exists() {
+            render_markdown(&fs::read_to_string(&md_path).with_context(|| {
+                format!("read {}", md_path.display())
+            })?)?
+        } else {
+            String::new()
+        };
+        let mut ctx = post.meta.to_context(&body);
+        ctx.insert("draft", &true);
+        ctx.extend(cfg.base_ctx(style, root));
+        let html = tera
+            .render("post.html", &ctx)
+            .with_context(|| format!("render draft post {}", post.meta.slug))?;
+        let out_dir = out_root.join("posts").join(&post.meta.slug);
+        fs::create_dir_all(&out_dir)
+            .with_context(|| format!("mkdir {}", out_dir.display()))?;
+        fs::write(out_dir.join("index.html"), html)
+            .with_context(|| format!("write draft {}/index.html", out_dir.display()))?;
+        let title = post.meta.title.clone();
+        listed.push((format!("/preview/drafts/posts/{}/", post.meta.slug), title));
+    }
+    Ok(listed)
+}
+
+/// Draft items of typed collections, at the collection's schema-selected
+/// template. agent_notes travels in the item's fields map (pass-through), so
+/// surface it explicitly and keep it out of the field list via the template.
+fn render_draft_collections(
+    tera: &Tera,
+    out_root: &Path,
+    collections: &[Collection],
+    style: &Styling,
+    cfg: &SiteConfig,
+    root: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut listed = Vec::new();
+    for coll in collections {
+        for item in coll.items.iter() {
+            let md_path = item.dir.join("index.mdx");
+            let body = if md_path.exists() {
+                render_markdown(&fs::read_to_string(&md_path).with_context(|| {
+                    format!("read {}", md_path.display())
+                })?)?
+            } else {
+                String::new()
+            };
+            let mut ctx = TeraContext::new();
+            ctx.insert("title", &item.title);
+            ctx.insert("slug", &item.slug);
+            ctx.insert("description", &item.description);
+            if let Some(d) = item.date {
+                ctx.insert("date", &d.to_string());
+            }
+            ctx.insert("fields", &item.fields);
+            if let Some(serde_json::Value::String(notes)) =
+                item.fields.get("agent_notes").cloned()
+            {
+                ctx.insert("agent_notes", &notes);
+            }
+            ctx.insert("body", &body);
+            ctx.insert("draft", &true);
+            ctx.extend(cfg.base_ctx(style, root));
+            let html = tera
+                .render(&coll.item_template, &ctx)
+                .with_context(|| format!("render draft {} item {}", coll.name, item.slug))?;
+            let out_dir = out_root.join(&coll.name).join(&item.slug);
+            fs::create_dir_all(&out_dir)
+                .with_context(|| format!("mkdir {}", out_dir.display()))?;
+            fs::write(out_dir.join("index.html"), html)
+                .with_context(|| format!("write draft {}/index.html", out_dir.display()))?;
+            listed.push((
+                format!("/preview/drafts/{}/{}/", coll.name, item.slug),
+                item.title.clone(),
+            ));
+        }
+    }
+    Ok(listed)
 }
 
 /// Render typed collections: per-item pages at /<collection>/<slug>/ and a

@@ -11,5 +11,5 @@ ORIGIN_TARGET="${ORIGIN_TARGET:-./deploy-target}"
 bash ci/build.sh
 
 mkdir -p "$ORIGIN_TARGET"
-rsync -a --delete dist/ "$ORIGIN_TARGET/"
+rsync -a --delete --exclude=preview/ dist/ "$ORIGIN_TARGET/"
 echo "done: rsynced dist/ → $ORIGIN_TARGET"
