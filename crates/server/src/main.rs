@@ -4,6 +4,7 @@
 //! posts (/posts/<slug>/), and feed/meta files. Cache-Control headers follow
 //! the CDN guidance baked into the build.
 
+use anyhow::Context;
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -54,13 +55,19 @@ fn content_type_for(path: &StdPath) -> (&'static str, &'static str) {
 }
 
 fn main() -> anyhow::Result<()> {
-    let dist = repo_root()?.join("dist");
+    let root = repo_root()?;
+    let dist = root.join("dist");
     if !dist.is_dir() {
         anyhow::bail!(
             "dist/ not found at {} — run `cargo run -p build` first",
             dist.display()
         );
     }
+    // Redirect rules are startup config: a malformed map refuses to start
+    // (loud, like the build failing on a broken schema) instead of silently
+    // 404-ing migrated URLs.
+    let redirects = load_redirects(&root)?;
+    let _ = REDIRECTS.set(redirects);
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -128,6 +135,111 @@ fn ask_max_concurrent() -> usize {
 }
 
 static ASK_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+// ---- URL redirect map (migration / restructure) ---------------------------
+//
+// redirects.yaml at the repo root, committed like any content change:
+//
+//   /old-page/: {to: /new-page/, status: 301}
+//   /old-post: /posts/moved/
+//
+// A bare string target means 301 (permanent). Loaded once at startup — a
+// malformed map fails startup loudly, the same contract as the build failing
+// on a broken schema.
+#[derive(Clone, Debug)]
+struct Redirect {
+    from: String,
+    to: String,
+    status: u16,
+}
+
+static REDIRECTS: OnceLock<Vec<Redirect>> = OnceLock::new();
+
+fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
+    let path = root.join("redirects.yaml");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parse {}", path.display()))?;
+    let map = parsed
+        .as_mapping()
+        .ok_or_else(|| anyhow::anyhow!("{}: must be a mapping of from → to", path.display()))?;
+    let mut out = Vec::new();
+    for (k, v) in map {
+        let from = k
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{}: keys must be paths", path.display()))?
+            .to_string();
+        let (to, status) = match v {
+            serde_yaml::Value::String(to) => (to.clone(), 301),
+            serde_yaml::Value::Mapping(m) => {
+                let to = m
+                    .get(serde_yaml::Value::from("to"))
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{}: `{from}` needs a `to` target", path.display())
+                    })?
+                    .to_string();
+                let status = m
+                    .get(serde_yaml::Value::from("status"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(301) as u16;
+                if status != 301 && status != 302 && status != 307 && status != 308 {
+                    return Err(anyhow::anyhow!(
+                        "{}: `{from}` status {status} must be 301, 302, 307 or 308",
+                        path.display()
+                    ));
+                }
+                (to, status)
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "{}: `{from}` value must be a target path or a {{to, status}} mapping",
+                    path.display()
+                ))
+            }
+        };
+        if !to.starts_with('/') {
+            return Err(anyhow::anyhow!(
+                "{}: `{from}` target `{to}` must be an absolute path",
+                path.display()
+            ));
+        }
+        out.push(Redirect { from: from.trim_matches('/').to_string(), to, status });
+    }
+    if out.is_empty() {
+        eprintln!("redirects: {} is empty", path.display());
+    } else {
+        eprintln!("redirects: {} rules loaded from {}", out.len(), path.display());
+    }
+    Ok(out)
+}
+
+/// Exact-match lookup against the loaded map. Paths are compared
+/// slash-stripped, so /old-page, /old-page/ and old-page all match.
+fn redirect_for(rel: &str) -> Option<&'static Redirect> {
+    let rel = rel.trim_matches('/');
+    REDIRECTS.get().and_then(|map| {
+        map.iter()
+            .find(|r| !r.from.is_empty() && r.from == rel)
+    })
+}
+
+fn redirect_response(r: &Redirect) -> Response {
+    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
+    let mut resp = (status, String::new()).into_response();
+    if let Ok(v) = HeaderValue::from_str(&r.to) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    // Redirects are permanent routing facts, not content: let the CDN cache
+    // them but revalidate daily.
+    let v = HeaderValue::from_static("public, max-age=86400");
+    resp.headers_mut().insert(header::CACHE_CONTROL, v);
+    resp
+}
 
 fn ask_semaphore() -> &'static tokio::sync::Semaphore {
     ASK_SEM.get_or_init(|| tokio::sync::Semaphore::new(ask_max_concurrent()))
@@ -217,6 +329,11 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     let rel = rel.trim_matches('/').to_string();
     if rel.is_empty() {
         return not_found(root.clone());
+    }
+    // Redirects win before the filesystem: a migrated URL must never depend
+    // on the old file still existing.
+    if let Some(r) = redirect_for(&rel) {
+        return redirect_response(r);
     }
     // Reject traversal and empty segments.
     if rel.split('/').any(|seg| {
