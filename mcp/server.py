@@ -463,6 +463,31 @@ def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None =
     return True, pr.stdout.strip().splitlines()[-1]
 
 
+def _artifact_payload(html_path: str | None) -> dict[str, Any]:
+    """Artifact as CONTENT, not a filesystem path: over the hosted HTTP
+    transport the reviewer's chat client cannot read the MCP server's /tmp,
+    so the rendered HTML travels in the tool result itself (capped)."""
+    payload: dict[str, Any] = {"path": html_path}
+    if not html_path:
+        return payload
+    try:
+        html = Path(html_path).read_text()
+    except OSError:
+        return payload
+    if len(html) > 400_000:
+        html = html[:400_000] + "\n<!-- truncated (artifact path has the full page) -->"
+    payload["html"] = html
+    return payload
+
+
+def _save_artifact(name: str, html: str) -> str | None:
+    out_dir = Path(tempfile.gettempdir()) / "pcms-artifacts"
+    out_dir.mkdir(exist_ok=True)
+    out = out_dir / name
+    out.write_text(html)
+    return str(out)
+
+
 def _render_preview_artifact(wt: Path, collection: str, slug: str) -> str | None:
     """Per-PR preview as a chat artifact, not a hosted URL: DRAFTS=1 build in
     the proposal worktree renders the item AS IT WILL APPEAR (site template,
@@ -496,10 +521,16 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
-    author_name = (args.get("author_name") or "").strip()
-    author_email = (args.get("author_email") or "").strip()
-    if not author_name or not author_email:
-        raise ValueError("author_name and author_email are required (identity on the MR)")
+    # Author identity comes from the authenticated session, not from a
+    # typed name: an agent could otherwise propose as "Alice", approve as
+    # itself, and launder self-approval past the distinct-approver check.
+    # Free-text author_name/email stay OPTIONAL but must MATCH the session
+    # (same contract as approve_proposal).
+    author_i = _check_declared_identity(
+        (args.get("author_name") or "").strip(),
+        (args.get("author_email") or "").strip())
+    author_name = author_i["name"] or author_i["login"]
+    author_email = author_i["email"] or f"{author_i['login']}@users.noreply.github.com"
     name = (args.get("name") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
         raise ValueError("template name must match [A-Za-z0-9][A-Za-z0-9_-]*")
@@ -565,6 +596,15 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
             "pr_url": pr_or_err if ok else None,
             "preview_command": preview_cmd,
         }
+        if ok:
+            # The template source IS the diff under review — it travels in
+            # the result so remote reviewers see it without the server fs.
+            try:
+                result["template_artifact"] = _artifact_payload(
+                    _save_artifact(f"template-{name}.html",
+                                   tpl_path.read_text()))
+            except OSError:
+                pass
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
@@ -621,10 +661,16 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
-    author_name = (args.get("author_name") or "").strip()
-    author_email = (args.get("author_email") or "").strip()
-    if not author_name or not author_email:
-        raise ValueError("author_name and author_email are required (identity on the MR)")
+    # Author identity comes from the authenticated session, not from a
+    # typed name: an agent could otherwise propose as "Alice", approve as
+    # itself, and launder self-approval past the distinct-approver check.
+    # Free-text author_name/email stay OPTIONAL but must MATCH the session
+    # (same contract as approve_proposal).
+    author_i = _check_declared_identity(
+        (args.get("author_name") or "").strip(),
+        (args.get("author_email") or "").strip())
+    author_name = author_i["name"] or author_i["login"]
+    author_email = author_i["email"] or f"{author_i['login']}@users.noreply.github.com"
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required (existing post slug or new draft slug)")
@@ -782,8 +828,9 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         }
         if ok:
             # Per-PR preview as a chat artifact: the rendered page travels
-            # into the review thread instead of needing a hosted URL.
-            result["preview_artifact"] = _render_preview_artifact(wt, collection, slug)
+            # INTO the result (path + html), not to a server-local path.
+            result["preview_artifact"] = _artifact_payload(
+                _render_preview_artifact(wt, collection, slug))
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
@@ -914,10 +961,16 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
-    author_name = (args.get("author_name") or "").strip()
-    author_email = (args.get("author_email") or "").strip()
-    if not author_name or not author_email:
-        raise ValueError("author_name and author_email are required (identity on the MR)")
+    # Author identity comes from the authenticated session, not from a
+    # typed name: an agent could otherwise propose as "Alice", approve as
+    # itself, and launder self-approval past the distinct-approver check.
+    # Free-text author_name/email stay OPTIONAL but must MATCH the session
+    # (same contract as approve_proposal).
+    author_i = _check_declared_identity(
+        (args.get("author_name") or "").strip(),
+        (args.get("author_email") or "").strip())
+    author_name = author_i["name"] or author_i["login"]
+    author_email = author_i["email"] or f"{author_i['login']}@users.noreply.github.com"
     name = (args.get("name") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", name):
         raise ValueError("plugin name must match [A-Za-z0-9][A-Za-z0-9-]*")
@@ -988,12 +1041,20 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
 
         # Validation: a real build. The build crate rejects declared plugins
         # with no snippet, unknown mounts, and bad names — so a broken plugin
-        # never reaches a PR.
+        # never reaches a PR. The build output doubles as the review artifact:
+        # dist/index.html has the plugin injected at its declared mount, so
+        # the reviewer sees exactly what a visitor's browser would run.
         build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
                                capture_output=True, text=True)
         if build.returncode != 0:
             tail = "\n".join(build.stderr.strip().splitlines()[-15:])
             raise ValueError(f"plugin failed build validation:\n{tail}")
+        rendered_artifact = None
+        if not remove:
+            built = wt / "dist" / "index.html"
+            if built.exists():
+                rendered_artifact = _artifact_payload(
+                    _save_artifact(f"plugin-{name}.html", built.read_text()))
 
         branch = f"agent/plugin-{name}"
         _git("add", str(plugin_dir.relative_to(wt)), worktree=wt)
@@ -1038,6 +1099,10 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             "tenant": tenant or None,
             "pr_url": pr_or_err if ok else None,
         }
+        if ok and rendered_artifact:
+            # The rendered page (plugin injected at its mount) travels in the
+            # result — reviewable over HTTP without touching the server's fs.
+            result["rendered_artifact"] = rendered_artifact
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
@@ -1147,10 +1212,13 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
     The push updates the open PR in place; a new DRAFTS=1 preview is available
     from the same PR body command.
     """
-    author_name = (args.get("author_name") or "").strip()
-    author_email = (args.get("author_email") or "").strip()
-    if not author_name or not author_email:
-        raise ValueError("author_name and author_email are required (identity on the revision)")
+    # Same contract as propose_change: the reviser's identity comes from the
+    # authenticated session, not free text.
+    author_i = _check_declared_identity(
+        (args.get("author_name") or "").strip(),
+        (args.get("author_email") or "").strip())
+    author_name = author_i["name"] or author_i["login"]
+    author_email = author_i["email"] or f"{author_i['login']}@users.noreply.github.com"
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
@@ -1203,7 +1271,8 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
         return {"revised": True, "branch": branch,
                 "pr_url": _open_pr_for_branch(branch),
-                "preview_artifact": _render_preview_artifact(tmp, collection, slug),
+                "preview_artifact": _artifact_payload(
+                    _render_preview_artifact(tmp, collection, slug)),
                 "preview_command": (f"cd {tmp} && DRAFTS=1 cargo run -q -p build && "
                                     f"python3 -m http.server 8000 -d dist")}
     finally:
@@ -1492,7 +1561,15 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     approver_name = ident["name"] or ident["login"]
     approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
     identity_source = ident["source"]
-    distinct = os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
+    # Distinct-approver defaults ON over the hosted HTTP transport (many
+    # principals, so self-approval is a real risk there) and OFF on a
+    # single-identity stdio machine (one human; blocking would freeze the
+    # loop). Explicit env always wins.
+    transport_http = os.environ.get("PCMS_TRANSPORT") == "http"
+    if "REQUIRE_DISTINCT_APPROVER" in os.environ:
+        distinct = os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
+    else:
+        distinct = transport_http
     slugs = args.get("slugs")
     if not slugs:
         slug = (args.get("slug") or "").strip()

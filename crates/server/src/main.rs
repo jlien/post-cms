@@ -808,8 +808,20 @@ async fn ask(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "LLM_API_KEY is empty" }))).into_response();
     }
 
-    let base = env::var("LLM_BASE_URL").unwrap_or_else(|_| "http://100.84.30.114:8000/v1".into());
-    let model = env::var("LLM_MODEL").unwrap_or_else(|_| "glm-5.3-flash".into());
+    let base = env::var("LLM_BASE_URL").ok().filter(|b| !b.trim().is_empty());
+    let model = env::var("LLM_MODEL").ok().filter(|m| !m.trim().is_empty());
+    // No hardcoded fallback: an unconfigured origin must refuse /api/ask
+    // rather than silently proxying to whatever host was compiled in.
+    let (base, model) = match (base, model) {
+        (Some(b), Some(m)) => (b, m),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "LLM not configured: set LLM_BASE_URL and LLM_MODEL to enable /api/ask" })),
+            )
+                .into_response()
+        }
+    };
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let corpus = load_corpus(&s.0);

@@ -473,6 +473,12 @@ struct PluginCfg {
     /// grants consent (cookie pcms_consent=granted, or a pcms:grant event).
     #[serde(default)]
     require_consent: bool,
+    /// Restrict injection to pages whose dist path contains this component
+    /// (e.g. `pages: [contact]` matches dist/contact/index.html). Empty =
+    /// every page. Forms and page-scoped widgets use this; consent-gated
+    /// tracking stays site-wide.
+    #[serde(default)]
+    pages: Vec<String>,
 }
 
 fn load_plugins(root: &Path) -> Result<Vec<PluginCfg>> {
@@ -501,6 +507,9 @@ fn load_plugins(root: &Path) -> Result<Vec<PluginCfg>> {
                 bail!("plugin {:?} has unknown mount {:?} (head / body_end)", cfg.name, m);
             }
         }
+        if cfg.pages.iter().any(|p| p.trim().is_empty()) {
+            bail!("plugin {:?} has an empty entry in pages:", cfg.name);
+        }
         plugins.push(cfg);
     }
     Ok(plugins)
@@ -508,8 +517,12 @@ fn load_plugins(root: &Path) -> Result<Vec<PluginCfg>> {
 
 /// The plugin's snippet, consent-gated when require_consent is set. The gate
 /// re-creates <script> nodes from the stored template (scripts inserted via
-/// innerHTML never execute) and only runs once consent exists.
-fn plugin_snippet(root: &Path, p: &PluginCfg) -> Result<String> {
+/// innerHTML never execute) and only runs once consent exists. Fixes over
+/// the first gate: non-script nodes mount at the DECLARED mount (head or
+/// body — a form div appended to <head> is invisible), and scripts execute
+/// in document order with external src awaited (an inline `hbspt.forms...`
+/// can no longer run before v2.js loads).
+fn plugin_snippet(root: &Path, p: &PluginCfg, mount: &str) -> Result<String> {
     let path = root.join("plugins").join(&p.name).join("snippet.html");
     let raw = fs::read_to_string(path)
         .with_context(|| format!("plugin {:?} declared but plugins/{}/snippet.html missing", p.name, p.name))?;
@@ -518,10 +531,61 @@ fn plugin_snippet(root: &Path, p: &PluginCfg) -> Result<String> {
     }
     let esc = raw.replace('\\', "\\\\").replace('`', "\\`").replace("</", "<\\/");
     Ok(format!(
-        "<script>(function(){{\nvar granted=function(){{return document.cookie.indexOf('pcms_consent=granted')!==-1}};\nvar go=function(){{\nif(window.__pcms_{name})return;window.__pcms_{name}=1;\nvar t=document.createElement('template');t.innerHTML=`{esc}`;\nt.content.querySelectorAll('script').forEach(function(old){{\nvar s=document.createElement('script');\nfor(var i=0;i<old.attributes.length;i++){{var a=old.attributes[i];s.setAttribute(a.name,a.value)}}\ns.text=old.text;document.head.appendChild(s);\n}});\ndocument.head.appendChild(t.content);\n}};\nvar check=function(){{if(granted())go()}};\ncheck();window.addEventListener('pcms:grant',check);\n}})();</script>\n",
+        r#"<script>(function(){{
+var MOUNT="{mount}";
+var granted=function(){{return document.cookie.indexOf('pcms_consent=granted')!==-1}};
+var go=function(){{
+if(window.__pcms_{name})return;window.__pcms_{name}=1;
+var host=MOUNT==='head'?document.head:document.body;
+var t=document.createElement('template');t.innerHTML=`{esc}`;
+var root=document.createElement('div');root.setAttribute('data-pcms-plugin','{name}');
+Array.from(t.content.childNodes).forEach(function(n){{
+if(n.nodeType===1&&n.tagName==='SCRIPT')return;
+root.appendChild(n);
+}});
+if(root.childNodes.length)host.appendChild(root);
+var scripts=Array.from(t.content.querySelectorAll('script'));var i=0;
+var next=function(){{
+if(i>=scripts.length)return;
+var old=scripts[i++];var s=document.createElement('script');
+for(var a=0;a<old.attributes.length;a++){{var at=old.attributes[a];s.setAttribute(at.name,at.value)}}
+if(old.src){{s.onload=next;s.onerror=next;host.appendChild(s);}}
+else{{s.text=old.text;host.appendChild(s);next();}}
+}};
+next();
+}};
+var check=function(){{if(granted())go()}};
+check();window.addEventListener('pcms:grant',check);
+}})();</script>
+"#,
         name = p.name,
+        mount = mount,
         esc = esc
     ))
+}
+
+/// One consent banner per build: shown only while pcms_consent is unset,
+/// Accept sets the cookie for a year, dispatches pcms:grant, removes itself.
+/// Without it, require_consent plugins wait forever — nothing in a static
+/// site ever fires pcms:grant.
+fn consent_banner() -> String {
+    r#"<div id="pcms-consent-bar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:9999;background:#111827;color:#f9fafb;font:14px system-ui,sans-serif;padding:12px 16px;justify-content:space-between;align-items:center;gap:16px">
+<span>This site uses cookies for analytics and forms. Accept to enable them.</span>
+<button id="pcms-consent-accept" type="button" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 16px;cursor:pointer;font:inherit">Accept</button>
+</div>
+<script>(function(){
+var bar=document.getElementById('pcms-consent-bar');
+if(!bar)return;
+if(document.cookie.indexOf('pcms_consent=granted')===-1){bar.style.display='flex';}
+document.getElementById('pcms-consent-accept').addEventListener('click',function(){
+var d=new Date();d.setFullYear(d.getFullYear()+1);
+document.cookie='pcms_consent=granted; expires='+d.toUTCString()+'; path=/';
+bar.style.display='none';
+window.dispatchEvent(new Event('pcms:grant'));
+});
+})();</script>
+"#
+    .to_string()
 }
 
 /// Copy plugins/<name>/assets/* to dist/assets/<name>/ (plain copies — the
@@ -549,93 +613,122 @@ fn copy_plugin_assets(root: &Path, dist: &Path, name: &str) -> Result<()> {
     walk(&src, &dst_root)
 }
 
-/// Inject all declared plugins into every rendered HTML file in dist/.
-/// Returns the number of files touched.
+/// Inject all declared plugins into rendered HTML files in dist/. Plugins
+/// with a `pages:` list only inject on matching pages (path component match);
+/// the consent banner ships once per page when any active plugin requires
+/// consent. Returns the number of files touched.
 fn render_plugins(root: &Path, dist: &Path) -> Result<usize> {
     let plugins = load_plugins(root)?;
     if plugins.is_empty() {
         return Ok(0);
     }
-    let mut head_parts: Vec<String> = Vec::new();
-    let mut end_parts: Vec<String> = Vec::new();
-    let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for p in &plugins {
         copy_plugin_assets(root, dist, &p.name)?;
-        let snippet = plugin_snippet(root, p)?;
-        for m in &p.mounts {
-            match m.as_str() {
-                "head" => head_parts.push(snippet.clone()),
-                "body_end" => end_parts.push(snippet.clone()),
-                _ => unreachable!("mounts validated in load_plugins"),
-            }
-        }
-        domains.extend(p.csp_script_src.iter().cloned());
     }
-    let head_html: String = if head_parts.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from("\n<!-- plugins: build-time injection (site.yaml plugins:) -->\n");
-        for p in &head_parts {
-            s.push_str(p);
-            s.push('\n');
+    let any_consent = plugins.iter().any(|p| p.require_consent);
+
+    fn plugin_applies(p: &PluginCfg, rel: &Path) -> bool {
+        if p.pages.is_empty() {
+            return true;
         }
-        s
-    };
-    let end_html: String = if end_parts.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from("\n<!-- plugins: build-time injection (site.yaml plugins:) -->\n");
-        for p in &end_parts {
-            s.push_str(p);
-            s.push('\n');
-        }
-        s
-    };
-    let csp_meta = if domains.is_empty() {
-        String::new()
-    } else {
-        let mut list: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
-        list.sort();
-        format!(
-            "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'unsafe-inline' {}\">\n",
-            list.join(" ")
-        )
-    };
+        let comps: Vec<String> = rel
+            .components()
+            .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+            .collect();
+        p.pages.iter().any(|pg| {
+            comps.iter().any(|c| c == pg)
+                // dist/index.html is the home page
+                || (pg == "home" && comps.len() == 1 && comps[0] == "index.html")
+        })
+    }
 
     let mut touched = 0usize;
-    fn inject_all(dir: &Path, head: &str, end: &str, csp: &str, touched: &mut usize) -> Result<()> {
+    fn inject_one(
+        root: &Path,
+        path: &Path,
+        rel: &Path,
+        plugins: &[PluginCfg],
+        any_consent: bool,
+        touched: &mut usize,
+    ) -> Result<()> {
+        let applicable: Vec<&PluginCfg> =
+            plugins.iter().filter(|p| plugin_applies(p, rel)).collect();
+        let mut head_parts: Vec<String> = Vec::new();
+        let mut end_parts: Vec<String> = Vec::new();
+        let mut domains: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for p in &applicable {
+            for m in &p.mounts {
+                let snippet = plugin_snippet(root, p, m)?;
+                match m.as_str() {
+                    "head" => head_parts.push(snippet),
+                    "body_end" => end_parts.push(snippet),
+                    _ => unreachable!("mounts validated in load_plugins"),
+                }
+            }
+            domains.extend(p.csp_script_src.iter().cloned());
+        }
+        let consent = applicable.iter().any(|p| p.require_consent) && any_consent;
+        if head_parts.is_empty() && end_parts.is_empty() && domains.is_empty() && !consent {
+            return Ok(());
+        }
+        let html = fs::read_to_string(path)?;
+        let mut out = html.clone();
+        if !domains.is_empty() {
+            let mut list: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+            list.sort();
+            let csp = format!(
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'unsafe-inline' {}\">\n",
+                list.join(" ")
+            );
+            if let Some(i) = out.find("<head>") {
+                out.insert_str(i + 6, &csp);
+            }
+        }
+        let banner = if consent { consent_banner() } else { String::new() };
+        for (parts, anchor) in [
+            (&head_parts, "</head>"),
+            (&end_parts, "</body>"),
+        ] {
+            if parts.is_empty() {
+                continue;
+            }
+            let mut block =
+                String::from("\n<!-- plugins: build-time injection (site.yaml plugins:) -->\n");
+            for p in parts {
+                block.push_str(p);
+                block.push('\n');
+            }
+            if !banner.is_empty() {
+                block.push_str(&banner);
+            }
+            if let Some(i) = out.find(anchor) {
+                out.insert_str(i, &block);
+            }
+        }
+        if out != html {
+            fs::write(path, out)?;
+            *touched += 1;
+        }
+        Ok(())
+    }
+
+    fn walk(root: &Path, dir: &Path, base: &Path, plugins: &[PluginCfg], any_consent: bool,
+            touched: &mut usize) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                inject_all(&path, head, end, csp, touched)?;
+                walk(root, &path, base, plugins, any_consent, touched)?;
             } else if path.extension().and_then(|e| e.to_str()) == Some("html") {
-                let html = fs::read_to_string(&path)?;
-                let mut out = html.clone();
-                if !csp.is_empty() {
-                    if let Some(i) = out.find("<head>") {
-                        out.insert_str(i + 6, csp);
-                    }
-                }
-                if !head.is_empty() {
-                    if let Some(i) = out.find("</head>") {
-                        out.insert_str(i, head);
-                    }
-                }
-                if !end.is_empty() {
-                    if let Some(i) = out.find("</body>") {
-                        out.insert_str(i, end);
-                    }
-                }
-                if out != html {
-                    fs::write(&path, out)?;
-                    *touched += 1;
-                }
+                let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+                inject_one(root, &path, &rel, plugins, any_consent, touched)?;
             }
         }
         Ok(())
     }
-    inject_all(dist, &head_html, &end_html, &csp_meta, &mut touched)?;
+
+    walk(root, dist, dist, &plugins, any_consent, &mut touched)?;
     Ok(touched)
 }
 

@@ -41,6 +41,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Load the stdio server module by path (its mcp/ dir must not shadow the
 # pip `mcp` package, and this file is executed as a script, not an import).
+# The HTTP transport is a multi-principal channel: identity-aware defaults
+# (e.g. distinct approver) key off this marker downstream.
+os.environ["PCMS_TRANSPORT"] = "http"
 _spec = importlib.util.spec_from_file_location("pcms_server", Path(__file__).with_name("server.py"))
 if _spec is None or _spec.loader is None:
     sys.exit("cannot load server.py next to http_server.py")
