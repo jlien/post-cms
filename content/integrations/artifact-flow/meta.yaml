@@ -1,0 +1,8 @@
+title: "Artifact Flow"
+slug: "artifact-flow"
+published: true
+description: "Proof item for the artifact-model editorial layer."
+agent_notes: "Verified against the local build only; the tier is a guess — reviewer should confirm. Setup time unverified."
+vendor: "Artifact Analytics"
+tier: "partner"
+setup_minutes: 10
