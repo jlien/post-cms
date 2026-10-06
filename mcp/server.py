@@ -1342,11 +1342,32 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
     return ident
 
 
-def _author_email_of(branch: str) -> str:
-    """Author email of the proposal's latest commit (for distinct-approver
-    checks in multi-human deployments)."""
-    res = _git("log", "--format=%ae", "-1", branch)
-    return res.stdout.strip() if res.returncode == 0 else ""
+def _author_of(branch: str) -> tuple[str, str]:
+    """(name, email) of the proposal's latest commit — for distinct-approver
+    checks in multi-human deployments."""
+    res = _git("log", "--format=%an|%ae", "-1", branch)
+    if res.returncode != 0 or "|" not in res.stdout:
+        return ("", "")
+    name, email = res.stdout.strip().split("|", 1)
+    return (name, email)
+
+
+def _is_self_approval(author_name: str, author_email: str, ident: dict[str, Any]) -> bool:
+    """True when the proposal was authored by the same human who is now
+    approving it. Compared against every form the session identity takes
+    (login, name, noreply email, real email) — an author cannot launder
+    their identity through a different email field."""
+    if not author_name and not author_email:
+        return False
+    candidates = {
+        c.lower() for c in (
+            ident["login"],
+            ident["name"],
+            ident["email"],
+            f"{ident['login']}@users.noreply.github.com",
+        ) if c
+    }
+    return (author_name.lower() in candidates) or (author_email.lower() in candidates)
 
 
 def _approve_one(slug: str, approver_name: str, approver_email: str,
@@ -1418,10 +1439,13 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
         # commit is authored by the same account), enforced when set.
         for s in slugs:
             branch = _proposal_branch(s)
-            if branch and _author_email_of(branch).lower() == approver_email.lower():
+            if not branch:
+                continue
+            an, ae = _author_of(branch)
+            if _is_self_approval(an, ae, ident):
                 raise ValueError(
-                    f"REQUIRE_DISTINCT_APPROVER is set: the approver "
-                    f"({approver_email}) is the author of {s!r} — a proposal "
+                    f"REQUIRE_DISTINCT_APPROVER is set: {s!r} was authored by "
+                    f"{an or ae!r}, the same human now approving it — a proposal "
                     "cannot approve itself"
                 )
 
