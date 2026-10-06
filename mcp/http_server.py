@@ -83,14 +83,8 @@ def _http_json(url: str, token: str | None = None) -> dict:
     req = urlreq.Request(url)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urlreq.urlopen(req, timeout=10) as resp:  # noqa: S310 — fixed https URLs
-            return json.loads(resp.read().decode())
-    except HTTPError as exc:
-        raise AuthError(
-            f"connector rejected the token ({exc.code})") from exc
-    except URLError as exc:
-        raise AuthError(f"connector unreachable: {exc.reason}") from exc
+    with urlreq.urlopen(req, timeout=10) as resp:  # noqa: S310 — fixed https URLs
+        return json.loads(resp.read().decode())
 
 
 def _identity_github(token: str) -> dict:
