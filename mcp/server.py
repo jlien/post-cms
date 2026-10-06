@@ -445,9 +445,13 @@ def _reset_worktree(wt: Path, created: list[Path]) -> None:
     _git("checkout", "--detach", "origin/main", worktree=wt)
 
 
-def _open_pr(wt: Path, branch: str, title: str, pr_body: str) -> tuple[bool, str]:
-    pr = subprocess.run(["gh", "pr", "create", "--title", title, "--body", pr_body],
-                        cwd=str(wt), capture_output=True, text=True)
+def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None = None):
+    """Open a PR. head: source branch name, needed when the worktree is
+    detached (throwaway worktrees) so gh can name the head ref."""
+    cmd = ["gh", "pr", "create", "--title", title, "--body", pr_body]
+    if head:
+        cmd += ["--head", head]
+    pr = subprocess.run(cmd, cwd=str(wt), capture_output=True, text=True)
     if pr.returncode != 0:
         return False, pr.stderr.strip()[:300]
     return True, pr.stdout.strip().splitlines()[-1]
@@ -866,16 +870,30 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     csp_script_src = [d.strip() for d in (args.get("csp_script_src") or []) if d.strip()]
     require_consent = bool(args.get("require_consent"))
     tenant = (args.get("tenant") or "").strip()
-    wt = tenant_worktree(tenant) if tenant else ROOT
 
-    site_path = wt / "site.yaml"
-    if not site_path.exists():
-        raise ValueError("site.yaml not found in repo")
-    plugin_dir = wt / "plugins" / name
-    snippet_path = plugin_dir / "snippet.html"
-    created: list[Path] = []
+    # A throwaway worktree on origin/main — the shared tree is never touched,
+    # so a failed proposal cannot leave uncommitted writes behind (and a
+    # cleanup handler can never eat unrelated work the way a reset --hard
+    # on the shared tree would).
+    tmp: Path | None = None
+    if tenant:
+        wt = tenant_worktree(tenant)
+    else:
+        _git("fetch", "origin")
+        tmp = ROOT / ".tenants" / f"plugin-{name}-{int(time.time() * 1000)}"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        res = _git("worktree", "add", "--detach", str(tmp), "origin/main")
+        if res.returncode != 0:
+            raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
+        wt = tmp
 
     try:
+        site_path = wt / "site.yaml"
+        if not site_path.exists():
+            raise ValueError("site.yaml not found in repo")
+        plugin_dir = wt / "plugins" / name
+        snippet_path = plugin_dir / "snippet.html"
+
         current = _read_site_yaml_plugins(site_path)
         if remove:
             if not any(e["name"] == name for e in current):
@@ -913,22 +931,25 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"plugin failed build validation:\n{tail}")
 
         branch = f"agent/plugin-{name}"
-        _git("switch", "-C", branch, worktree=wt)
+        _git("add", str(plugin_dir.relative_to(wt)), worktree=wt)
+        _git("add", "site.yaml", worktree=wt)
         commit_env = {
             "GIT_AUTHOR_NAME": author_name,
             "GIT_AUTHOR_EMAIL": author_email,
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
-        _git("add", str(plugin_dir.relative_to(wt)), worktree=wt)
-        _git("add", "site.yaml", worktree=wt)
         res = _git("commit", "-m", f"propose: {verb} plugin {name}", env_extra=commit_env,
                    worktree=wt)
         if res.returncode != 0:
             if "nothing to commit" in (res.stdout + res.stderr):
                 raise ValueError("plugin unchanged — nothing to propose")
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
-        push = _git("push", "-u", "origin", branch, worktree=wt)
+        if tmp is not None:
+            push = _git("push", "origin", f"HEAD:refs/heads/{branch}",
+                        "--force-with-lease", worktree=wt)
+        else:
+            push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
@@ -941,7 +962,8 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
                       "The PR diff IS the pixel being added — review the script URLs.")
         pr_body = (f"Agent-authored plugin by {author_name}.\n\n"
                    f"risk: tracking\n\n{detail}")
-        ok, pr_or_err = _open_pr(wt, branch, f"Plugin ({verb}): {name}", pr_body)
+        ok, pr_or_err = _open_pr(wt, branch, f"Plugin ({verb}): {name}", pr_body,
+                                 head=None if tmp is None else branch)
 
         result: dict[str, Any] = {
             "branch": branch,
@@ -982,16 +1004,14 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             _git("switch", "-")
         return result
     except Exception:
-        for p in created:
-            p.unlink(missing_ok=True)
         if wt != ROOT:
             _reset_worktree(wt, [])
-        else:
-            _git("switch", "-")
-            # The shared tree must stay clean: undo the staged/unstaged
-            # plugin writes (safe — proposals are the only write path).
-            _git("reset", "-q", "--hard")
         raise
+    finally:
+        if tmp is not None:
+            _git("worktree", "remove", "--force", str(tmp))
+            _git("worktree", "prune")
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
