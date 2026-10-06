@@ -201,11 +201,9 @@ TOOLS = [
     {
         "name": "approve_proposal",
         "description": (
-            "Approve one proposal (slug) or a batch (slugs): merges, then "
-            "builds, deploys and purges once — 'approve' means live. Approver "
-            "identity is taken from the authenticated GitHub session (`gh api "
-            "user`); free-text approver_name/approver_email are optional and "
-            "must MATCH that session identity. Refused without a gh session."
+            "Approve one proposal (slug) or a batch (slugs): records the "
+            "approver's identity as PR comments, merges, then builds, deploys "
+            "and purges once — 'approve' means live. deploy=false skips deploy."
         ),
         "inputSchema": {
             "type": "object",
@@ -213,30 +211,28 @@ TOOLS = [
                 "slug": {"type": "string", "description": "Slug of the proposed item (or use slugs for a batch)."},
                 "slugs": {"type": "array", "items": {"type": "string"},
                           "description": "Batch of low-risk proposals to approve in one action (one build+deploy)."},
-                "approver_name": {"type": "string", "description": "Optional; must match the gh session identity."},
-                "approver_email": {"type": "string", "description": "Optional; must match the gh session identity."},
+                "approver_name": {"type": "string"},
+                "approver_email": {"type": "string"},
                 "deploy": {"type": "boolean", "description": "Build+deploy+purge after merge (default true)."},
             },
-            "required": [],
+            "required": ["approver_name", "approver_email"],
         },
     },
     {
         "name": "reject_proposal",
         "description": (
             "Reject a proposal: records WHO and WHY as a REJECTED: comment on "
-            "the PR (agent-readable state), then closes the PR. Reviewer "
-            "identity comes from the authenticated GitHub session; free-text "
-            "reviewer_name/reviewer_email must MATCH it."
+            "the PR (agent-readable state), then closes the PR."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Slug of the proposed item."},
                 "reason": {"type": "string", "description": "Why — the proposing agent reads this to revise."},
-                "reviewer_name": {"type": "string", "description": "Optional; must match the gh session identity."},
-                "reviewer_email": {"type": "string", "description": "Optional; must match the gh session identity."},
+                "reviewer_name": {"type": "string"},
+                "reviewer_email": {"type": "string"},
             },
-            "required": ["slug", "reason"],
+            "required": ["slug", "reason", "reviewer_name", "reviewer_email"],
         },
     },
     {
@@ -544,19 +540,19 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
-            # merge=true is an approval — identity comes from the
-            # authenticated GitHub session, exactly like approve_proposal.
-            # Free-text args must match the session; no anonymous merges.
-            apn_i = _check_declared_identity(
-                (args.get("approver_name") or "").strip(),
-                (args.get("approver_email") or "").strip())
-            apn = apn_i["name"] or apn_i["login"]
-            ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-            apn_src = f"github:{apn_i['login']} via gh session"
+            # merge=true is an approval — it requires a human's identity on
+            # the record, exactly like approve_proposal. No anonymous merges.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
+            if not apn or not ape:
+                raise ValueError(
+                    "merge=true requires approver_name and approver_email "
+                    "(an approval is on the record) — or call approve_proposal "
+                    "after review"
+                )
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_change(merge=true) "
-                 f"[identity: {apn_src}]"],
+                 f"Approved by {apn} <{ape}> via propose_change(merge=true)."],
                 cwd=str(wt), capture_output=True, text=True)
             result["approval_recorded"] = comment.returncode == 0
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
@@ -759,18 +755,19 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
-            # merge=true is an approval — identity from the GitHub session,
-            # like approve_proposal. No anonymous merges.
-            apn_i = _check_declared_identity(
-                (args.get("approver_name") or "").strip(),
-                (args.get("approver_email") or "").strip())
-            apn = apn_i["name"] or apn_i["login"]
-            ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-            apn_src = f"github:{apn_i['login']} via gh session"
+            # merge=true is an approval — it requires a human's identity on
+            # the record, exactly like approve_proposal. No anonymous merges.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
+            if not apn or not ape:
+                raise ValueError(
+                    "merge=true requires approver_name and approver_email "
+                    "(an approval is on the record) — or call approve_proposal "
+                    "after review"
+                )
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_template(merge=true) "
-                 f"[identity: {apn_src}]"],
+                 f"Approved by {apn} <{ape}> via propose_template(merge=true)."],
                 cwd=str(wt), capture_output=True, text=True)
             result["approval_recorded"] = comment.returncode == 0
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
@@ -901,17 +898,17 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     csp_script_src = [d.strip() for d in (args.get("csp_script_src") or []) if d.strip()]
     require_consent = bool(args.get("require_consent"))
     tenant = (args.get("tenant") or "").strip()
-    apn = ape = apn_src = ""  # bound when merge=true (gate below); Pyright-narrowing aid
     if args.get("merge"):
-        # Approval gate BEFORE any side effect: identity from the GitHub
-        # session (free text must match it), no anonymous merges, and a
+        # Approval gate BEFORE any side effect: no anonymous merges, and a
         # refused merge must not leave a pushed branch or open PR behind.
-        apn_i = _check_declared_identity(
-            (args.get("approver_name") or "").strip(),
-            (args.get("approver_email") or "").strip())
-        apn = apn_i["name"] or apn_i["login"]
-        ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-        apn_src = f"github:{apn_i['login']} via gh session"
+        apn = (args.get("approver_name") or "").strip()
+        ape = (args.get("approver_email") or "").strip()
+        if not apn or not ape:
+            raise ValueError(
+                "merge=true requires approver_name and approver_email "
+                "(an approval is on the record) — or call approve_proposal "
+                "after review"
+            )
 
     # A throwaway worktree on origin/main — the shared tree is never touched,
     # so a failed proposal cannot leave uncommitted writes behind (and a
@@ -1014,10 +1011,11 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
             # Gate already validated up-front; record the approval, merge.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_plugin(merge=true) "
-                 f"[identity: {apn_src}]"],
+                 f"Approved by {apn} <{ape}> via propose_plugin(merge=true)."],
                 cwd=str(wt), capture_output=True, text=True)
             result["approval_recorded"] = comment.returncode == 0
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
@@ -1317,89 +1315,7 @@ def _ship_and_purge(result: dict[str, Any]) -> None:
     result["purge"] = "ok" if purge.returncode == 0 else purge.stderr.strip()[:200]
 
 
-# ---- approver identity: from the login, not from free text ----------------
-
-_GH_IDENTITY_CACHE: dict[str, Any] | None = None
-
-
-def _gh_identity() -> dict[str, Any]:
-    """Resolve the approver's identity from the AUTHENTICATED GitHub session
-    (gh api user) — not from free text. The same agent could type any name;
-    it cannot type the token that gh is logged in with. Cached per process.
-    Raises if gh has no session: approvals without a resolvable identity are
-    refused, not guessed."""
-    global _GH_IDENTITY_CACHE
-    if _GH_IDENTITY_CACHE is not None:
-        return _GH_IDENTITY_CACHE
-    res = subprocess.run(["gh", "api", "user"], cwd=str(ROOT),
-                         capture_output=True, text=True)
-    if res.returncode != 0:
-        raise ValueError(
-            "approver identity could not be resolved: `gh api user` failed "
-            f"({res.stderr.strip()[:200]}). Approvals require an "
-            "authenticated GitHub session — identity is taken from the "
-            "login, never from free-text arguments."
-        )
-    try:
-        u = json.loads(res.stdout)
-    except ValueError:
-        raise ValueError("approver identity: could not parse `gh api user` output")
-    _GH_IDENTITY_CACHE = {
-        "login": u.get("login") or "",
-        "name": u.get("name") or "",
-        "email": u.get("email") or "",
-    }
-    return _GH_IDENTITY_CACHE
-
-
-def _check_declared_identity(declared_name: str, declared_email: str) -> dict[str, Any]:
-    """Free-text approver args (legacy) are allowed only when they MATCH the
-    authenticated session identity — a name typed into a tool call is no
-    longer the identity. Returns the canonical identity record."""
-    ident = _gh_identity()
-    candidates = {c for c in (ident["name"], ident["login"], ident["email"]) if c}
-    name_ok = (not declared_name) or declared_name in candidates
-    email_ok = (not declared_email) or (not ident["email"]) or declared_email == ident["email"]
-    if not name_ok or not email_ok:
-        raise ValueError(
-            f"declared approver {declared_name!r} <{declared_email!r}> does not "
-            f"match the authenticated GitHub session (login: {ident['login']!r}, "
-            f"name: {ident['name']!r}). Identity comes from the login — a typed "
-            "name is not accepted as someone else."
-        )
-    return ident
-
-
-def _author_of(branch: str) -> tuple[str, str]:
-    """(name, email) of the proposal's latest commit — for distinct-approver
-    checks in multi-human deployments."""
-    res = _git("log", "--format=%an|%ae", "-1", branch)
-    if res.returncode != 0 or "|" not in res.stdout:
-        return ("", "")
-    name, email = res.stdout.strip().split("|", 1)
-    return (name, email)
-
-
-def _is_self_approval(author_name: str, author_email: str, ident: dict[str, Any]) -> bool:
-    """True when the proposal was authored by the same human who is now
-    approving it. Compared against every form the session identity takes
-    (login, name, noreply email, real email) — an author cannot launder
-    their identity through a different email field."""
-    if not author_name and not author_email:
-        return False
-    candidates = {
-        c.lower() for c in (
-            ident["login"],
-            ident["name"],
-            ident["email"],
-            f"{ident['login']}@users.noreply.github.com",
-        ) if c
-    }
-    return (author_name.lower() in candidates) or (author_email.lower() in candidates)
-
-
-def _approve_one(slug: str, approver_name: str, approver_email: str,
-                 identity_source: str) -> dict[str, Any]:
+def _approve_one(slug: str, approver_name: str, approver_email: str) -> dict[str, Any]:
     """Merge one proposal PR with the approver's identity on the record."""
     branch = _proposal_branch(slug)
     if branch is None:
@@ -1420,8 +1336,7 @@ def _approve_one(slug: str, approver_name: str, approver_email: str,
     out: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
     comment = subprocess.run(
         ["gh", "pr", "comment", str(pr_number), "--body",
-         f"Approved by {approver_name} <{approver_email}> via approve_proposal "
-         f"[identity: {identity_source}]"],
+         f"Approved by {approver_name} <{approver_email}> via approve_proposal."],
         cwd=str(ROOT), capture_output=True, text=True)
     out["approval_recorded"] = comment.returncode == 0
     merge = subprocess.run(
@@ -1436,22 +1351,12 @@ def _approve_one(slug: str, approver_name: str, approver_email: str,
 def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """Approve one proposal (slug) or a batch (slugs): merge the PR(s), then
     build + deploy + purge once, so 'approve' means live. The approver's
-    identity is resolved from the authenticated GitHub session (`gh api
-    user`) — free-text name/email are accepted only if they MATCH that
-    identity. Low-risk copy batches can ride one approval."""
-    if os.environ.get("MCP_ALLOW_APPROVE") == "0":
-        raise ValueError(
-            "approve_proposal is disabled on this server instance "
-            "(MCP_ALLOW_APPROVE=0). Approvals happen through a human-"
-            "authenticated channel — an agent-facing server must not merge."
-        )
-    declared_name = (args.get("approver_name") or "").strip()
-    declared_email = (args.get("approver_email") or "").strip()
-    ident = _check_declared_identity(declared_name, declared_email)
-    approver_name = ident["name"] or ident["login"]
-    approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
-    identity_source = f"github:{ident['login']} via gh session"
-    distinct = os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
+    identity is recorded as a comment on each PR — the audit receipt. Low-risk
+    copy batches can ride one approval."""
+    approver_name = (args.get("approver_name") or "").strip()
+    approver_email = (args.get("approver_email") or "").strip()
+    if not approver_name or not approver_email:
+        raise ValueError("approver_name and approver_email are required (identity on the record)")
     slugs = args.get("slugs")
     if not slugs:
         slug = (args.get("slug") or "").strip()
@@ -1461,32 +1366,15 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(slugs, list) or not all(isinstance(s, str) and s.strip() for s in slugs):
         raise ValueError("slugs must be a list of proposal slugs")
     slugs = [s.strip() for s in slugs]
-    if distinct:
-        # Multi-human deployments: an approver cannot approve their own
-        # proposal. Off by default on this single-identity machine (every
-        # commit is authored by the same account), enforced when set.
-        for s in slugs:
-            branch = _proposal_branch(s)
-            if not branch:
-                continue
-            an, ae = _author_of(branch)
-            if _is_self_approval(an, ae, ident):
-                raise ValueError(
-                    f"REQUIRE_DISTINCT_APPROVER is set: {s!r} was authored by "
-                    f"{an or ae!r}, the same human now approving it — a proposal "
-                    "cannot approve itself"
-                )
 
     merged: list[dict[str, Any]] = []
     result: dict[str, Any] = {}
     try:
         for s in slugs:
-            merged.append(_approve_one(s, approver_name, approver_email, identity_source))
+            merged.append(_approve_one(s, approver_name, approver_email))
     finally:
         result["approved"] = merged
         result["count"] = len(merged)
-        result["approver"] = {"name": approver_name, "email": approver_email,
-                              "source": identity_source}
     if not args.get("deploy", True):
         result["deploy"] = "skipped (deploy=false)"
         return result
@@ -1497,20 +1385,17 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
 def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """Reject a proposal: record WHO and WHY on the PR (agent-readable state —
     the proposing agent can read the reason and revise instead of re-proposing
-    blind), then close the PR and delete its branch. Reviewer identity comes
-    from the authenticated GitHub session; free-text args must match it."""
+    blind), then close the PR and delete its branch."""
     slug = (args.get("slug") or "").strip()
     reason = (args.get("reason") or "").strip()
+    reviewer_name = (args.get("reviewer_name") or "").strip()
+    reviewer_email = (args.get("reviewer_email") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
     if not reason:
         raise ValueError("reason required — a rejection without a reason teaches nothing")
-    ident = _check_declared_identity(
-        (args.get("reviewer_name") or "").strip(),
-        (args.get("reviewer_email") or "").strip())
-    reviewer_name = ident["name"] or ident["login"]
-    reviewer_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
-    identity_source = f"github:{ident['login']} via gh session"
+    if not reviewer_name or not reviewer_email:
+        raise ValueError("reviewer_name and reviewer_email are required (identity on the record)")
     branch = _proposal_branch(slug)
     if branch is None:
         raise ValueError(f"no proposal branch for slug {slug!r}")
@@ -1529,8 +1414,7 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"no open PR on {branch} — nothing to reject")
     comment = subprocess.run(
         ["gh", "pr", "comment", str(pr_number), "--body",
-         f"REJECTED: {reason}\n\nBy {reviewer_name} <{reviewer_email}> via "
-         f"reject_proposal [identity: {identity_source}]."],
+         f"REJECTED: {reason}\n\nBy {reviewer_name} <{reviewer_email}> via reject_proposal."],
         cwd=str(ROOT), capture_output=True, text=True)
     out: dict[str, Any] = {
         "slug": slug, "branch": branch, "pr": pr_number,

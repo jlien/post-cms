@@ -6,4 +6,3 @@ setup_minutes: 15
 published: true
 date: 2026-10-03
 description: "Lightweight metrics collector with a hosted endpoint."
-docs_url: "https://beacon.example/metrics/docs"

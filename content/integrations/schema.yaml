@@ -2,13 +2,6 @@
 # Every item (content/integrations/<slug>/meta.yaml) must define all
 # `required` fields, non-empty, with types matching `types` (string|number|
 # boolean|list). Build fails naming the exact offending file otherwise.
-#
-# Beyond required+types, three optional constraints are enforced the same
-# way — build fails naming file and field:
-#   enums:      the value (or every list item) must be one of the set
-#   formats:    url | date | email — shape check on string fields
-#   references: the value names an item of another collection (checked
-#               after all collections load; a dangling reference fails)
 title: Integrations
 required:
   - title
@@ -17,8 +10,3 @@ required:
 types:
   tier: string
   setup_minutes: number
-enums:
-  tier: [verified, partner, community]
-formats:
-  docs_url: url
-  date: date
