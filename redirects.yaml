@@ -1,0 +1,12 @@
+# URL redirect map — loaded by the origin at startup (crates/server).
+# Exact path match, checked before the filesystem, so a migrated URL never
+# depends on the old page still existing. A bare string target means 301.
+#
+#   /old-page/: {to: /new-page/, status: 301}
+#   /old-post: /posts/moved/
+#
+# Malformed entries fail origin startup loudly (same contract as the build
+# failing on a broken schema). Committed like any content change — editing
+# the map is a proposal like everything else.
+/pricing: {to: /contact/, status: 302}
+/old-blog: /blog/
