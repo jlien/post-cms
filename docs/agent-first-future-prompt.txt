@@ -1,0 +1,69 @@
+# Brief: Agent-first website of the future — outside perspective
+
+You are giving an independent outside perspective on a working prototype. This
+is a RESEARCH + PERSPECTIVE pass: read the repo, then write ONE new document.
+No code changes, no commits, no pushes.
+
+## Context
+
+`~/Eng/post-cms` (your cwd) is a git-based, static-first publishing stack
+built as a reference architecture: content as files in git (meta.yaml +
+index.mdx per folder), a Rust static build (Tera + pulldown-cmark) emitting
+dist/ with search index + embeddings + MCP discovery artifacts, an Axum
+origin server, and MCP servers both local (stdio, write ops) and public
+(read-only POST /mcp). It was built to test a thesis: post-AI, a custom
+agent-first stack beats renting a blogging platform (WordPress/Sanity).
+Recent additions: typed collections with schema validation, propose_change /
+propose_template review flow (branch -> PR with preview command), and
+per-tenant git worktrees for concurrent agents.
+
+## What to read (start here, follow your curiosity after)
+
+- README.md, agents/CONVENTIONS.md, BUILD_REPORT.md, TASK.md
+- mcp/server.py (the write MCP tool surface — read the TOOLS manifest)
+- crates/server/src/main.rs (public /mcp route, /api/ask)
+- content/ layout incl. content/integrations/schema.yaml (typed collections)
+- ci/*.sh
+
+## Deliverable: docs/agent-first-future.md
+
+A perspective piece, 200-350 lines, plain owner-facing voice. Sections:
+
+1. **What this stack gets right** — judged against where agent-driven web
+   publishing is heading. Cite the specific files/mechanisms you read.
+2. **The interface with human maintainers** — this is the heart of the piece.
+   The current answer is: chat + MCP tools -> git branch -> PR with preview
+   command -> human merges. Evaluate honestly: is PR-per-change the right
+   human gate for agent-authored content at scale? What breaks at 50
+   proposals/week? What would a maintainer-facing dashboard/queue need to
+   look like? Who carries the pager?
+3. **What's missing for 2027** — the gaps between this prototype and a real
+   agent-first site of the future (identity/auth for hosted write MCP,
+   preview deploys, analytics, brand governance, multi-tenant hosting).
+   Mark each gap: [buildable now] vs [needs org decision] vs [unsolved].
+4. **The contrarian take** — argue the strongest case AGAINST this
+   architecture (e.g. why Sanity + agents might win anyway). Steelman it.
+5. **Verdict** — would you run a real site on this today? Under what
+   conditions?
+
+## Hard requirements
+
+- Cite files you actually read (path + what it showed). File-truth only:
+  do not claim runtime behavior you cannot see in code/docs. Speculation must
+  be marked [unverified].
+- Do external research if useful (you have web tools): how do other
+  agent-first/CMS-of-the-future projects handle the human-gate problem?
+  Cite sources with URLs; if none found, say "none found as of October 2026".
+- Be honest about adoption risks. No hype.
+- Do NOT modify any file except creating docs/agent-first-future.md.
+- Do NOT git commit, push, or create branches/worktrees.
+- The repo's remote is PRIVATE — do not mention any client names from the
+  build history in your document; this is a public-portfolio-style perspective.
+
+## Budget
+
+60 turns max. Reserve your final ~8 turns for: re-read your draft end-to-end
+for coherence, then print a numbered final report (sections written, word/line
+count, sources cited, anything skipped and why), then write the done marker.
+
+Done marker: append "DONE" to /tmp/agent-first-future.done
