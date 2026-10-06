@@ -640,9 +640,18 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     if res.returncode != 0:
         raise ValueError(f"git switch failed: {res.stderr.strip()[:300]}")
 
+    # Files this proposal created or overwrote in wt. On ANY failure they are
+    # removed/restored — a rejected proposal must leave the tree exactly as
+    # it found it (the shared tree is not a scratchpad).
+    created: list[Path] = []
+    overwritten: dict[Path, str | None] = {}
+
     try:
         if is_new:
             item_dir.mkdir(parents=True, exist_ok=True)
+            created.append(meta_path)
+            if body_md:
+                created.append(md_path)
             lines = [
                 f'title: "{raw_title or slug}"',
                 f'slug: "{slug}"',
@@ -662,6 +671,11 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             summary = f"propose: new {collection}/{slug} draft"
         else:
             summary = f"propose: update {collection}/{slug}"
+            for f in (meta_path, md_path):
+                if f.exists():
+                    overwritten[f] = f.read_text()
+                else:
+                    overwritten[f] = None
             _apply_meta_edits(meta_path,
                               title=raw_title or None,
                               description=description,
@@ -779,6 +793,20 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         if wt != ROOT:
             _reset_worktree(wt, [])
         else:
+            # Restore overwritten files, remove created ones, then prune the
+            # now-empty dirs — the shared tree ends exactly as it started.
+            for f, content in overwritten.items():
+                if content is None:
+                    if f.exists():
+                        f.unlink()
+                else:
+                    f.write_text(content)
+            for f in created:
+                if f.exists():
+                    f.unlink()
+            for d in sorted({f.parent for f in created}, reverse=True):
+                if d != ROOT and d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
             _git("switch", "-")
         raise
 
@@ -1523,11 +1551,14 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
 def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """One-action undo: revert the merge commit that shipped a proposal,
     rebuild, redeploy, purge. The revert itself is a commit — the ledger keeps
-    both the mistake and the correction."""
-    approver_name = (args.get("approver_name") or "").strip()
-    approver_email = (args.get("approver_email") or "").strip()
-    if not approver_name or not approver_email:
-        raise ValueError("approver_name and approver_email are required (identity on the record)")
+    both the mistake and the correction. Identity comes from the
+    authenticated GitHub session; free-text args must match it."""
+    ident = _check_declared_identity(
+        (args.get("approver_name") or "").strip(),
+        (args.get("approver_email") or "").strip())
+    approver_name = ident["name"] or ident["login"]
+    approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
+    identity_source = f"github:{ident['login']} via gh session"
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
@@ -1553,7 +1584,8 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if merge_pr is not None:
         subprocess.run(
             ["gh", "pr", "comment", str(merge_pr), "--body",
-             f"Reverted by {approver_name} <{approver_email}> via revert_proposal."],
+             f"Reverted by {approver_name} <{approver_email}> via revert_proposal "
+             f"[identity: {identity_source}]."],
             cwd=str(ROOT), capture_output=True, text=True)
     switch = _git("switch", "main")
     if switch.returncode != 0:
