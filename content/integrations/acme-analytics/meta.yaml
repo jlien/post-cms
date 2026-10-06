@@ -6,3 +6,4 @@ setup_minutes: 30
 published: true
 date: 2026-10-03
 description: "Product analytics integration with per-event webhooks."
+docs_url: "https://acme.example/analytics/docs"

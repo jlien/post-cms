@@ -238,7 +238,7 @@ fn main() -> Result<()> {
     // Live site renders at the site root.
     render_posts(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
-    let collections = load_collections(&root.join("content"))?;
+    let (collections, _ref_checks) = load_collections(&root.join("content"))?;
     render_collections(&tera, &dist, &collections, &styling, &cfg, "")?;
     render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_blog(&tera, &dist, &posts, &styling, &cfg, "")?;
@@ -756,12 +756,23 @@ fn load_posts(dir: &Path) -> Result<Vec<Post>> {
     Ok(posts)
 }
 
+/// A cross-item reference to validate after all collections load:
+/// `<at>` names a meta.yaml whose `<field>` must be an item of `<target>`.
+struct RefCheck {
+    at: String,
+    field: String,
+    target: String,
+    value: String,
+}
+
 /// Load typed collections: every directory under content/ other than posts/
 /// pages/ is a collection if it has a schema.yaml. Each item is
 /// content/<collection>/<slug>/ with meta.yaml + index.mdx. Required fields
 /// (and optional type checks) from schema.yaml are enforced at build time —
 /// a missing or wrongly-typed field fails the build naming the exact file.
-fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
+/// Returns (collections, deferred reference checks).
+fn load_collections(content_dir: &Path) -> Result<(Vec<Collection>, Vec<RefCheck>)> {
+    let mut ref_checks: Vec<RefCheck> = Vec::new();
     let mut collections = Vec::new();
     let entries = fs::read_dir(content_dir)
         .with_context(|| format!("read_dir {}", content_dir.display()))?;
@@ -798,6 +809,51 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
             .unwrap_or_default();
         let types: std::collections::HashMap<String, String> = schema
             .get("types")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // enums: {field: [allowed values]} — the value (or each list item)
+        // must be one of the declared set.
+        let enums: std::collections::HashMap<String, Vec<String>> = schema
+            .get("enums")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        let field = k.as_str()?.to_string();
+                        let allowed: Vec<String> = v
+                            .as_sequence()?
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect();
+                        Some((field, allowed))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // formats: {field: url|date|email} — shape checks beyond types.
+        let formats: std::collections::HashMap<String, String> = schema
+            .get("formats")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // references: {field: collection} — the value names an item in
+        // another typed collection (cross-item integrity). Validated after
+        // all collections load, since the target may be defined later.
+        let references: std::collections::HashMap<String, String> = schema
+            .get("references")
             .and_then(|v| v.as_mapping())
             .map(|m| {
                 m.iter()
@@ -887,6 +943,114 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
                     }
                 }
             }
+            // ---- enums: value (or every list item) must be declared ----
+            for (field, allowed) in &enums {
+                let val = map.get(serde_yaml::Value::String(field.clone()));
+                let Some(v) = val else { continue };
+                let check_one = |item: &serde_yaml::Value, at: &str| -> Result<()> {
+                    let s = item.as_str().unwrap_or_default();
+                    if allowed.iter().any(|a| a == s) {
+                        Ok(())
+                    } else {
+                        bail!(
+                            "{}: field `{}` value `{}` is not one of {:?} (schema: {})",
+                            at,
+                            field,
+                            s,
+                            allowed,
+                            schema_path.display()
+                        );
+                    }
+                };
+                match v {
+                    serde_yaml::Value::String(_) => check_one(v, &meta_path.display().to_string())?,
+                    serde_yaml::Value::Sequence(seq) => {
+                        for item in seq {
+                            check_one(item, &meta_path.display().to_string())?;
+                        }
+                    }
+                    _ => bail!(
+                        "{}: field `{}` must be a string or list for enum checking",
+                        meta_path.display(),
+                        field
+                    ),
+                }
+            }
+            // ---- formats: url | date | email ----
+            for (field, format) in &formats {
+                let val = map.get(serde_yaml::Value::String(field.clone()));
+                let Some(serde_yaml::Value::String(s)) = val else {
+                    continue;
+                };
+                let ok = match format.as_str() {
+                    "url" => {
+                        let after_scheme = s
+                            .strip_prefix("https://")
+                            .or_else(|| s.strip_prefix("http://"));
+                        match after_scheme {
+                            Some(rest) => {
+                                let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+                                host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+                            }
+                            None => false,
+                        }
+                    }
+                    "date" => s.parse::<NaiveDate>().is_ok(),
+                    "email" => {
+                        let (local, domain) = match s.split_once('@') {
+                            Some(x) => x,
+                            None => ("", ""),
+                        };
+                        !local.is_empty()
+                            && domain.contains('.')
+                            && !domain.starts_with('.')
+                            && !domain.ends_with('.')
+                            && !domain.contains('@')
+                    }
+                    other => bail!(
+                        "{}: unknown format `{other}` for field `{}` (url|date|email)",
+                        schema_path.display(),
+                        field
+                    ),
+                };
+                if !ok {
+                    bail!(
+                        "{}: field `{}` value `{}` is not a valid {format} (schema: {})",
+                        meta_path.display(),
+                        field,
+                        s,
+                        schema_path.display()
+                    );
+                }
+            }
+            // ---- references: defer to the cross-collection pass ----
+            for (field, target) in &references {
+                let val = map.get(serde_yaml::Value::String(field.clone()));
+                let Some(v) = val else { continue };
+                let mut push = |value: &str| {
+                    ref_checks.push(RefCheck {
+                        at: meta_path.display().to_string(),
+                        field: field.clone(),
+                        target: target.clone(),
+                        value: value.to_string(),
+                    });
+                };
+                match v {
+                    serde_yaml::Value::String(s) => push(s),
+                    serde_yaml::Value::Sequence(seq) => {
+                        for item in seq {
+                            if let Some(s) = item.as_str() {
+                                push(s);
+                            }
+                        }
+                    }
+                    _ => bail!(
+                        "{}: field `{}` must be a string or list for reference checking",
+                        meta_path.display(),
+                        field
+                    ),
+                }
+            }
 
             let slug = item_path
                 .file_name()
@@ -947,7 +1111,37 @@ fn load_collections(content_dir: &Path) -> Result<Vec<Collection>> {
         });
     }
     collections.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(collections)
+    // ---- cross-collection reference validation ----
+    // Every reference must name an item that actually exists in the target
+    // collection. A dangling reference is a broken page waiting to happen,
+    // so it fails the build naming the exact file.
+    if !ref_checks.is_empty() {
+        let slugs_by_collection: std::collections::HashMap<&str, Vec<&str>> = collections
+            .iter()
+            .map(|c| (c.name.as_str(), c.items.iter().map(|i| i.slug.as_str()).collect()))
+            .collect();
+        for r in &ref_checks {
+            let known = slugs_by_collection.get(r.target.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: field `{}` references collection `{}` which does not exist",
+                    r.at,
+                    r.field,
+                    r.target
+                )
+            })?;
+            if !known.contains(&r.value.as_str()) {
+                bail!(
+                    "{}: field `{}` references `{}` — no such item in collection `{}` (known: {:?})",
+                    r.at,
+                    r.field,
+                    r.value,
+                    r.target,
+                    known
+                );
+            }
+        }
+    }
+    Ok((collections, ref_checks))
 }
 
 /// Render preview copies under dist/preview/drafts/ so a reviewer can see
