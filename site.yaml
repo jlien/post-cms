@@ -9,5 +9,6 @@ plugins:
     mounts: [body_end]
     csp_script_src: ["js.hsforms.net", "js.hs-scripts.com"]
     require_consent: true
-    # per-page component: only dist/contact/ — forms don't belong on every page
-    pages: [contact]
+  - name: pass4-pixel
+    mounts: [head]
+    csp_script_src: ["cdn.pass4.test"]
