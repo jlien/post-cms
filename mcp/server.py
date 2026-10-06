@@ -68,7 +68,7 @@ TOOLS = [
     },
     {
         "name": "update_post",
-        "description": "Update fields of an existing post; returns a diff summary.",
+        "description": "Update fields of an existing post; returns a diff summary. Cannot change `published` — use propose_change + approve_proposal.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -76,7 +76,6 @@ TOOLS = [
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
-                "published": {"type": "boolean"},
                 "description": {"type": "string"},
             },
             "required": ["slug"],
@@ -187,25 +186,68 @@ TOOLS = [
         "name": "list_proposals",
         "description": (
             "The proposal queue: open PRs on agent/* branches with number, "
-            "title, slug, author, URL and the DRAFTS=1 draft-preview command "
-            "for each. The review surface, readable by humans and agents."
+            "title, slug, author, risk class, field-level diff, URL and the "
+            "DRAFTS=1 draft-preview command for each. include_rejected adds "
+            "recent rejections (with reasons) so agents can revise."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_rejected": {"type": "boolean",
+                                     "description": "Also return recently rejected proposals with their reasons."},
+            },
+        },
     },
     {
         "name": "approve_proposal",
         "description": (
-            "Approve a proposal: records the approver's identity as a PR "
-            "comment, merges the PR, then builds, deploys and purges — "
-            "'approve' means live. deploy=false skips the deploy."
+            "Approve one proposal (slug) or a batch (slugs): records the "
+            "approver's identity as PR comments, merges, then builds, deploys "
+            "and purges once — 'approve' means live. deploy=false skips deploy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Slug of the proposed item (or use slugs for a batch)."},
+                "slugs": {"type": "array", "items": {"type": "string"},
+                          "description": "Batch of low-risk proposals to approve in one action (one build+deploy)."},
+                "approver_name": {"type": "string"},
+                "approver_email": {"type": "string"},
+                "deploy": {"type": "boolean", "description": "Build+deploy+purge after merge (default true)."},
+            },
+            "required": ["approver_name", "approver_email"],
+        },
+    },
+    {
+        "name": "reject_proposal",
+        "description": (
+            "Reject a proposal: records WHO and WHY as a REJECTED: comment on "
+            "the PR (agent-readable state), then closes the PR."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Slug of the proposed item."},
+                "reason": {"type": "string", "description": "Why — the proposing agent reads this to revise."},
+                "reviewer_name": {"type": "string"},
+                "reviewer_email": {"type": "string"},
+            },
+            "required": ["slug", "reason", "reviewer_name", "reviewer_email"],
+        },
+    },
+    {
+        "name": "revert_proposal",
+        "description": (
+            "One-action undo: reverts the merge commit that shipped a proposal, "
+            "then rebuilds, redeploys and purges. Records the revert on the PR."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Slug of the shipped proposal to undo."},
                 "approver_name": {"type": "string"},
                 "approver_email": {"type": "string"},
-                "deploy": {"type": "boolean", "description": "Build+deploy+purge after merge (default true)."},
+                "deploy": {"type": "boolean", "description": "Build+deploy+purge after revert (default true)."},
             },
             "required": ["slug", "approver_name", "approver_email"],
         },
@@ -466,11 +508,29 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
+            # merge=true is an approval — it requires a human's identity on
+            # the record, exactly like approve_proposal. No anonymous merges.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
+            if not apn or not ape:
+                raise ValueError(
+                    "merge=true requires approver_name and approver_email "
+                    "(an approval is on the record) — or call approve_proposal "
+                    "after review"
+                )
+            comment = subprocess.run(
+                ["gh", "pr", "comment", branch, "--body",
+                 f"Approved by {apn} <{ape}> via propose_change(merge=true)."],
+                cwd=str(wt), capture_output=True, text=True)
+            result["approval_recorded"] = comment.returncode == 0
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
                                    cwd=str(wt), capture_output=True, text=True)
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
+            else:
+                result["deploy"] = ("skipped: propose_change does not deploy; "
+                                    "use approve_proposal for build+deploy+purge")
         _reset_worktree(wt, [])
         return result
     except Exception:
@@ -608,7 +668,30 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
                        f"DRAFTS=1 cargo run -q -p build && "
                        f"python3 -m http.server 8000 -d dist")
         preview_url = f"http://localhost:8000/preview/drafts/{collection}/{slug}/"
+        # Risk class: the queue uses this to batch copy edits and page a
+        # human for publish flips / schema changes.
+        target_published = published
+        if not is_new:
+            try:
+                cur = {}
+                for line in meta_path.read_text().splitlines():
+                    if ":" in line and not line.startswith((" ", "#", "-")):
+                        k, _, v = line.partition(":")
+                        cur[k.strip()] = v.strip()
+                raw_pub = fields.get("published") if "published" in fields else cur.get("published", False)
+                target_published = str(raw_pub).strip().lower() in ("true", "yes", "1")
+            except Exception:
+                pass
+        if is_new and target_published:
+            risk = "publish-flip"
+        elif is_new:
+            risk = "new-item"
+        elif fields:
+            risk = "schema"
+        else:
+            risk = "copy"
         pr_body = (f"Agent-authored change by {author_name}.\n\n"
+                   f"risk: {risk}\n\n"
                    f"Preview URL (after running the command): {preview_url}\n"
                    f"Preview: {preview_cmd}")
         ok, pr_or_err = _open_pr(wt, branch, title, pr_body)
@@ -617,6 +700,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             "branch": branch,
             "proposed": True,
             "is_new": is_new,
+            "risk": risk,
             "tenant": tenant or None,
             "summary": summary,
             "pr_url": pr_or_err if ok else None,
@@ -625,11 +709,29 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
+            # merge=true is an approval — it requires a human's identity on
+            # the record, exactly like approve_proposal. No anonymous merges.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
+            if not apn or not ape:
+                raise ValueError(
+                    "merge=true requires approver_name and approver_email "
+                    "(an approval is on the record) — or call approve_proposal "
+                    "after review"
+                )
+            comment = subprocess.run(
+                ["gh", "pr", "comment", branch, "--body",
+                 f"Approved by {apn} <{ape}> via propose_template(merge=true)."],
+                cwd=str(wt), capture_output=True, text=True)
+            result["approval_recorded"] = comment.returncode == 0
             merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
                                    cwd=str(wt), capture_output=True, text=True)
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
+            else:
+                result["deploy"] = ("skipped: propose_template does not deploy; "
+                                    "use approve_proposal for build+deploy+purge")
         # Reset the worktree to the default branch head: it must be clean for
         # the next proposal (the repo root is returned to main only when no
         # tenant was used, since the shared tree must not sit on a branch).
@@ -778,13 +880,13 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def tool_list_proposals(_args: dict[str, Any]) -> dict[str, Any]:
+def tool_list_proposals(args: dict[str, Any]) -> dict[str, Any]:
     """The proposal queue: open PRs whose head branch is agent/*, with the
     draft-preview command for each. This is the human- and agent-readable
     review surface git was hiding."""
     res = subprocess.run(
         ["gh", "pr", "list", "--state", "open", "--json",
-         "number,title,headRefName,url,author,createdAt"],
+         "number,title,headRefName,url,author,createdAt,body"],
         cwd=str(ROOT), capture_output=True, text=True)
     if res.returncode != 0:
         raise ValueError(f"gh pr list failed: {res.stderr.strip()[:300]}")
@@ -798,7 +900,7 @@ def tool_list_proposals(_args: dict[str, Any]) -> dict[str, Any]:
         if not head.startswith("agent/"):
             continue
         slug = re.sub(r"-r\d+$", "", head.removeprefix("agent/"))
-        proposals.append({
+        entry: dict[str, Any] = {
             "number": p.get("number"),
             "title": p.get("title"),
             "branch": head,
@@ -808,21 +910,112 @@ def tool_list_proposals(_args: dict[str, Any]) -> dict[str, Any]:
             "preview_command": f"cd {ROOT} && git fetch origin {head} && "
                                f"git switch {head} && DRAFTS=1 cargo run -q -p build && "
                                f"python3 -m http.server 8000 -d dist",
+        }
+        body = str(p.get("body") or "")
+        m = re.search(r"^risk:\s*(\S+)", body, re.MULTILINE)
+        entry["risk"] = m.group(1) if m else "unknown"
+        entry["field_diff"] = _proposal_field_diff(head)
+        proposals.append(entry)
+    result: dict[str, Any] = {"proposals": proposals, "count": len(proposals)}
+    if args.get("include_rejected"):
+        result["recently_rejected"] = _recent_rejections()
+    return result
+
+
+def _proposal_field_diff(branch: str) -> list[dict[str, Any]]:
+    """Field-level diff of meta.yaml between origin/main and the proposal
+    branch — so a reviewer sees `tier: pro -> enterprise` without reading a
+    unified diff. Empty when the item is new (nothing to compare against)."""
+    fetch = _git("fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    if fetch.returncode != 0:
+        return [{"error": fetch.stderr.strip()[:200]}]
+    diff = _git("diff", "origin/main...origin/" + branch, "--", "content/*/meta.yaml")
+    if diff.returncode != 0:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in diff.stdout.splitlines():
+        if line.startswith(("--- ", "+++ ")) or "@@" in line:
+            continue
+        if line.startswith("-") and line[1:].strip() and ":" in line:
+            k, _, v = line[1:].partition(":")
+            out.append({"field": k.strip(), "from": v.strip()})
+        elif line.startswith("+") and line[1:].strip() and ":" in line:
+            k, _, v = line[1:].partition(":")
+            for entry in out:
+                if entry.get("field") == k.strip() and "to" not in entry:
+                    entry["to"] = v.strip()
+                    break
+            else:
+                out.append({"field": k.strip(), "added": v.strip()})
+    return out
+
+
+def _recent_rejections(limit: int = 10) -> list[dict[str, Any]]:
+    """Rejections as agent-readable state: recently closed agent PRs whose
+    last comment starts with REJECTED: <reason>."""
+    res = subprocess.run(
+        ["gh", "pr", "list", "--state", "closed", "--json",
+         "number,title,headRefName,url,closedAt", "--limit", "30"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    try:
+        prs = json.loads(res.stdout or "[]")
+    except ValueError:
+        return []
+    rejected = []
+    for p in prs:
+        head = str(p.get("headRefName") or "")
+        if not head.startswith("agent/"):
+            continue
+        comments = subprocess.run(
+            ["gh", "pr", "view", str(p["number"]), "--json", "comments",
+             "--jq", ".comments[-1].body // \"\""],
+            cwd=str(ROOT), capture_output=True, text=True)
+        body = comments.stdout.strip()
+        if not body.startswith("REJECTED:"):
+            continue
+        rejected.append({
+            "number": p.get("number"),
+            "slug": re.sub(r"-r\d+$", "", head.removeprefix("agent/")),
+            "url": p.get("url"),
+            "reason": body.removeprefix("REJECTED:").strip(),
+            "closed_at": p.get("closedAt"),
         })
-    return {"proposals": proposals, "count": len(proposals)}
+        if len(rejected) >= limit:
+            break
+    return rejected
 
 
-def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
-    """Approve a proposal: merge its PR, then build + deploy + purge so
-    'approve' means live, not 'a human will now run scripts'. The approver's
-    identity is recorded as a comment on the PR — the audit receipt."""
-    approver_name = (args.get("approver_name") or "").strip()
-    approver_email = (args.get("approver_email") or "").strip()
-    if not approver_name or not approver_email:
-        raise ValueError("approver_name and approver_email are required (identity on the record)")
-    slug = (args.get("slug") or "").strip()
-    if not slug or "/" in slug or ".." in slug:
-        raise ValueError("slug required")
+def _ship_and_purge(result: dict[str, Any]) -> None:
+    """Bring the shared tree to origin/main and run build + deploy + purge.
+    One call = the whole 'approve/revert means live' tail, atomically from
+    the caller's point of view."""
+    _git("fetch", "origin")
+    switch = _git("switch", "main")
+    if switch.returncode != 0:
+        switch = _git("switch", "-")
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty.stdout.strip():
+        result["deploy"] = ("merged, but the shared tree is dirty — run the "
+                            "deploy manually after committing or stashing")
+        result["dirty"] = dirty.stdout.strip()[:200]
+        return
+    pull = _git("pull", "--ff-only", "origin", "main")
+    if pull.returncode != 0:
+        raise ValueError(f"pull after merge failed: {pull.stderr.strip()[:300]}")
+    deploy = subprocess.run(["bash", "ci/deploy.sh"], cwd=str(ROOT),
+                            capture_output=True, text=True, timeout=600)
+    if deploy.returncode != 0:
+        raise ValueError(f"deploy failed: {(deploy.stdout + deploy.stderr)[-400:]}")
+    result["deploy"] = "ok"
+    purge = subprocess.run(["bash", "ci/purge.sh"], cwd=str(ROOT),
+                           capture_output=True, text=True)
+    result["purge"] = "ok" if purge.returncode == 0 else purge.stderr.strip()[:200]
+
+
+def _approve_one(slug: str, approver_name: str, approver_email: str) -> dict[str, Any]:
+    """Merge one proposal PR with the approver's identity on the record."""
     branch = _proposal_branch(slug)
     if branch is None:
         raise ValueError(f"no proposal branch for slug {slug!r}")
@@ -839,48 +1032,157 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
             pr_number = None
     if pr_number is None:
         raise ValueError(f"no open PR on {branch} — nothing to approve")
-
-    result: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
+    out: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
     comment = subprocess.run(
         ["gh", "pr", "comment", str(pr_number), "--body",
          f"Approved by {approver_name} <{approver_email}> via approve_proposal."],
         cwd=str(ROOT), capture_output=True, text=True)
-    result["approval_recorded"] = comment.returncode == 0
-
+    out["approval_recorded"] = comment.returncode == 0
     merge = subprocess.run(
         ["gh", "pr", "merge", str(pr_number), "--merge", "--delete-branch"],
         cwd=str(ROOT), capture_output=True, text=True)
     if merge.returncode != 0:
-        raise ValueError(f"merge failed: {merge.stderr.strip()[:300]}")
-    result["merged"] = True
+        raise ValueError(f"merge failed for {slug}: {merge.stderr.strip()[:300]}")
+    out["merged"] = True
+    return out
 
+
+def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Approve one proposal (slug) or a batch (slugs): merge the PR(s), then
+    build + deploy + purge once, so 'approve' means live. The approver's
+    identity is recorded as a comment on each PR — the audit receipt. Low-risk
+    copy batches can ride one approval."""
+    approver_name = (args.get("approver_name") or "").strip()
+    approver_email = (args.get("approver_email") or "").strip()
+    if not approver_name or not approver_email:
+        raise ValueError("approver_name and approver_email are required (identity on the record)")
+    slugs = args.get("slugs")
+    if not slugs:
+        slug = (args.get("slug") or "").strip()
+        if not slug or "/" in slug or ".." in slug:
+            raise ValueError("slug required")
+        slugs = [slug]
+    if not isinstance(slugs, list) or not all(isinstance(s, str) and s.strip() for s in slugs):
+        raise ValueError("slugs must be a list of proposal slugs")
+    slugs = [s.strip() for s in slugs]
+
+    merged: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+    try:
+        for s in slugs:
+            merged.append(_approve_one(s, approver_name, approver_email))
+    finally:
+        result["approved"] = merged
+        result["count"] = len(merged)
     if not args.get("deploy", True):
         result["deploy"] = "skipped (deploy=false)"
         return result
+    _ship_and_purge(result)
+    return result
 
-    # Bring the shared tree to the merged head, then ship it.
+
+def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """Reject a proposal: record WHO and WHY on the PR (agent-readable state —
+    the proposing agent can read the reason and revise instead of re-proposing
+    blind), then close the PR and delete its branch."""
+    slug = (args.get("slug") or "").strip()
+    reason = (args.get("reason") or "").strip()
+    reviewer_name = (args.get("reviewer_name") or "").strip()
+    reviewer_email = (args.get("reviewer_email") or "").strip()
+    if not slug or "/" in slug or ".." in slug:
+        raise ValueError("slug required")
+    if not reason:
+        raise ValueError("reason required — a rejection without a reason teaches nothing")
+    if not reviewer_name or not reviewer_email:
+        raise ValueError("reviewer_name and reviewer_email are required (identity on the record)")
+    branch = _proposal_branch(slug)
+    if branch is None:
+        raise ValueError(f"no proposal branch for slug {slug!r}")
+    pr_number = None
+    res = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "number", "--limit", "1"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            prs = json.loads(res.stdout or "[]")
+            pr_number = prs[0]["number"] if prs else None
+        except (ValueError, KeyError, IndexError):
+            pr_number = None
+    if pr_number is None:
+        raise ValueError(f"no open PR on {branch} — nothing to reject")
+    comment = subprocess.run(
+        ["gh", "pr", "comment", str(pr_number), "--body",
+         f"REJECTED: {reason}\n\nBy {reviewer_name} <{reviewer_email}> via reject_proposal."],
+        cwd=str(ROOT), capture_output=True, text=True)
+    out: dict[str, Any] = {
+        "slug": slug, "branch": branch, "pr": pr_number,
+        "reason": reason, "rejected": True,
+        "recorded": comment.returncode == 0,
+    }
+    close = subprocess.run(
+        ["gh", "pr", "close", str(pr_number), "--delete-branch"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if close.returncode != 0:
+        out["closed"] = False
+        out["close_error"] = close.stderr.strip()[:300]
+    else:
+        out["closed"] = True
+    return out
+
+
+def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
+    """One-action undo: revert the merge commit that shipped a proposal,
+    rebuild, redeploy, purge. The revert itself is a commit — the ledger keeps
+    both the mistake and the correction."""
+    approver_name = (args.get("approver_name") or "").strip()
+    approver_email = (args.get("approver_email") or "").strip()
+    if not approver_name or not approver_email:
+        raise ValueError("approver_name and approver_email are required (identity on the record)")
+    slug = (args.get("slug") or "").strip()
+    if not slug or "/" in slug or ".." in slug:
+        raise ValueError("slug required")
     _git("fetch", "origin")
+    log = _git("log", "origin/main", "--merges", "--format=%H %s", "--")
+    needle = f"agent/{slug}"
+    merge_sha = None
+    merge_pr = None
+    for line in log.stdout.splitlines():
+        sha, _, subject = line.partition(" ")
+        if needle in subject:
+            m = re.search(r"#(\d+)", subject)
+            merge_pr = int(m.group(1)) if m else None
+            merge_sha = sha
+            break
+    if merge_sha is None:
+        raise ValueError(f"no merge commit found for proposal {slug!r} on main")
+    out: dict[str, Any] = {"slug": slug, "merge_commit": merge_sha, "pr": merge_pr}
+    if merge_pr is not None:
+        subprocess.run(
+            ["gh", "pr", "comment", str(merge_pr), "--body",
+             f"Reverted by {approver_name} <{approver_email}> via revert_proposal."],
+            cwd=str(ROOT), capture_output=True, text=True)
     switch = _git("switch", "main")
     if switch.returncode != 0:
-        switch = _git("switch", "-")
+        _git("switch", "-")
     dirty = _git("status", "--porcelain", "--untracked-files=no")
     if dirty.stdout.strip():
-        result["deploy"] = ("merged, but the shared tree is dirty — run the "
-                            "deploy manually after committing or stashing")
-        result["dirty"] = dirty.stdout.strip()[:200]
-        return result
+        raise ValueError(f"shared tree is dirty: {dirty.stdout.strip()[:200]}")
     pull = _git("pull", "--ff-only", "origin", "main")
     if pull.returncode != 0:
-        raise ValueError(f"pull after merge failed: {pull.stderr.strip()[:300]}")
-    deploy = subprocess.run(["bash", "ci/deploy.sh"], cwd=str(ROOT),
-                            capture_output=True, text=True, timeout=600)
-    if deploy.returncode != 0:
-        raise ValueError(f"deploy failed: {(deploy.stdout + deploy.stderr)[-400:]}")
-    result["deploy"] = "ok"
-    purge = subprocess.run(["bash", "ci/purge.sh"], cwd=str(ROOT),
-                           capture_output=True, text=True)
-    result["purge"] = "ok" if purge.returncode == 0 else purge.stderr.strip()[:200]
-    return result
+        raise ValueError(f"pull failed: {pull.stderr.strip()[:300]}")
+    revert = _git("revert", "--no-edit", "-m", "1", merge_sha)
+    if revert.returncode != 0:
+        raise ValueError(f"revert failed: {revert.stderr.strip()[:400]}")
+    push = _git("push", "origin", "main")
+    if push.returncode != 0:
+        raise ValueError(f"push of revert failed: {push.stderr.strip()[:300]}")
+    out["reverted"] = True
+    if not args.get("deploy", True):
+        out["deploy"] = "skipped (deploy=false)"
+        return out
+    _ship_and_purge(out)
+    return out
 
 
 def git_commit(message: str) -> dict[str, Any]:
@@ -942,11 +1244,21 @@ def tool_create_draft(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_update_post(args: dict[str, Any]) -> dict[str, Any]:
     slug = args["slug"]
+    # GATE: the published flag is the one field that changes what the world
+    # sees without a build. It must go through the proposal gate
+    # (propose_change + approve_proposal) like any other publish decision —
+    # a direct flip here would be a side door around "approve means live".
+    if "published" in args:
+        raise ValueError(
+            "update_post cannot flip `published` — publishing is a gated "
+            "decision. Use propose_change (with published/fields) and then "
+            "approve_proposal; that path builds, deploys and purges."
+        )
     meta = _read_meta(slug)
     if not _post_dir(slug).is_dir():
         raise ValueError(f"post not found: {slug}")
     changes: list[dict[str, Any]] = []
-    for field in ("title", "description", "published", "tags"):
+    for field in ("title", "description", "tags"):
         if field in args:
             old = meta.get(field)
             new = args[field]
@@ -1037,6 +1349,8 @@ HANDLERS = {
     "revise_proposal": tool_revise_proposal,
     "list_proposals": tool_list_proposals,
     "approve_proposal": tool_approve_proposal,
+    "reject_proposal": tool_reject_proposal,
+    "revert_proposal": tool_revert_proposal,
     "build_site": tool_build_site,
     "build_preview": tool_build_preview,
     "add_media": tool_add_media,

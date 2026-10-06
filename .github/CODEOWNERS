@@ -1,0 +1,4 @@
+# CODEOWNERS — post-cms
+# Everything requires the owner's review. The proposal gate (approve_proposal)
+# is the tool-level enforcement; this is the GitHub-level backstop.
+* @jlien

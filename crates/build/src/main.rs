@@ -245,13 +245,13 @@ fn main() -> Result<()> {
     render_contact(&tera, &dist, &styling, &cfg, "")?;
     render_404(&tera, &dist, &styling, &cfg, "")?;
     render_rss(&root, &dist, &posts)?;
-    render_sitemap(&root, &dist, &posts, &pages)?;
+    render_sitemap(&root, &dist, &posts, &pages, &collections)?;
     render_robots(&dist, &site_base_url(&root))?;
     render_llms_txt(&root, &dist, &posts)?;
     render_mcp_card(&root, &dist)?;
-    render_search_index(&root, &dist, &posts)?;
+    render_search_index(&root, &dist, &posts, &collections)?;
     render_posts_markdown(&dist, &posts)?;
-    render_embeddings(&root, &dist, &posts)?;
+    render_embeddings(&root, &dist, &posts, &collections)?;
     // ---- draft previews --------------------------------------------------
     // DRAFTS=1 renders unpublished posts + collection items under
     // dist/preview/drafts/ with a draft banner and embedded agent_notes, so
@@ -957,7 +957,12 @@ fn markdown_to_text(input: &str) -> String {
 /// Emit search-index.json: one row per published post with title, description,
 /// url, date, tags and plain-text body — consumed lazily by the client search
 /// widget (Tier 1) and by /api/ask (Tier 2).
-fn render_search_index(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+fn render_search_index(
+    root: &Path,
+    dist: &Path,
+    posts: &[Post],
+    collections: &[Collection],
+) -> Result<()> {
     let site_base = site_base_url(root);
     let mut idx = Vec::new();
     for post in posts {
@@ -975,6 +980,21 @@ fn render_search_index(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
             "body": markdown_to_text(&md),
         }));
     }
+    // Typed-collection items are searchable too — /api/ask must be able to
+    // cite them like any other page.
+    for coll in collections {
+        for item in coll.items.iter().filter(|i| i.published) {
+            let md = fs::read_to_string(item.dir.join("index.mdx")).unwrap_or_default();
+            idx.push(serde_json::json!({
+                "title": item.title,
+                "description": item.description,
+                "url": format!("{}/{}/{}/", site_base, coll.name, item.slug),
+                "date": item.date.map(|d| d.to_string()).unwrap_or_default(),
+                "tags": [],
+                "body": markdown_to_text(&md),
+            }));
+        }
+    }
     fs::write(dist.join("search-index.json"), serde_json::to_vec_pretty(&idx)?)
         .with_context(|| "write search-index.json".to_string())?;
     Ok(())
@@ -984,11 +1004,20 @@ fn render_search_index(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
 /// Uses fastembed (ONNX on CPU, weights cached in ~/.cache) — no API key.
 /// Skips gracefully when the model can't be fetched (offline), leaving
 /// /api/ask in Tier-2 inline mode.
-fn render_embeddings(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+fn render_embeddings(
+    root: &Path,
+    dist: &Path,
+    posts: &[Post],
+    collections: &[Collection],
+) -> Result<()> {
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
-    if published.is_empty() {
+    let live_items: Vec<(&str, &CollectionItem)> = collections
+        .iter()
+        .flat_map(|c| c.items.iter().filter(|i| i.published).map(move |i| (c.name.as_str(), i)))
+        .collect();
+    if published.is_empty() && live_items.is_empty() {
         return Ok(());
     }
 
@@ -1021,6 +1050,25 @@ fn render_embeddings(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
                 serde_json::json!({
                     "title": title,
                     "url": format!("{}{}/", site_base, post.url_path()),
+                }),
+                format!("# {title} — {desc}\n\n{chunk}"),
+            ));
+        }
+    }
+    // Collection items get the same treatment (published only).
+    for (coll_name, item) in &live_items {
+        let md = fs::read_to_string(item.dir.join("index.mdx")).unwrap_or_default();
+        let text = markdown_to_text(&md);
+        let title = &item.title;
+        let desc = &item.description;
+        for chunk in chunk_text(&text, 700) {
+            if chunk.chars().count() < 80 {
+                continue;
+            }
+            rows.push((
+                serde_json::json!({
+                    "title": title,
+                    "url": format!("{}/{}/{}/", site_base, coll_name, item.slug),
                 }),
                 format!("# {title} — {desc}\n\n{chunk}"),
             ));
@@ -1287,7 +1335,13 @@ fn render_rss(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
     Ok(())
 }
 
-fn render_sitemap(root: &Path, dist: &Path, posts: &[Post], pages: &[Page]) -> Result<()> {
+fn render_sitemap(
+    root: &Path,
+    dist: &Path,
+    posts: &[Post],
+    pages: &[Page],
+    collections: &[Collection],
+) -> Result<()> {
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
     let live_pages: Vec<&Page> = pages.iter().filter(|p| p.meta.published).collect();
     let site_base = site_base_url(root);
@@ -1300,12 +1354,31 @@ fn render_sitemap(root: &Path, dist: &Path, posts: &[Post], pages: &[Page]) -> R
     for page in &live_pages {
         xml.push_str(&format!("<url><loc>{}/{}/</loc></url>\n", site_base, page.meta.slug));
     }
-    for post in published {
+    for post in published.iter().copied() {
         xml.push_str(&format!(
             "<url><loc>{}</loc><lastmod>{}</lastmod></url>\n",
             format!("{}{}", site_base, post.url_path()),
             post.meta.date
         ));
+    }
+    // Typed-collection items are first-class pages; they belong in the
+    // sitemap too.
+    for coll in collections {
+        let live_items: Vec<&CollectionItem> =
+            coll.items.iter().filter(|i| i.published).collect();
+        if live_items.is_empty() {
+            continue;
+        }
+        xml.push_str(&format!(
+            "<url><loc>{}/{}/</loc></url>\n",
+            site_base, coll.name
+        ));
+        for item in live_items {
+            xml.push_str(&format!(
+                "<url><loc>{}/{}/{}/</loc></url>\n",
+                site_base, coll.name, item.slug
+            ));
+        }
     }
     xml.push_str("</urlset>\n");
     fs::write(dist.join("sitemap.xml"), xml).context("write sitemap.xml")?;
