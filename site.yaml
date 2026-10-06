@@ -5,3 +5,7 @@ tagline: A git-based publishing stack — posts live in markdown, the build is a
 contact_email: hello@example.com
 
 plugins:
+  - name: hubspot-form
+    mounts: [body_end]
+    csp_script_src: ["js.hsforms.net", "js.hs-scripts.com"]
+    require_consent: true
