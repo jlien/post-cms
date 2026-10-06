@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -462,6 +463,28 @@ def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None =
     return True, pr.stdout.strip().splitlines()[-1]
 
 
+def _render_preview_artifact(wt: Path, collection: str, slug: str) -> str | None:
+    """Per-PR preview as a chat artifact, not a hosted URL: DRAFTS=1 build in
+    the proposal worktree renders the item AS IT WILL APPEAR (site template,
+    draft banner, agent_notes), and the rendered HTML is copied to a stable
+    path the agent attaches in the chat window. Returns the artifact path or
+    None when the item did not render (never blocks the proposal)."""
+    build = subprocess.run(
+        ["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
+        capture_output=True, text=True,
+        env={**os.environ, "DRAFTS": "1", "CARGO_TARGET_DIR": str(ROOT / "target")})
+    if build.returncode != 0:
+        return None
+    src = wt / "dist" / "preview" / "drafts" / collection / slug / "index.html"
+    if not src.exists():
+        return None
+    out_dir = Path(tempfile.gettempdir()) / "pcms-artifacts"
+    out_dir.mkdir(exist_ok=True)
+    out = out_dir / f"{collection}-{slug}.html"
+    shutil.copyfile(src, out)
+    return str(out)
+
+
 def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
     """Create a Tera template via the review flow.
 
@@ -757,6 +780,10 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             "pr_url": pr_or_err if ok else None,
             "preview_command": preview_cmd,
         }
+        if ok:
+            # Per-PR preview as a chat artifact: the rendered page travels
+            # into the review thread instead of needing a hosted URL.
+            result["preview_artifact"] = _render_preview_artifact(wt, collection, slug)
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
@@ -1176,6 +1203,7 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
         return {"revised": True, "branch": branch,
                 "pr_url": _open_pr_for_branch(branch),
+                "preview_artifact": _render_preview_artifact(tmp, collection, slug),
                 "preview_command": (f"cd {tmp} && DRAFTS=1 cargo run -q -p build && "
                                     f"python3 -m http.server 8000 -d dist")}
     finally:
