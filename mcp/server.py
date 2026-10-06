@@ -11,6 +11,7 @@ Run:   python3 mcp/server.py            # JSON-RPC server on stdio
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -552,7 +553,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
                 (args.get("approver_email") or "").strip())
             apn = apn_i["name"] or apn_i["login"]
             ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-            apn_src = f"github:{apn_i['login']} via gh session"
+            apn_src = apn_i["source"]
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
                  f"Approved by {apn} <{ape}> via propose_change(merge=true) "
@@ -766,7 +767,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
                 (args.get("approver_email") or "").strip())
             apn = apn_i["name"] or apn_i["login"]
             ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-            apn_src = f"github:{apn_i['login']} via gh session"
+            apn_src = apn_i["source"]
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
                  f"Approved by {apn} <{ape}> via propose_template(merge=true) "
@@ -1318,16 +1319,26 @@ def _ship_and_purge(result: dict[str, Any]) -> None:
 
 
 # ---- approver identity: from the login, not from free text ----------------
+#
+# Over the hosted HTTP transport (mcp/http_server.py), identity comes from
+# the validated OAuth token bound into the request context — a standard
+# connector (GitHub token introspection or any OIDC issuer via discovery +
+# JWKS). Locally (stdio), it comes from the authenticated gh session.
+
+_HTTP_IDENTITY: "contextvars.ContextVar[dict[str, Any] | None]" = (
+    contextvars.ContextVar("pcms_http_identity", default=None))
 
 _GH_IDENTITY_CACHE: dict[str, Any] | None = None
 
 
 def _gh_identity() -> dict[str, Any]:
-    """Resolve the approver's identity from the AUTHENTICATED GitHub session
-    (gh api user) — not from free text. The same agent could type any name;
-    it cannot type the token that gh is logged in with. Cached per process.
-    Raises if gh has no session: approvals without a resolvable identity are
-    refused, not guessed."""
+    """Resolve the approver's identity — not from free text. Over HTTP this
+    is the authenticated OAuth principal; locally it is the gh session
+    (`gh api user`). Cached per process for the local path. Raises when no
+    authenticated identity exists: approvals are refused, not guessed."""
+    http_ident = _HTTP_IDENTITY.get()
+    if http_ident is not None:
+        return http_ident
     global _GH_IDENTITY_CACHE
     if _GH_IDENTITY_CACHE is not None:
         return _GH_IDENTITY_CACHE
@@ -1337,8 +1348,9 @@ def _gh_identity() -> dict[str, Any]:
         raise ValueError(
             "approver identity could not be resolved: `gh api user` failed "
             f"({res.stderr.strip()[:200]}). Approvals require an "
-            "authenticated GitHub session — identity is taken from the "
-            "login, never from free-text arguments."
+            "authenticated identity (OAuth token over HTTP, gh session "
+            "locally) — identity is taken from the login, never from "
+            "free-text arguments."
         )
     try:
         u = json.loads(res.stdout)
@@ -1348,6 +1360,7 @@ def _gh_identity() -> dict[str, Any]:
         "login": u.get("login") or "",
         "name": u.get("name") or "",
         "email": u.get("email") or "",
+        "source": f"github:{u.get('login')} via gh session",
     }
     return _GH_IDENTITY_CACHE
 
@@ -1450,7 +1463,7 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     ident = _check_declared_identity(declared_name, declared_email)
     approver_name = ident["name"] or ident["login"]
     approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
-    identity_source = f"github:{ident['login']} via gh session"
+    identity_source = ident["source"]
     distinct = os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
     slugs = args.get("slugs")
     if not slugs:
@@ -1510,7 +1523,7 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
         (args.get("reviewer_email") or "").strip())
     reviewer_name = ident["name"] or ident["login"]
     reviewer_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
-    identity_source = f"github:{ident['login']} via gh session"
+    identity_source = ident["source"]
     branch = _proposal_branch(slug)
     if branch is None:
         raise ValueError(f"no proposal branch for slug {slug!r}")
@@ -1558,7 +1571,7 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
         (args.get("approver_email") or "").strip())
     approver_name = ident["name"] or ident["login"]
     approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
-    identity_source = f"github:{ident['login']} via gh session"
+    identity_source = ident["source"]
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
