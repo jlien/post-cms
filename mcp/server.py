@@ -870,6 +870,17 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     csp_script_src = [d.strip() for d in (args.get("csp_script_src") or []) if d.strip()]
     require_consent = bool(args.get("require_consent"))
     tenant = (args.get("tenant") or "").strip()
+    if args.get("merge"):
+        # Approval gate BEFORE any side effect: no anonymous merges, and a
+        # refused merge must not leave a pushed branch or open PR behind.
+        apn = (args.get("approver_name") or "").strip()
+        ape = (args.get("approver_email") or "").strip()
+        if not apn or not ape:
+            raise ValueError(
+                "merge=true requires approver_name and approver_email "
+                "(an approval is on the record) — or call approve_proposal "
+                "after review"
+            )
 
     # A throwaway worktree on origin/main — the shared tree is never touched,
     # so a failed proposal cannot leave uncommitted writes behind (and a
@@ -879,7 +890,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     if tenant:
         wt = tenant_worktree(tenant)
     else:
-        _git("fetch", "origin")
+        _git("fetch", "--prune", "origin")
         tmp = ROOT / ".tenants" / f"plugin-{name}-{int(time.time() * 1000)}"
         tmp.parent.mkdir(parents=True, exist_ok=True)
         res = _git("worktree", "add", "--detach", str(tmp), "origin/main")
@@ -971,15 +982,9 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
-            # Same approval gate as everywhere else: no anonymous merges.
+            # Gate already validated up-front; record the approval, merge.
             apn = (args.get("approver_name") or "").strip()
             ape = (args.get("approver_email") or "").strip()
-            if not apn or not ape:
-                raise ValueError(
-                    "merge=true requires approver_name and approver_email "
-                    "(an approval is on the record) — or call approve_proposal "
-                    "after review"
-                )
             comment = subprocess.run(
                 ["gh", "pr", "comment", branch, "--body",
                  f"Approved by {apn} <{ape}> via propose_plugin(merge=true)."],
