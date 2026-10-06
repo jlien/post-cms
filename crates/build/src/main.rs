@@ -500,6 +500,20 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<Strin
 }
 
 fn repo_root() -> Result<PathBuf> {
+    // Runtime repo root (git toplevel of the current directory), so builds in
+    // tenant worktrees validate the worktree's content. Falls back to the
+    // compile-time manifest dir only outside a git repo.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Ok(PathBuf::from(s));
+            }
+        }
+    }
     let manifest = env!("CARGO_MANIFEST_DIR");
     // crates/build → repo root
     let root = Path::new(manifest)

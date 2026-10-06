@@ -365,10 +365,14 @@ def tenant_worktree(tenant: str) -> Path:
 
 
 def _reset_worktree(wt: Path, created: list[Path]) -> None:
-    """Undo uncommitted writes in a worktree (new files removed, tracked restored)."""
+    """Undo uncommitted writes in a worktree (new files removed, tracked
+    restored), then leave it detached on origin/main — the proposal branch
+    ref must keep pointing at the pushed commits, so reset --hard is only
+    ever run against HEAD, never against origin/main."""
     for p in created:
         p.unlink(missing_ok=True)
-    _git("reset", "--hard", "origin/main", worktree=wt)
+    _git("reset", "--hard", worktree=wt)
+    _git("checkout", "--detach", "origin/main", worktree=wt)
 
 
 def _open_pr(wt: Path, branch: str, title: str, pr_body: str) -> tuple[bool, str]:
@@ -527,14 +531,15 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     md_path = item_dir / "index.mdx"
     is_new = not item_dir.exists()
 
-    # Branch per change, from current default branch state.
-    existing = _git("rev-parse", "--verify", "--quiet", f"agent/{slug}-1").returncode
-    n = 1
-    while existing == 0:
-        n += 1
-        existing = _git("rev-parse", "--verify", "--quiet",
-                        f"agent/{slug}-{n}").returncode
-    branch = f"agent/{slug}-{n}" if n > 1 else f"agent/{slug}"
+    # Branch per change, from current default branch state. Version suffixes
+    # are -rN (so hyphenated slugs parse unambiguously); a slug's first
+    # proposal is agent/<slug>, competing re-proposals get -r2, -r3, ...
+    branch = f"agent/{slug}"
+    for i in range(2, 21):
+        if (_git("rev-parse", "--verify", "--quiet", f"agent/{slug}-r{i}").returncode == 0
+                or _git("rev-parse", "--verify", "--quiet",
+                        f"origin/agent/{slug}-r{i}").returncode == 0):
+            branch = f"agent/{slug}-r{i + 1}"
     res = _git("switch", "-C", branch, worktree=wt)
     if res.returncode != 0:
         raise ValueError(f"git switch failed: {res.stderr.strip()[:300]}")
@@ -670,9 +675,10 @@ def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
 
 
 def _proposal_branch(slug: str) -> str | None:
-    """Latest agent/<slug>-<n> (or agent/<slug>) branch, local or on origin."""
+    """Latest agent/<slug>[-rN] branch, local or on origin. The version
+    suffix is -rN so hyphenated slugs parse unambiguously."""
     for n in range(20, 1, -1):
-        name = f"agent/{slug}-{n}"
+        name = f"agent/{slug}-r{n}"
         if (_git("rev-parse", "--verify", "--quiet", name).returncode == 0
                 or _git("rev-parse", "--verify", "--quiet",
                         f"origin/{name}").returncode == 0):
@@ -724,10 +730,13 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
 
     tmp = ROOT / ".tenants" / f"revise-{slug}-{int(time.time() * 1000)}"
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    ref = branch
-    if _git("rev-parse", "--verify", "--quiet", branch).returncode != 0:
-        ref = f"origin/{branch}"
-    res = _git("worktree", "add", "--detach", str(tmp), ref)
+    # origin/<branch> is the source of truth — a local ref can be stale
+    # (behind a revision pushed by an earlier session).
+    fres = _git("fetch", "origin",
+                f"+refs/heads/{branch}:refs/remotes/origin/{branch}", worktree=ROOT)
+    if fres.returncode != 0:
+        raise ValueError(f"git fetch failed: {fres.stderr.strip()[:300]}")
+    res = _git("worktree", "add", "--detach", str(tmp), f"origin/{branch}")
     if res.returncode != 0:
         raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
     try:
@@ -788,7 +797,7 @@ def tool_list_proposals(_args: dict[str, Any]) -> dict[str, Any]:
         head = str(p.get("headRefName") or "")
         if not head.startswith("agent/"):
             continue
-        slug = head.removeprefix("agent/").rsplit("-", 1)[0]
+        slug = re.sub(r"-r\d+$", "", head.removeprefix("agent/"))
         proposals.append({
             "number": p.get("number"),
             "title": p.get("title"),
