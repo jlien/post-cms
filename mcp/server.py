@@ -899,9 +899,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             if not any(e["name"] == name for e in current):
                 raise ValueError(f"plugin {name!r} is not declared in site.yaml — nothing to remove")
             if snippet_path.exists():
-                # tracked file: git rm handles it at commit time; untracked: unlink
                 _git("rm", "-rqf", str(plugin_dir.relative_to(wt)), worktree=wt)
-                created.append(snippet_path)
             new_entries = [e for e in current if e["name"] != name]
             _set_site_yaml_plugins(site_path, new_entries)
             verb = "remove"
@@ -911,9 +909,6 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("snippet (HTML) is required unless remove=true")
             if not plugin_dir.exists():
                 plugin_dir.mkdir(parents=True)
-                created.append(plugin_dir)
-            if not snippet_path.exists():
-                created.append(snippet_path)
             snippet_path.write_text(snippet if snippet.endswith("\n") else snippet + "\n")
             entry = {"name": name, "mounts": mounts, "csp_script_src": csp_script_src,
                      "require_consent": require_consent}
