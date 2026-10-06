@@ -2,7 +2,7 @@ title: "Artifact Flow"
 slug: "artifact-flow"
 published: true
 description: "Proof item for the artifact-model editorial layer."
-agent_notes: "Verified against the local build only; the tier is a guess — reviewer should confirm. Setup time unverified."
+agent_notes: "Reviewer asked for the setup caveat to be resolved — confirmed against the vendor docs."
 vendor: "Artifact Analytics"
 tier: "partner"
 setup_minutes: 10
