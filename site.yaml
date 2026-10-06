@@ -5,3 +5,6 @@ tagline: A git-based publishing stack — posts live in markdown, the build is a
 contact_email: hello@example.com
 
 plugins:
+  - name: acme-pixel
+    mounts: [head]
+    csp_script_src: ["https://www.example-analytics.example"]
