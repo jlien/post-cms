@@ -275,6 +275,34 @@ TOOLS = [
         },
     },
     {
+        "name": "propose_plugin",
+        "description": (
+            "Propose a client-side plugin (analytics pixel, ad tag) via the "
+            "review flow: writes plugins/<name>/snippet.html + the site.yaml "
+            "plugins: entry, validates with a real build, opens a PR with "
+            "risk: tracking. remove=true deletes an existing plugin. The PR "
+            "diff IS the pixel being added."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Plugin name [A-Za-z0-9-] — becomes plugins/<name>/."},
+                "snippet": {"type": "string", "description": "Raw snippet HTML (mounted verbatim). Required unless remove=true."},
+                "mounts": {"type": "array", "items": {"type": "string", "enum": ["head", "body_end"]}, "description": "Where the snippet mounts (default [head])."},
+                "csp_script_src": {"type": "array", "items": {"type": "string"}, "description": "Script-src hosts the snippet loads from (feeds the CSP meta tag)."},
+                "require_consent": {"type": "boolean", "description": "Run only after visitor consent (pcms_consent=granted / pcms:grant event)."},
+                "remove": {"type": "boolean", "description": "Remove the plugin instead of adding it."},
+                "tenant": {"type": "string", "description": "Isolated working copy (.tenants/<tenant>) for multi-tenant simulation."},
+                "author_name": {"type": "string", "description": "Git author name for the commit."},
+                "author_email": {"type": "string", "description": "Git author email for the commit."},
+                "merge": {"type": "boolean", "description": "Merge the PR immediately (requires approver identity, default false)."},
+                "approver_name": {"type": "string", "description": "Required with merge=true."},
+                "approver_email": {"type": "string", "description": "Required with merge=true."},
+            },
+            "required": ["name", "author_name", "author_email"],
+        },
+    },
+    {
         "name": "publish_status",
         "description": "Counts and lists of live vs pending (draft) posts.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -748,6 +776,224 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
         raise
 
 
+# ------------------------------------------------------------------- plugins
+
+def _read_site_yaml_plugins(site_path: Path) -> list[dict[str, Any]]:
+    """Parse the top-level `plugins:` block of a site.yaml (stdlib only)."""
+    lines = site_path.read_text().splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("plugins:"))
+    except StopIteration:
+        return []
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith((" ", "\t")) or not lines[end].strip()):
+        end += 1
+    entries: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for ln in lines[start + 1:end]:
+        if ln.strip().startswith("- name:"):
+            cur = {"name": ln.split(":", 1)[1].strip()}
+            entries.append(cur)
+        elif cur is not None and ":" in ln:
+            k, v = ln.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k == "mounts":
+                cur["mounts"] = [t.strip() for t in v.strip("[]").split(",") if t.strip()]
+            elif k == "csp_script_src":
+                cur["csp_script_src"] = [t.strip().strip('"')
+                                         for t in v.strip("[]").split(",") if t.strip()]
+            elif k == "require_consent":
+                cur["require_consent"] = v.lower() in ("true", "yes", "1")
+    return entries
+
+
+def _site_yaml_plugins_block(entries: list[dict[str, Any]]) -> str:
+    lines = ["plugins:"]
+    for e in entries:
+        lines.append(f"  - name: {e['name']}")
+        lines.append(f"    mounts: [{', '.join(e.get('mounts') or ['head'])}]")
+        if e.get("csp_script_src"):
+            domains = ", ".join(f'"{d}"' for d in e["csp_script_src"])
+            lines.append(f"    csp_script_src: [{domains}]")
+        if e.get("require_consent"):
+            lines.append("    require_consent: true")
+    return "\n".join(lines)
+
+
+def _set_site_yaml_plugins(site_path: Path, new_entries: list[dict[str, Any]]) -> None:
+    """Replace the top-level `plugins:` block in site.yaml (or append it, or
+    remove it entirely when the list is empty). Rest of the file untouched."""
+    lines = site_path.read_text().splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("plugins:"))
+    except StopIteration:
+        start = None
+    if start is not None:
+        end = start + 1
+        while end < len(lines) and (lines[end].startswith((" ", "\t")) or not lines[end].strip()):
+            end += 1
+        del lines[start:end]
+    block = _site_yaml_plugins_block(new_entries)
+    if block:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(block.splitlines())
+    site_path.write_text("\n".join(lines) + "\n")
+
+
+def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
+    """Propose a client-side plugin (analytics pixel, ad tag) via the review
+    flow. Writes plugins/<name>/snippet.html and registers the plugin in
+    site.yaml `plugins:`, validates with a real build (a snippet whose
+    domains are undeclared or whose file is missing fails the build), pushes,
+    and opens a PR with risk: tracking — the PR diff IS the pixel being
+    added. `remove: true` deletes the snippet and drops the declaration.
+    """
+    if not (ROOT / ".git").exists():
+        raise ValueError("not a git repository")
+    author_name = (args.get("author_name") or "").strip()
+    author_email = (args.get("author_email") or "").strip()
+    if not author_name or not author_email:
+        raise ValueError("author_name and author_email are required (identity on the MR)")
+    name = (args.get("name") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", name):
+        raise ValueError("plugin name must match [A-Za-z0-9][A-Za-z0-9-]*")
+    remove = bool(args.get("remove"))
+    mounts = args.get("mounts") or ["head"]
+    for m in mounts:
+        if m not in ("head", "body_end"):
+            raise ValueError(f"unknown mount {m!r} (head / body_end)")
+    csp_script_src = [d.strip() for d in (args.get("csp_script_src") or []) if d.strip()]
+    require_consent = bool(args.get("require_consent"))
+    tenant = (args.get("tenant") or "").strip()
+    wt = tenant_worktree(tenant) if tenant else ROOT
+
+    site_path = wt / "site.yaml"
+    if not site_path.exists():
+        raise ValueError("site.yaml not found in repo")
+    plugin_dir = wt / "plugins" / name
+    snippet_path = plugin_dir / "snippet.html"
+    created: list[Path] = []
+
+    try:
+        current = _read_site_yaml_plugins(site_path)
+        if remove:
+            if not any(e["name"] == name for e in current):
+                raise ValueError(f"plugin {name!r} is not declared in site.yaml — nothing to remove")
+            if snippet_path.exists():
+                # tracked file: git rm handles it at commit time; untracked: unlink
+                _git("rm", "-rqf", str(plugin_dir.relative_to(wt)), worktree=wt)
+                created.append(snippet_path)
+            new_entries = [e for e in current if e["name"] != name]
+            _set_site_yaml_plugins(site_path, new_entries)
+            verb = "remove"
+        else:
+            snippet = args.get("snippet")
+            if not snippet or not snippet.strip():
+                raise ValueError("snippet (HTML) is required unless remove=true")
+            if not plugin_dir.exists():
+                plugin_dir.mkdir(parents=True)
+                created.append(plugin_dir)
+            if not snippet_path.exists():
+                created.append(snippet_path)
+            snippet_path.write_text(snippet if snippet.endswith("\n") else snippet + "\n")
+            entry = {"name": name, "mounts": mounts, "csp_script_src": csp_script_src,
+                     "require_consent": require_consent}
+            new_entries = [e for e in current if e["name"] != name] + [entry]
+            _set_site_yaml_plugins(site_path, new_entries)
+            verb = "add"
+
+        # Validation: a real build. The build crate rejects declared plugins
+        # with no snippet, unknown mounts, and bad names — so a broken plugin
+        # never reaches a PR.
+        build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            raise ValueError(f"plugin failed build validation:\n{tail}")
+
+        branch = f"agent/plugin-{name}"
+        _git("switch", "-C", branch, worktree=wt)
+        commit_env = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        _git("add", str(plugin_dir.relative_to(wt)), worktree=wt)
+        _git("add", "site.yaml", worktree=wt)
+        res = _git("commit", "-m", f"propose: {verb} plugin {name}", env_extra=commit_env,
+                   worktree=wt)
+        if res.returncode != 0:
+            if "nothing to commit" in (res.stdout + res.stderr):
+                raise ValueError("plugin unchanged — nothing to propose")
+            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        push = _git("push", "-u", "origin", branch, worktree=wt)
+        if push.returncode != 0:
+            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+
+        if remove:
+            detail = ("Removes the tracking snippet and its site.yaml declaration. "
+                      "After merge, revert_proposal can restore it — the ledger keeps both.")
+        else:
+            detail = (f"mounts: {mounts}\ncsp_script_src: {csp_script_src or ['(none)']}\n"
+                      f"require_consent: {require_consent}\n\n"
+                      "The PR diff IS the pixel being added — review the script URLs.")
+        pr_body = (f"Agent-authored plugin by {author_name}.\n\n"
+                   f"risk: tracking\n\n{detail}")
+        ok, pr_or_err = _open_pr(wt, branch, f"Plugin ({verb}): {name}", pr_body)
+
+        result: dict[str, Any] = {
+            "branch": branch,
+            "plugin": f"plugins/{name}/snippet.html",
+            "proposed": True,
+            "risk": "tracking",
+            "tenant": tenant or None,
+            "pr_url": pr_or_err if ok else None,
+        }
+        if not ok:
+            result["pr_error"] = pr_or_err
+        if ok and args.get("merge"):
+            # Same approval gate as everywhere else: no anonymous merges.
+            apn = (args.get("approver_name") or "").strip()
+            ape = (args.get("approver_email") or "").strip()
+            if not apn or not ape:
+                raise ValueError(
+                    "merge=true requires approver_name and approver_email "
+                    "(an approval is on the record) — or call approve_proposal "
+                    "after review"
+                )
+            comment = subprocess.run(
+                ["gh", "pr", "comment", branch, "--body",
+                 f"Approved by {apn} <{ape}> via propose_plugin(merge=true)."],
+                cwd=str(wt), capture_output=True, text=True)
+            result["approval_recorded"] = comment.returncode == 0
+            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
+                                   cwd=str(wt), capture_output=True, text=True)
+            result["merged"] = merge.returncode == 0
+            if merge.returncode != 0:
+                result["merge_error"] = merge.stderr.strip()[:300]
+            else:
+                result["deploy"] = ("skipped: propose_plugin does not deploy; "
+                                    "use approve_proposal for build+deploy+purge")
+        if wt != ROOT:
+            _reset_worktree(wt, [])
+        else:
+            _git("switch", "-")
+        return result
+    except Exception:
+        for p in created:
+            p.unlink(missing_ok=True)
+        if wt != ROOT:
+            _reset_worktree(wt, [])
+        else:
+            _git("switch", "-")
+            # The shared tree must stay clean: undo the staged/unstaged
+            # plugin writes (safe — proposals are the only write path).
+            _git("reset", "-q", "--hard")
+        raise
+
+
 def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
                       description: str | None = None,
                       agent_notes: str | None = None,
@@ -778,17 +1024,24 @@ def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
 
 def _proposal_branch(slug: str) -> str | None:
     """Latest agent/<slug>[-rN] branch, local or on origin. The version
-    suffix is -rN so hyphenated slugs parse unambiguously."""
-    for n in range(20, 1, -1):
-        name = f"agent/{slug}-r{n}"
-        if (_git("rev-parse", "--verify", "--quiet", name).returncode == 0
+    suffix is -rN so hyphenated slugs parse unambiguously. Accepts the bare
+    proposal ID and resolves kind-prefixed branches too: `acme-pixel`
+    finds agent/plugin-acme-pixel (plugins) / agent/template-<name>
+    (templates); the queue always shows the full branch-derived ID."""
+    candidates = [slug]
+    if not slug.startswith(("plugin-", "template-")):
+        candidates += [f"plugin-{slug}", f"template-{slug}"]
+    for s in candidates:
+        for n in range(20, 1, -1):
+            name = f"agent/{s}-r{n}"
+            if (_git("rev-parse", "--verify", "--quiet", name).returncode == 0
+                    or _git("rev-parse", "--verify", "--quiet",
+                            f"origin/{name}").returncode == 0):
+                return name
+        if (_git("rev-parse", "--verify", "--quiet", f"agent/{s}").returncode == 0
                 or _git("rev-parse", "--verify", "--quiet",
-                        f"origin/{name}").returncode == 0):
-            return name
-    if (_git("rev-parse", "--verify", "--quiet", f"agent/{slug}").returncode == 0
-            or _git("rev-parse", "--verify", "--quiet",
-                    f"origin/agent/{slug}").returncode == 0):
-        return f"agent/{slug}"
+                        f"origin/agent/{s}").returncode == 0):
+            return f"agent/{s}"
     return None
 
 
@@ -1144,12 +1397,16 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("slug required")
     _git("fetch", "origin")
     log = _git("log", "origin/main", "--merges", "--format=%H %s", "--")
-    needle = f"agent/{slug}"
+    # The branch name in the merge subject may carry a kind prefix
+    # (agent/plugin-<name>, agent/template-<name>) — accept the bare ID too.
+    needles = [f"agent/{slug}"]
+    if not slug.startswith(("plugin-", "template-")):
+        needles += [f"agent/plugin-{slug}", f"agent/template-{slug}"]
     merge_sha = None
     merge_pr = None
     for line in log.stdout.splitlines():
         sha, _, subject = line.partition(" ")
-        if needle in subject:
+        if any(n in subject for n in needles):
             m = re.search(r"#(\d+)", subject)
             merge_pr = int(m.group(1)) if m else None
             merge_sha = sha
@@ -1346,6 +1603,7 @@ HANDLERS = {
     "update_post": tool_update_post,
     "propose_change": tool_propose_change,
     "propose_template": tool_propose_template,
+    "propose_plugin": tool_propose_plugin,
     "revise_proposal": tool_revise_proposal,
     "list_proposals": tool_list_proposals,
     "approve_proposal": tool_approve_proposal,

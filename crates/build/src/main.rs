@@ -290,6 +290,18 @@ fn main() -> Result<()> {
         );
     }
 
+    // ---- client-side plugins (analytics pixels, ad tags) ------------------
+    // Declared in site.yaml `plugins:`; snippets live in plugins/<name>/.
+    // Snippets are injected into the rendered HTML at BUILD time — the
+    // origin never serves or executes anything. Skipped in DRAFTS=1 builds:
+    // review previews must not fire tracking.
+    if !drafts_on {
+        let injected = render_plugins(&root, &dist)?;
+        if injected > 0 {
+            println!("plugins injected into {} html files", injected);
+        }
+    }
+
     let images_saved = optimize_images(&dist)?;
     if images_saved > 0 {
         println!("optimized images: {} bytes saved", images_saved);
@@ -436,6 +448,195 @@ fn read_site_theme(root: &Path) -> Option<String> {
     val.get("theme")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+// ---- client-side plugins (analytics pixels, ad tags) -----------------------
+//
+// A plugin is declared in site.yaml `plugins:` and its snippet lives in
+// plugins/<name>/snippet.html. The build injects snippets into every
+// rendered HTML page (before </head> or </body>) and computes a CSP meta
+// tag from the domains each plugin declares — a plugin cannot phone home
+// to a domain it did not declare. Assets in plugins/<name>/assets/ are
+// copied to dist/assets/<name>/ like theme assets.
+
+#[derive(Debug, Deserialize)]
+struct PluginCfg {
+    name: String,
+    /// Where the snippet mounts: "head" (before </head>) and/or
+    /// "body_end" (before </body>).
+    #[serde(default)]
+    mounts: Vec<String>,
+    /// Extra script-src hosts this plugin needs (feeds the CSP meta tag).
+    #[serde(default)]
+    csp_script_src: Vec<String>,
+    /// Wrap the snippet in a consent gate: it only runs after the visitor
+    /// grants consent (cookie pcms_consent=granted, or a pcms:grant event).
+    #[serde(default)]
+    require_consent: bool,
+}
+
+fn load_plugins(root: &Path) -> Result<Vec<PluginCfg>> {
+    let raw = fs::read_to_string(root.join("site.yaml"))
+        .with_context(|| "read site.yaml".to_string())?;
+    let val: serde_yaml::Value =
+        serde_yaml::from_str(&raw).with_context(|| "parse site.yaml".to_string())?;
+    let Some(list) = val.get("plugins").and_then(|v| v.as_sequence()) else {
+        return Ok(Vec::new());
+    };
+    let mut plugins = Vec::new();
+    for item in list {
+        let cfg: PluginCfg = serde_yaml::from_value(item.clone())
+            .with_context(|| "malformed entry in site.yaml plugins:".to_string())?;
+        if cfg.name.is_empty() {
+            bail!("plugins: entry with empty name");
+        }
+        if !cfg.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            bail!("plugin name {:?} must be [A-Za-z0-9-]+", cfg.name);
+        }
+        if cfg.mounts.is_empty() {
+            bail!("plugin {:?} declares no mounts (head / body_end)", cfg.name);
+        }
+        for m in &cfg.mounts {
+            if m != "head" && m != "body_end" {
+                bail!("plugin {:?} has unknown mount {:?} (head / body_end)", cfg.name, m);
+            }
+        }
+        plugins.push(cfg);
+    }
+    Ok(plugins)
+}
+
+/// The plugin's snippet, consent-gated when require_consent is set. The gate
+/// re-creates <script> nodes from the stored template (scripts inserted via
+/// innerHTML never execute) and only runs once consent exists.
+fn plugin_snippet(root: &Path, p: &PluginCfg) -> Result<String> {
+    let path = root.join("plugins").join(&p.name).join("snippet.html");
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("plugin {:?} declared but plugins/{}/snippet.html missing", p.name, p.name))?;
+    if !p.require_consent {
+        return Ok(raw);
+    }
+    let esc = raw.replace('\\', "\\\\").replace('`', "\\`").replace("</", "<\\/");
+    Ok(format!(
+        "<script>(function(){{\nvar granted=function(){{return document.cookie.indexOf('pcms_consent=granted')!==-1}};\nvar go=function(){{\nif(window.__pcms_{name})return;window.__pcms_{name}=1;\nvar t=document.createElement('template');t.innerHTML=`{esc}`;\nt.content.querySelectorAll('script').forEach(function(old){{\nvar s=document.createElement('script');\nfor(var i=0;i<old.attributes.length;i++){{var a=old.attributes[i];s.setAttribute(a.name,a.value)}}\ns.text=old.text;document.head.appendChild(s);\n}});\ndocument.head.appendChild(t.content);\n}};\nvar check=function(){{if(granted())go()}};\ncheck();window.addEventListener('pcms:grant',check);\n}})();</script>\n",
+        name = p.name,
+        esc = esc
+    ))
+}
+
+/// Copy plugins/<name>/assets/* to dist/assets/<name>/ (plain copies — the
+/// server serves /assets with immutable caching like theme assets).
+fn copy_plugin_assets(root: &Path, dist: &Path, name: &str) -> Result<()> {
+    let src = root.join("plugins").join(name).join("assets");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let dst_root = dist.join("assets").join(name);
+    fn walk(src: &Path, dst: &Path) -> Result<()> {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                walk(&from, &to)?;
+            } else {
+                fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+    walk(&src, &dst_root)
+}
+
+/// Inject all declared plugins into every rendered HTML file in dist/.
+/// Returns the number of files touched.
+fn render_plugins(root: &Path, dist: &Path) -> Result<usize> {
+    let plugins = load_plugins(root)?;
+    if plugins.is_empty() {
+        return Ok(0);
+    }
+    let mut head_parts: Vec<String> = Vec::new();
+    let mut end_parts: Vec<String> = Vec::new();
+    let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for p in &plugins {
+        copy_plugin_assets(root, dist, &p.name)?;
+        let snippet = plugin_snippet(root, p)?;
+        for m in &p.mounts {
+            match m.as_str() {
+                "head" => head_parts.push(snippet.clone()),
+                "body_end" => end_parts.push(snippet.clone()),
+                _ => unreachable!("mounts validated in load_plugins"),
+            }
+        }
+        domains.extend(p.csp_script_src.iter().cloned());
+    }
+    let head_html: String = if head_parts.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("\n<!-- plugins: build-time injection (site.yaml plugins:) -->\n");
+        for p in &head_parts {
+            s.push_str(p);
+            s.push('\n');
+        }
+        s
+    };
+    let end_html: String = if end_parts.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("\n<!-- plugins: build-time injection (site.yaml plugins:) -->\n");
+        for p in &end_parts {
+            s.push_str(p);
+            s.push('\n');
+        }
+        s
+    };
+    let csp_meta = if domains.is_empty() {
+        String::new()
+    } else {
+        let mut list: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+        list.sort();
+        format!(
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'unsafe-inline' {}\">\n",
+            list.join(" ")
+        )
+    };
+
+    let mut touched = 0usize;
+    fn inject_all(dir: &Path, head: &str, end: &str, csp: &str, touched: &mut usize) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                inject_all(&path, head, end, csp, touched)?;
+            } else if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                let html = fs::read_to_string(&path)?;
+                let mut out = html.clone();
+                if !csp.is_empty() {
+                    if let Some(i) = out.find("<head>") {
+                        out.insert_str(i + 6, csp);
+                    }
+                }
+                if !head.is_empty() {
+                    if let Some(i) = out.find("</head>") {
+                        out.insert_str(i, head);
+                    }
+                }
+                if !end.is_empty() {
+                    if let Some(i) = out.find("</body>") {
+                        out.insert_str(i, end);
+                    }
+                }
+                if out != html {
+                    fs::write(&path, out)?;
+                    *touched += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+    inject_all(dist, &head_html, &end_html, &csp_meta, &mut touched)?;
+    Ok(touched)
 }
 
 fn available_themes(root: &Path) -> Vec<String> {
