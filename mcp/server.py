@@ -521,6 +521,11 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
+    # A refused merge must not leave a pushed branch or open PR behind:
+    # check the approval gate BEFORE any side effect (same contract as
+    # propose_plugin documents explicitly).
+    if args.get("merge"):
+        _approval_allowed()
     # Author identity comes from the authenticated session, not from a
     # typed name: an agent could otherwise propose as "Alice", approve as
     # itself, and launder self-approval past the distinct-approver check.
@@ -661,6 +666,11 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     """
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
+    # A refused merge must not leave a pushed branch or open PR behind:
+    # check the approval gate BEFORE any side effect (same contract as
+    # propose_plugin documents explicitly).
+    if args.get("merge"):
+        _approval_allowed()
     # Author identity comes from the authenticated session, not from a
     # typed name: an agent could otherwise propose as "Alice", approve as
     # itself, and launder self-approval past the distinct-approver check.
@@ -984,9 +994,11 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     tenant = (args.get("tenant") or "").strip()
     apn = ape = apn_src = ""  # bound when merge=true (gate below); Pyright-narrowing aid
     if args.get("merge"):
-        # Approval gate BEFORE any side effect: identity from the GitHub
-        # session (free text must match it), no anonymous merges, and a
-        # refused merge must not leave a pushed branch or open PR behind.
+        # Approval gate BEFORE any side effect: transport rules first,
+        # then identity from the GitHub session (free text must match it),
+        # no anonymous merges, and a refused merge must not leave a pushed
+        # branch or open PR behind.
+        _approval_allowed()
         apn_i = _check_declared_identity(
             (args.get("approver_name") or "").strip(),
             (args.get("approver_email") or "").strip())
@@ -1462,6 +1474,28 @@ def _gh_identity() -> dict[str, Any]:
     return _GH_IDENTITY_CACHE
 
 
+def _approval_allowed() -> None:
+    """Raise unless merging is allowed in this transport.
+
+    MCP_ALLOW_APPROVE=0: hard block everywhere (agent-facing installs).
+    Unset + PCMS_TRANSPORT=http: refuse by default — the token holder may
+    be an agent, and agents must not merge. Humans approve in the PR UI
+    or Slack; set MCP_ALLOW_APPROVE=1 to re-enable.
+    stdio: allowed (a solo loop would freeze without it).
+    """
+    if os.environ.get("MCP_ALLOW_APPROVE") == "0":
+        raise ValueError(
+            "merging is disabled (MCP_ALLOW_APPROVE=0). Approvals happen "
+            "through a human-authenticated channel — an agent-facing "
+            "server must not merge.")
+    if os.environ.get("MCP_ALLOW_APPROVE") != "1" \
+            and os.environ.get("PCMS_TRANSPORT") == "http":
+        raise ValueError(
+            "merging is disabled over HTTP by default: the token holder "
+            "may be an agent, and agents must not merge. Humans approve "
+            "in the PR UI or Slack; set MCP_ALLOW_APPROVE=1 to re-enable.")
+
+
 def _check_declared_identity(declared_name: str, declared_email: str) -> dict[str, Any]:
     """Free-text approver args (legacy) are allowed only when they MATCH the
     authenticated session identity — a name typed into a tool call is no
@@ -1549,12 +1583,7 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     identity is resolved from the authenticated GitHub session (`gh api
     user`) — free-text name/email are accepted only if they MATCH that
     identity. Low-risk copy batches can ride one approval."""
-    if os.environ.get("MCP_ALLOW_APPROVE") == "0":
-        raise ValueError(
-            "approve_proposal is disabled on this server instance "
-            "(MCP_ALLOW_APPROVE=0). Approvals happen through a human-"
-            "authenticated channel — an agent-facing server must not merge."
-        )
+    _approval_allowed()
     declared_name = (args.get("approver_name") or "").strip()
     declared_email = (args.get("approver_email") or "").strip()
     ident = _check_declared_identity(declared_name, declared_email)
