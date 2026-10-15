@@ -8,3 +8,4 @@ mcp/__pycache__/
 
 # multi-tenant simulation worktrees
 .tenants/
+.cache/

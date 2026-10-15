@@ -1,0 +1,8 @@
+title: A Caching Guide
+slug: caching-guide
+description: How to cache static pages at the edge.
+date: "2026-03-01"
+kind: guide
+tags: [caching, cdn]
+read_minutes: 6
+published: true

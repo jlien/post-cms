@@ -1,0 +1,59 @@
+[
+  {
+    "_type": "block",
+    "_key": "c1",
+    "style": "normal",
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "t1",
+        "text": "Check these before launch:",
+        "marks": [
+          "em"
+        ]
+      }
+    ]
+  },
+  {
+    "_type": "block",
+    "_key": "c2",
+    "style": "normal",
+    "listItem": "number",
+    "level": 1,
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "t2",
+        "text": "TLS everywhere",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "block",
+    "_key": "c3",
+    "style": "normal",
+    "listItem": "number",
+    "level": 1,
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "t3",
+        "text": "Health checks",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "image",
+    "_key": "c4",
+    "asset": {
+      "_ref": "image-0a1b2c3d-1200x630-png",
+      "_type": "reference"
+    },
+    "alt": "Edge diagram"
+  }
+]

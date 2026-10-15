@@ -1,0 +1,20 @@
+# Sanity-backed twin of files/articles: same constraints, items from GROQ.
+title: Articles
+required:
+  - title
+  - kind
+types:
+  read_minutes: number
+  tags: list
+enums:
+  kind: [guide, case-study, checklist]
+formats:
+  date: date
+  hero_url: url
+source:
+  type: sanity
+  project_id: exmpl123
+  dataset: production
+  api_version: "2025-02-19"
+  token_env: SANITY_READ_TOKEN
+  query: '*[_type == "article" && defined(slug.current)] | order(slug.current asc){_id, _type, _rev, title, slug, description, date, kind, tags, read_minutes, hero_url, body}'

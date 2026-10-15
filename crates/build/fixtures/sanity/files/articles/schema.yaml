@@ -1,0 +1,13 @@
+# File-based twin of articles: the same items as the recorded GROQ response.
+title: Articles
+required:
+  - title
+  - kind
+types:
+  read_minutes: number
+  tags: list
+enums:
+  kind: [guide, case-study, checklist]
+formats:
+  date: date
+  hero_url: url

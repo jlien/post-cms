@@ -1,0 +1,9 @@
+title: Edge Basics
+slug: edge-basics
+description: A short checklist for edge deployments.
+date: "2026-02-10"
+kind: checklist
+tags: [edge]
+read_minutes: 3
+hero_url: https://cdn.example.com/edge.png
+published: true

@@ -1,0 +1,68 @@
+{
+  "ms": 12,
+  "query": "*[_type == \"article\" && defined(slug.current)] | order(slug.current asc){_id, _type, _rev, title, slug, description, date, kind, tags, read_minutes, hero_url, body}",
+  "result": [
+    {
+      "_id": "a1f0c3d2-0001",
+      "_type": "article",
+      "_rev": "r1",
+      "title": "A Caching Guide",
+      "slug": {"_type": "slug", "current": "caching-guide"},
+      "description": "How to cache static pages at the edge.",
+      "date": "2026-03-01",
+      "kind": "guide",
+      "tags": ["caching", "cdn"],
+      "read_minutes": 6,
+      "hero_url": null,
+      "body": [
+        {"_type": "block", "_key": "b1", "style": "h2", "markDefs": [], "children": [{"_type": "span", "_key": "s1", "text": "Why cache", "marks": []}]},
+        {"_type": "block", "_key": "b2", "style": "normal", "markDefs": [{"_type": "link", "_key": "l1", "href": "https://example.com/cdn"}], "children": [
+          {"_type": "span", "_key": "s2", "text": "Static pages are ", "marks": []},
+          {"_type": "span", "_key": "s3", "text": "fast", "marks": ["strong"]},
+          {"_type": "span", "_key": "s4", "text": " behind a ", "marks": []},
+          {"_type": "span", "_key": "s5", "text": "CDN", "marks": ["l1"]},
+          {"_type": "span", "_key": "s6", "text": ".", "marks": []}
+        ]},
+        {"_type": "block", "_key": "b3", "style": "normal", "listItem": "bullet", "level": 1, "markDefs": [], "children": [{"_type": "span", "_key": "s7", "text": "Set long max-age on hashed assets", "marks": []}]},
+        {"_type": "block", "_key": "b4", "style": "normal", "listItem": "bullet", "level": 1, "markDefs": [], "children": [{"_type": "span", "_key": "s8", "text": "Purge HTML on publish", "marks": []}]}
+      ]
+    },
+    {
+      "_id": "a1f0c3d2-0002",
+      "_type": "article",
+      "_rev": "r2",
+      "title": "Edge Basics",
+      "slug": {"_type": "slug", "current": "edge-basics"},
+      "description": "A short checklist for edge deployments.",
+      "date": "2026-02-10",
+      "kind": "checklist",
+      "tags": ["edge"],
+      "read_minutes": 3,
+      "hero_url": "https://cdn.example.com/edge.png",
+      "body": [
+        {"_type": "block", "_key": "c1", "style": "normal", "markDefs": [], "children": [{"_type": "span", "_key": "t1", "text": "Check these before launch:", "marks": ["em"]}]},
+        {"_type": "block", "_key": "c2", "style": "normal", "listItem": "number", "level": 1, "markDefs": [], "children": [{"_type": "span", "_key": "t2", "text": "TLS everywhere", "marks": []}]},
+        {"_type": "block", "_key": "c3", "style": "normal", "listItem": "number", "level": 1, "markDefs": [], "children": [{"_type": "span", "_key": "t3", "text": "Health checks", "marks": []}]},
+        {"_type": "image", "_key": "c4", "asset": {"_ref": "image-0a1b2c3d-1200x630-png", "_type": "reference"}, "alt": "Edge diagram"}
+      ]
+    },
+    {
+      "_id": "a1f0c3d2-0003",
+      "_type": "article",
+      "_rev": "r3",
+      "title": "Rollout Story",
+      "slug": {"_type": "slug", "current": "rollout-story"},
+      "description": "How a team moved to static builds.",
+      "date": "2026-01-20",
+      "kind": "case-study",
+      "tags": [],
+      "read_minutes": 9,
+      "hero_url": null,
+      "body": [
+        {"_type": "block", "_key": "d1", "style": "blockquote", "markDefs": [], "children": [{"_type": "span", "_key": "u1", "text": "Builds went from minutes to seconds.", "marks": []}]},
+        {"_type": "divider", "_key": "d2"},
+        {"_type": "block", "_key": "d3", "style": "normal", "markDefs": [], "children": [{"_type": "span", "_key": "u2", "text": "The rest is history.", "marks": []}]}
+      ]
+    }
+  ]
+}
