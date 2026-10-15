@@ -68,6 +68,7 @@ fn main() -> anyhow::Result<()> {
     // 404-ing migrated URLs.
     let redirects = load_redirects(&root)?;
     let _ = REDIRECTS.set(redirects);
+    let _ = TRAILING_SLASH.set(load_trailing_slash(&root));
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -202,9 +203,9 @@ fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
                 ))
             }
         };
-        if !to.starts_with('/') {
+        if !valid_redirect_target(&to) {
             return Err(anyhow::anyhow!(
-                "{}: `{from}` target `{to}` must be an absolute path",
+                "{}: `{from}` target `{to}` must be an absolute path or an http(s) URL",
                 path.display()
             ));
         }
@@ -220,6 +221,14 @@ fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
 
 /// Exact-match lookup against the loaded map. Paths are compared
 /// slash-stripped, so /old-page, /old-page/ and old-page all match.
+/// A redirect target is a site path (`/x`) or a full http(s) URL for moves to
+/// another domain. Protocol-relative `//host` is rejected as ambiguous.
+fn valid_redirect_target(to: &str) -> bool {
+    (to.starts_with('/') && !to.starts_with("//"))
+        || to.starts_with("https://")
+        || to.starts_with("http://")
+}
+
 fn redirect_for(rel: &str) -> Option<&'static Redirect> {
     let rel = rel.trim_matches('/');
     REDIRECTS.get().and_then(|map| {
@@ -288,13 +297,61 @@ fn rate_limit(ip: IpAddr) -> (bool, u32, u64) {
     }
 }
 
+/// Site root, resolved the same way as the build: SITE_ROOT, then the git
+/// toplevel of the current directory (so a separate site repo serves its own
+/// dist/), then the compile-time manifest dir.
 fn repo_root() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = env::var("SITE_ROOT") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Ok(PathBuf::from(s));
+            }
+        }
+    }
     let manifest = env!("CARGO_MANIFEST_DIR");
     StdPath::new(manifest)
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .ok_or_else(|| anyhow::anyhow!("cannot locate repo root"))
+}
+
+/// site.yaml `trailing_slash` (default true). When false, `/x/` 301s to `/x`.
+static TRAILING_SLASH: OnceLock<bool> = OnceLock::new();
+
+fn load_trailing_slash(root: &StdPath) -> bool {
+    std::fs::read_to_string(root.join("site.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .and_then(|v| v.get("trailing_slash").and_then(|b| b.as_bool()))
+        .unwrap_or(true)
+}
+
+/// The slash-free URL a request should 301 to, when the site uses
+/// `trailing_slash: false` and the path ends in `/` (the root excepted).
+fn slash_redirect(path: &str, query: Option<&str>) -> Option<String> {
+    slash_redirect_with(*TRAILING_SLASH.get().unwrap_or(&true), path, query)
+}
+
+fn slash_redirect_with(trailing_slash: bool, path: &str, query: Option<&str>) -> Option<String> {
+    if trailing_slash || path == "/" || !path.ends_with('/') {
+        return None;
+    }
+    let bare = path.trim_end_matches('/');
+    let bare = if bare.is_empty() { "/" } else { bare };
+    Some(match query {
+        Some(q) if !q.is_empty() => format!("{bare}?{q}"),
+        _ => bare.to_string(),
+    })
 }
 
 fn not_found(root: PathBuf) -> Response {
@@ -597,7 +654,15 @@ async fn mcp_endpoint(
 
 async fn serve_path(State(s): State<StaticDir>, req: Request) -> Response {
     let gzip = wants_gzip(&req);
-    serve(&s.0, req.uri().path(), gzip)
+    let path = req.uri().path();
+    // A redirect-map hit wins, so a migrated `/old/` goes straight to its
+    // target in one hop. Otherwise normalize the slash form.
+    if redirect_for(path).is_none() {
+        if let Some(to) = slash_redirect(path, req.uri().query()) {
+            return redirect_response(&Redirect { from: String::new(), to, status: 301 });
+        }
+    }
+    serve(&s.0, path, gzip)
 }
 
 async fn index(State(s): State<StaticDir>, req: Request) -> Response {
@@ -888,5 +953,30 @@ async fn ask(
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": "upstream LLM error", "status": status.as_u16(), "detail": text.chars().take(300).collect::<String>() }))).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("upstream unreachable: {e}") }))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirect_targets_allow_paths_and_urls() {
+        assert!(valid_redirect_target("/platform/ops"));
+        assert!(valid_redirect_target("https://www.example.org/"));
+        assert!(!valid_redirect_target("//evil.example"));
+        assert!(!valid_redirect_target("platform/ops"));
+    }
+
+    #[test]
+    fn slash_form_redirects_only_when_disabled() {
+        assert_eq!(slash_redirect_with(true, "/pricing/", None), None);
+        assert_eq!(slash_redirect_with(false, "/pricing/", None), Some("/pricing".into()));
+        assert_eq!(
+            slash_redirect_with(false, "/a/b/", Some("utm=1")),
+            Some("/a/b?utm=1".into())
+        );
+        assert_eq!(slash_redirect_with(false, "/", None), None);
+        assert_eq!(slash_redirect_with(false, "/pricing", None), None);
     }
 }

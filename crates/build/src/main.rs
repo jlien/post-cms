@@ -58,7 +58,49 @@ struct Collection {
     item_template: String,
     /// Template used for the collection index (schema.yaml `index_template`, default collection.html).
     index_template: String,
+    /// URL prefix for the index and items (schema.yaml `url_prefix`, default `/<name>`).
+    url_prefix: String,
+    /// Whether to render the index page (schema.yaml `index`, default true).
+    index: bool,
     items: Vec<CollectionItem>,
+}
+
+impl Collection {
+    fn item_path(&self, slug: &str) -> String {
+        format!("{}/{}", self.url_prefix.trim_end_matches('/'), slug)
+    }
+}
+
+/// URL style for every emitted link (sitemap, search index, llms.txt, RSS,
+/// canonical). site.yaml `trailing_slash` (default true keeps `/x/`); false
+/// emits `/x` and the server 301s the slash form.
+static TRAILING_SLASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Normalize a site path ("/a/b", "a/b/", "/") to the configured URL style.
+fn page_url(path: &str) -> String {
+    page_url_with(path, *TRAILING_SLASH.get().unwrap_or(&true))
+}
+
+fn page_url_with(path: &str, trailing_slash: bool) -> String {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    if trailing_slash {
+        format!("/{trimmed}/")
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Output directory under dist/ for a site path ("/" is dist itself).
+fn out_dir_for(dist: &Path, path: &str) -> PathBuf {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        dist.to_path_buf()
+    } else {
+        dist.join(trimmed)
+    }
 }
 
 fn default_lang() -> String {
@@ -93,6 +135,19 @@ struct PageMeta {
     lang: String,
     #[serde(default = "default_true")]
     published: bool,
+    /// Site path (e.g. `/platform/operations`, `/` for the home page).
+    /// Default `/<slug>`.
+    #[serde(default)]
+    path: Option<String>,
+    /// Template to render with (default page.html).
+    #[serde(default)]
+    template: Option<String>,
+}
+
+impl PageMeta {
+    fn site_path(&self) -> String {
+        self.path.clone().unwrap_or_else(|| format!("/{}", self.slug))
+    }
 }
 
 fn default_true() -> bool {
@@ -106,6 +161,7 @@ impl PageMeta {
         ctx.insert("slug", &self.slug);
         ctx.insert("lang", &self.lang);
         ctx.insert("description", &self.description);
+        ctx.insert("url", &page_url(&self.site_path()));
         ctx.insert("body", body);
         ctx
     }
@@ -128,6 +184,13 @@ struct SiteConfig {
     tagline: String,
     #[serde(default = "default_contact_email")]
     contact_email: String,
+    /// Emit `/x/` (true, default) or `/x` (false) URLs.
+    #[serde(default = "default_true")]
+    trailing_slash: bool,
+    /// Render the built-in blog home (`/`), `/blog/`, and `/contact/` and
+    /// require posts (true, default). Sites with their own home page set false.
+    #[serde(default = "default_true")]
+    builtin_pages: bool,
 }
 
 fn default_theme() -> String {
@@ -152,6 +215,8 @@ impl SiteConfig {
             title: default_title(),
             tagline: String::new(),
             contact_email: default_contact_email(),
+            trailing_slash: true,
+            builtin_pages: true,
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -175,8 +240,18 @@ struct Post {
 }
 
 impl Post {
+    /// Path used in the sitemap, RSS, and llms.txt. With the default
+    /// trailing_slash: true this stays the historical `/posts/<slug>`, so
+    /// existing sites emit exactly what they did before.
     fn url_path(&self) -> String {
-        format!("/posts/{}", self.meta.slug)
+        let raw = format!("/posts/{}", self.meta.slug);
+        if *TRAILING_SLASH.get().unwrap_or(&true) { raw } else { page_url(&raw) }
+    }
+
+    /// Path used in the search and embeddings indexes (slash form by default,
+    /// as before).
+    fn index_url(&self) -> String {
+        page_url(&format!("/posts/{}", self.meta.slug))
     }
 
     fn summary(&self) -> serde_json::Value {
@@ -228,8 +303,10 @@ fn main() -> Result<()> {
     copy_theme_assets(&theme_dir, &dist, &theme_name)?;
 
     let cfg = SiteConfig::load(&root);
-    let posts = load_posts(&root.join("content/posts"))?;
-    if posts.is_empty() {
+    let _ = TRAILING_SLASH.set(cfg.trailing_slash);
+    let posts_dir = root.join("content/posts");
+    let posts = if posts_dir.is_dir() { load_posts(&posts_dir)? } else { Vec::new() };
+    if posts.is_empty() && cfg.builtin_pages {
         bail!("no posts found under content/posts");
     }
     // Default pages (about, privacy, terms, ...) — optional directory.
@@ -240,12 +317,16 @@ fn main() -> Result<()> {
     render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
     let (collections, _ref_checks) = load_collections(&root.join("content"))?;
     render_collections(&tera, &dist, &collections, &styling, &cfg, "")?;
-    render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
-    render_blog(&tera, &dist, &posts, &styling, &cfg, "")?;
-    render_contact(&tera, &dist, &styling, &cfg, "")?;
+    if cfg.builtin_pages {
+        render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
+        render_blog(&tera, &dist, &posts, &styling, &cfg, "")?;
+        render_contact(&tera, &dist, &styling, &cfg, "")?;
+    }
     render_404(&tera, &dist, &styling, &cfg, "")?;
-    render_rss(&root, &dist, &posts)?;
-    render_sitemap(&root, &dist, &posts, &pages, &collections)?;
+    if !posts.is_empty() {
+        render_rss(&root, &dist, &posts)?;
+    }
+    render_sitemap(&root, &dist, &posts, &pages, &collections, cfg.builtin_pages)?;
     render_robots(&dist, &site_base_url(&root))?;
     render_llms_txt(&root, &dist, &posts)?;
     render_mcp_card(&root, &dist)?;
@@ -371,11 +452,14 @@ fn main() -> Result<()> {
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
-        "built dist/: {} posts ({} drafts skipped), {} pages, theme={:?}, home, blog, contact, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
+        "built dist/: {} posts ({} drafts skipped), {} pages, {} collections, theme={:?}, {}404, {}sitemap.xml, robots.txt, llms.txt",
         posts.len() - drafts,
         drafts,
         pages.iter().filter(|p| p.meta.published).count(),
-        theme_name
+        collections.len(),
+        theme_name,
+        if cfg.builtin_pages { "home, blog, contact, " } else { "" },
+        if posts.is_empty() { "" } else { "rss.xml, " },
     );
     Ok(())
 }
@@ -845,9 +929,15 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<Strin
 }
 
 fn repo_root() -> Result<PathBuf> {
-    // Runtime repo root (git toplevel of the current directory), so builds in
-    // tenant worktrees validate the worktree's content. Falls back to the
-    // compile-time manifest dir only outside a git repo.
+    // SITE_ROOT wins (containers and CI without a .git). Otherwise the
+    // runtime repo root (git toplevel of the current directory), so builds in
+    // tenant worktrees, or a separate site repo, use that repo's content.
+    // Falls back to the compile-time manifest dir only outside a git repo.
+    if let Ok(dir) = std::env::var("SITE_ROOT") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
     if let Ok(out) = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -1019,6 +1109,12 @@ fn load_collections(content_dir: &Path) -> Result<(Vec<Collection>, Vec<RefCheck
             .and_then(|v| v.as_str())
             .unwrap_or("collection.html")
             .to_string();
+        let url_prefix = schema
+            .get("url_prefix")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("/{}", p.trim_matches('/')))
+            .unwrap_or_else(|| format!("/{name}"));
+        let index = schema.get("index").and_then(|v| v.as_bool()).unwrap_or(true);
         for item_entry in fs::read_dir(&path)
             .with_context(|| format!("read_dir {}", path.display()))?
         {
@@ -1251,6 +1347,8 @@ fn load_collections(content_dir: &Path) -> Result<(Vec<Collection>, Vec<RefCheck
             types,
             item_template,
             index_template,
+            url_prefix,
+            index,
             items,
         });
     }
@@ -1399,6 +1497,9 @@ fn render_collections(
         let mut listed: Vec<serde_json::Value> = Vec::new();
         // Fail fast with a clear name when a schema points at a missing template.
         for (tpl, kind) in [(&coll.item_template, "item"), (&coll.index_template, "index")] {
+            if kind == "index" && !coll.index {
+                continue;
+            }
             if !tera.templates.contains_key(tpl) {
                 bail!(
                     "collection `{}`: {} template `{}` not found (templates/ or theme overrides)",
@@ -1426,11 +1527,12 @@ fn render_collections(
             }
             ctx.insert("fields", &item.fields);
             ctx.insert("body", &body);
+            ctx.insert("url", &page_url(&coll.item_path(&item.slug)));
             ctx.extend(cfg.base_ctx(style, root));
             let html = tera
                 .render(&coll.item_template, &ctx)
                 .with_context(|| format!("render {} for {}", coll.item_template, item.slug))?;
-            let out_dir = dist.join(&coll.name).join(&item.slug);
+            let out_dir = out_dir_for(dist, &coll.item_path(&item.slug));
             fs::create_dir_all(&out_dir)
                 .with_context(|| format!("mkdir {}", out_dir.display()))?;
             fs::write(out_dir.join("index.html"), html)
@@ -1442,15 +1544,19 @@ fn render_collections(
             }
             listed.push(serde_json::Value::Object(row));
         }
+        if !coll.index {
+            continue;
+        }
         let mut ctx = TeraContext::new();
         ctx.insert("coll_name", &coll.name);
         ctx.insert("coll_title", &coll.title);
         ctx.insert("items", &listed);
+        ctx.insert("url", &page_url(&coll.url_prefix));
         ctx.extend(cfg.base_ctx(style, root));
         let html = tera
             .render(&coll.index_template, &ctx)
             .with_context(|| format!("render {} for {}", coll.index_template, coll.name))?;
-        let out_dir = dist.join(&coll.name);
+        let out_dir = out_dir_for(dist, &coll.url_prefix);
         fs::create_dir_all(&out_dir)
             .with_context(|| format!("mkdir {}", out_dir.display()))?;
         fs::write(out_dir.join("index.html"), html)
@@ -1513,7 +1619,7 @@ fn render_search_index(
         idx.push(serde_json::json!({
             "title": post.meta.title,
             "description": post.meta.description,
-            "url": format!("{}{}/", site_base, post.url_path()),
+            "url": format!("{}{}", site_base, post.index_url()),
             "date": post.meta.date.to_string(),
             "tags": post.meta.tags,
             "body": markdown_to_text(&md),
@@ -1527,7 +1633,7 @@ fn render_search_index(
             idx.push(serde_json::json!({
                 "title": item.title,
                 "description": item.description,
-                "url": format!("{}/{}/{}/", site_base, coll.name, item.slug),
+                "url": format!("{}{}", site_base, page_url(&coll.item_path(&item.slug))),
                 "date": item.date.map(|d| d.to_string()).unwrap_or_default(),
                 "tags": [],
                 "body": markdown_to_text(&md),
@@ -1552,9 +1658,9 @@ fn render_embeddings(
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
-    let live_items: Vec<(&str, &CollectionItem)> = collections
+    let live_items: Vec<(&Collection, &CollectionItem)> = collections
         .iter()
-        .flat_map(|c| c.items.iter().filter(|i| i.published).map(move |i| (c.name.as_str(), i)))
+        .flat_map(|c| c.items.iter().filter(|i| i.published).map(move |i| (c, i)))
         .collect();
     if published.is_empty() && live_items.is_empty() {
         return Ok(());
@@ -1588,14 +1694,14 @@ fn render_embeddings(
             rows.push((
                 serde_json::json!({
                     "title": title,
-                    "url": format!("{}{}/", site_base, post.url_path()),
+                    "url": format!("{}{}", site_base, post.index_url()),
                 }),
                 format!("# {title} — {desc}\n\n{chunk}"),
             ));
         }
     }
     // Collection items get the same treatment (published only).
-    for (coll_name, item) in &live_items {
+    for (coll, item) in &live_items {
         let md = fs::read_to_string(item.dir.join("index.mdx")).unwrap_or_default();
         let text = markdown_to_text(&md);
         let title = &item.title;
@@ -1607,7 +1713,7 @@ fn render_embeddings(
             rows.push((
                 serde_json::json!({
                     "title": title,
-                    "url": format!("{}/{}/{}/", site_base, coll_name, item.slug),
+                    "url": format!("{}{}", site_base, page_url(&coll.item_path(&item.slug))),
                 }),
                 format!("# {title} — {desc}\n\n{chunk}"),
             ));
@@ -1721,8 +1827,9 @@ fn render_pages(
         let body = render_markdown(&md)?;
         let mut ctx = page.meta.to_context(&body);
         ctx.extend(cfg.base_ctx(style, root));
-        let html = tera.render("page.html", &ctx).context("render page.html")?;
-        let out_dir = dist.join(&page.meta.slug);
+        let tpl = page.meta.template.as_deref().unwrap_or("page.html");
+        let html = tera.render(tpl, &ctx).with_context(|| format!("render {tpl}"))?;
+        let out_dir = out_dir_for(dist, &page.meta.site_path());
         fs::create_dir_all(&out_dir)
             .with_context(|| format!("mkdir {}", out_dir.display()))?;
         fs::write(out_dir.join("index.html"), html)
@@ -1880,6 +1987,7 @@ fn render_sitemap(
     posts: &[Post],
     pages: &[Page],
     collections: &[Collection],
+    builtin_pages: bool,
 ) -> Result<()> {
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
     let live_pages: Vec<&Page> = pages.iter().filter(|p| p.meta.published).collect();
@@ -1887,11 +1995,17 @@ fn render_sitemap(
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
-    xml.push_str(&format!("<url><loc>{}/</loc></url>\n", site_base));
-    xml.push_str(&format!("<url><loc>{}/blog/</loc></url>\n", site_base));
-    xml.push_str(&format!("<url><loc>{}/contact/</loc></url>\n", site_base));
+    if builtin_pages {
+        xml.push_str(&format!("<url><loc>{}/</loc></url>\n", site_base));
+        xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url("/blog")));
+        xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url("/contact")));
+    }
     for page in &live_pages {
-        xml.push_str(&format!("<url><loc>{}/{}/</loc></url>\n", site_base, page.meta.slug));
+        xml.push_str(&format!(
+            "<url><loc>{}{}</loc></url>\n",
+            site_base,
+            page_url(&page.meta.site_path())
+        ));
     }
     for post in published.iter().copied() {
         xml.push_str(&format!(
@@ -1908,14 +2022,18 @@ fn render_sitemap(
         if live_items.is_empty() {
             continue;
         }
-        xml.push_str(&format!(
-            "<url><loc>{}/{}/</loc></url>\n",
-            site_base, coll.name
-        ));
+        if coll.index {
+            xml.push_str(&format!(
+                "<url><loc>{}{}</loc></url>\n",
+                site_base,
+                page_url(&coll.url_prefix)
+            ));
+        }
         for item in live_items {
             xml.push_str(&format!(
-                "<url><loc>{}/{}/{}/</loc></url>\n",
-                site_base, coll.name, item.slug
+                "<url><loc>{}{}</loc></url>\n",
+                site_base,
+                page_url(&coll.item_path(&item.slug))
             ));
         }
     }
@@ -1994,8 +2112,18 @@ fn render_mcp_card(root: &Path, dist: &Path) -> Result<()> {
     Ok(())
 }
 
-fn site_base_url(_root: &Path) -> String {
-    std::env::var("SITE_BASE_URL").unwrap_or_else(|_| "http://localhost:8787".to_string())
+/// SITE_BASE_URL env, then site.yaml `base_url`, then the local origin.
+fn site_base_url(root: &Path) -> String {
+    if let Ok(v) = std::env::var("SITE_BASE_URL") {
+        if !v.is_empty() {
+            return v.trim_end_matches('/').to_string();
+        }
+    }
+    fs::read_to_string(root.join("site.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .and_then(|v| v.get("base_url").and_then(|b| b.as_str()).map(|s| s.trim_end_matches('/').to_string()))
+        .unwrap_or_else(|| "http://localhost:8787".to_string())
 }
 
 /// Build-time image optimization (replaces hand-running `sips`): walks dist/,
@@ -2315,4 +2443,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{:08x}", word));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_url_follows_slash_setting() {
+        assert_eq!(page_url_with("/platform/ops", true), "/platform/ops/");
+        assert_eq!(page_url_with("platform/ops/", false), "/platform/ops");
+        assert_eq!(page_url_with("/", false), "/");
+        assert_eq!(page_url_with("", true), "/");
+    }
+
+    #[test]
+    fn out_dir_maps_root_and_nested_paths() {
+        let dist = Path::new("/tmp/dist");
+        assert_eq!(out_dir_for(dist, "/"), PathBuf::from("/tmp/dist"));
+        assert_eq!(
+            out_dir_for(dist, "/events/speakers/acme/"),
+            PathBuf::from("/tmp/dist/events/speakers/acme")
+        );
+    }
+
+    #[test]
+    fn page_site_path_defaults_to_slug() {
+        let meta: PageMeta = serde_yaml::from_str("title: T\nslug: about\n").unwrap();
+        assert_eq!(meta.site_path(), "/about");
+        let meta: PageMeta =
+            serde_yaml::from_str("title: Home\nslug: home\npath: /\n").unwrap();
+        assert_eq!(meta.site_path(), "/");
+    }
+
+    #[test]
+    fn collection_item_path_uses_prefix() {
+        let c = Collection {
+            name: "speakers".into(),
+            title: "Speakers".into(),
+            required: vec![],
+            types: Default::default(),
+            item_template: "collection-item.html".into(),
+            index_template: "collection.html".into(),
+            url_prefix: "/events/speakers/".into(),
+            index: false,
+            items: vec![],
+        };
+        assert_eq!(c.item_path("acme"), "/events/speakers/acme");
+    }
+
+    #[test]
+    fn site_config_defaults_keep_blog_behavior() {
+        let cfg: SiteConfig = serde_yaml::from_str("title: X\n").unwrap();
+        assert!(cfg.trailing_slash);
+        assert!(cfg.builtin_pages);
+        let cfg: SiteConfig =
+            serde_yaml::from_str("trailing_slash: false\nbuiltin_pages: false\n").unwrap();
+        assert!(!cfg.trailing_slash);
+        assert!(!cfg.builtin_pages);
+    }
 }
