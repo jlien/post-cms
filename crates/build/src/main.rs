@@ -187,10 +187,79 @@ struct SiteConfig {
     /// Emit `/x/` (true, default) or `/x` (false) URLs.
     #[serde(default = "default_true")]
     trailing_slash: bool,
+    /// Sanity project for image URLs in Portable Text (`sanity: {project_id, dataset}`).
+    #[serde(default)]
+    sanity: Option<SanityCfg>,
     /// Render the built-in blog home (`/`), `/blog/`, and `/contact/` and
     /// require posts (true, default). Sites with their own home page set false.
     #[serde(default = "default_true")]
     builtin_pages: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SanityCfg {
+    project_id: String,
+    #[serde(default = "default_dataset")]
+    dataset: String,
+}
+
+fn default_dataset() -> String {
+    "production".to_string()
+}
+
+impl SiteConfig {
+    fn pt_options(&self) -> postcms_build::pt::PtOptions {
+        let (project, dataset) = self
+            .sanity
+            .as_ref()
+            .map(|c| (c.project_id.clone(), c.dataset.clone()))
+            .unwrap_or_default();
+        postcms_build::pt::PtOptions {
+            sanity_project_id: project,
+            sanity_dataset: dataset,
+            image_width: Some(1600),
+        }
+    }
+}
+
+/// Body of a collection item: `index.mdx` (Markdown) or `index.pt.json`
+/// (Portable Text). Unrenderable Portable Text blocks fail the build by name.
+fn item_body(item: &CollectionItem, tera: &Tera, cfg: &SiteConfig) -> Result<String> {
+    let md_path = item.dir.join("index.mdx");
+    if md_path.exists() {
+        return render_markdown(
+            &fs::read_to_string(&md_path).with_context(|| format!("read {}", md_path.display()))?,
+        );
+    }
+    let pt_path = item.dir.join("index.pt.json");
+    if pt_path.exists() {
+        let raw = fs::read_to_string(&pt_path).with_context(|| format!("read {}", pt_path.display()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", pt_path.display()))?;
+        let blocks = json.get("blocks").cloned().unwrap_or(json);
+        let out = postcms_build::pt::render(&blocks, &cfg.pt_options(), Some(tera));
+        if !out.unhandled.is_empty() {
+            bail!(
+                "{}: Portable Text blocks with no renderer: {:?} (add templates/pt/<type>.html)",
+                pt_path.display(),
+                out.unhandled
+            );
+        }
+        return Ok(out.html);
+    }
+    Ok(String::new())
+}
+
+/// Plain text of an item body for the search and embeddings indexes.
+fn item_text(item: &CollectionItem) -> String {
+    if let Ok(md) = fs::read_to_string(item.dir.join("index.mdx")) {
+        return markdown_to_text(&md);
+    }
+    fs::read_to_string(item.dir.join("index.pt.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|j| postcms_build::pt::plain_text(j.get("blocks").unwrap_or(&j)))
+        .unwrap_or_default()
 }
 
 fn default_theme() -> String {
@@ -217,6 +286,7 @@ impl SiteConfig {
             contact_email: default_contact_email(),
             trailing_slash: true,
             builtin_pages: true,
+            sanity: None,
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -1510,14 +1580,7 @@ fn render_collections(
             }
         }
         for item in coll.items.iter().filter(|i| i.published) {
-            let md_path = item.dir.join("index.mdx");
-            let body = if md_path.exists() {
-                render_markdown(&fs::read_to_string(&md_path).with_context(|| {
-                    format!("read {}", md_path.display())
-                })?)?
-            } else {
-                String::new()
-            };
+            let body = item_body(item, tera, cfg)?;
             let mut ctx = TeraContext::new();
             ctx.insert("title", &item.title);
             ctx.insert("slug", &item.slug);
@@ -1629,14 +1692,13 @@ fn render_search_index(
     // cite them like any other page.
     for coll in collections {
         for item in coll.items.iter().filter(|i| i.published) {
-            let md = fs::read_to_string(item.dir.join("index.mdx")).unwrap_or_default();
             idx.push(serde_json::json!({
                 "title": item.title,
                 "description": item.description,
                 "url": format!("{}{}", site_base, page_url(&coll.item_path(&item.slug))),
                 "date": item.date.map(|d| d.to_string()).unwrap_or_default(),
                 "tags": [],
-                "body": markdown_to_text(&md),
+                "body": item_text(item),
             }));
         }
     }
@@ -1702,8 +1764,7 @@ fn render_embeddings(
     }
     // Collection items get the same treatment (published only).
     for (coll, item) in &live_items {
-        let md = fs::read_to_string(item.dir.join("index.mdx")).unwrap_or_default();
-        let text = markdown_to_text(&md);
+        let text = item_text(item);
         let title = &item.title;
         let desc = &item.description;
         for chunk in chunk_text(&text, 700) {

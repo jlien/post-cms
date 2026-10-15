@@ -20,3 +20,11 @@ chrono.workspace = true
 serde_json.workspace = true
 fastembed.workspace = true
 image.workspace = true
+
+[lib]
+name = "postcms_build"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pt-render"
+path = "src/bin/pt_render.rs"
