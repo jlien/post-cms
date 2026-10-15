@@ -15,3 +15,14 @@ plugins:
     # per-page component: only dist/contact/, inside the template's slot
     pages: [contact]
     anchor: contact-form
+
+# llms.txt header (all keys optional; title defaults to `title`, summary to
+# `tagline`). `mcp: false` drops the MCP Servers section.
+llms:
+  summary: "A git-based publishing stack: content as files, static Rust build, no CMS. This file is a machine-readable index of all published posts."
+
+# robots.txt (all keys optional). Defaults: allow [/], no disallow, sitemap
+# line on, no extra lines.
+# robots:
+#   disallow: [/preview/]
+#   extra: ["User-agent: ExampleBot", "Disallow: /"]
