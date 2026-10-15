@@ -274,7 +274,8 @@ impl SiteConfig {
 }
 
 /// Body of a collection item: `index.mdx` (Markdown) or `index.pt.json`
-/// (Portable Text). Unrenderable Portable Text blocks fail the build by name.
+/// (Portable Text). Unrenderable Portable Text blocks fail the build by name;
+/// dropped links and images print one warning line for the item.
 fn item_body(item: &CollectionItem, tera: &Tera, cfg: &SiteConfig) -> Result<String> {
     let md_path = item.dir.join("index.mdx");
     if md_path.exists() {
@@ -284,19 +285,11 @@ fn item_body(item: &CollectionItem, tera: &Tera, cfg: &SiteConfig) -> Result<Str
     }
     let pt_path = item.dir.join("index.pt.json");
     if pt_path.exists() {
-        let raw = fs::read_to_string(&pt_path).with_context(|| format!("read {}", pt_path.display()))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).with_context(|| format!("parse {}", pt_path.display()))?;
-        let blocks = json.get("blocks").cloned().unwrap_or(json);
-        let out = postcms_build::pt::render(&blocks, &cfg.pt_options(), Some(tera));
-        if !out.unhandled.is_empty() {
-            bail!(
-                "{}: Portable Text blocks with no renderer: {:?} (add templates/pt/<type>.html)",
-                pt_path.display(),
-                out.unhandled
-            );
+        let (html, warning) = pt_item_body(&pt_path, tera, cfg)?;
+        if let Some(w) = warning {
+            eprintln!("{w}");
         }
-        return Ok(out.html);
+        return Ok(html);
     }
     Ok(String::new())
 }
@@ -596,6 +589,26 @@ fn main() -> Result<()> {
 
 /// Compile the template set: repo `templates/` plus any `<theme>/templates/*.html`
 /// overrides (which win on name collision).
+/// Render one `index.pt.json`: the HTML plus, when the renderer dropped
+/// links or images, a single warning line naming the file.
+fn pt_item_body(pt_path: &Path, tera: &Tera, cfg: &SiteConfig) -> Result<(String, Option<String>)> {
+    let raw = fs::read_to_string(pt_path).with_context(|| format!("read {}", pt_path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", pt_path.display()))?;
+    let blocks = json.get("blocks").cloned().unwrap_or(json);
+    let out = postcms_build::pt::render(&blocks, &cfg.pt_options(), Some(tera));
+    if !out.unhandled.is_empty() {
+        bail!(
+            "{}: Portable Text blocks with no renderer: {:?} (add templates/pt/<type>.html)",
+            pt_path.display(),
+            out.unhandled
+        );
+    }
+    let warning = (!out.warnings.is_empty())
+        .then(|| format!("warning: {}: {}", pt_path.display(), out.warnings.join("; ")));
+    Ok((out.html, warning))
+}
+
 fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera> {
     let mut tera = Tera::new(
         templates_dir
@@ -604,6 +617,7 @@ fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera
             .context("templates path is not valid UTF-8")?,
     )
     .context("failed to compile templates")?;
+    postcms_build::pt::register_filters(&mut tera);
     let theme_templates = theme_dir.join("templates");
     if theme_templates.is_dir() {
         for entry in fs::read_dir(&theme_templates)
@@ -2956,6 +2970,31 @@ mod tests {
         let root = sanity_site(&tmp.path().join("format"), &bad_url);
         let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
         assert!(err.contains("`hero_url` value `not a url` is not a valid url"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_links_warn_and_unknown_blocks_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tera = load_tera(&repo, &repo.join("themes/default"), &repo.join("templates")).unwrap();
+        let cfg = SiteConfig::default_theme_config();
+        let pt_path = tmp.path().join("index.pt.json");
+        fs::write(
+            &pt_path,
+            r#"[{"_type": "block", "style": "normal", "markDefs": [{"_type": "link", "_key": "l1", "href": ""}],
+                "children": [{"_type": "span", "text": "Press item", "marks": ["l1"]}]},
+               {"_type": "image", "_sanityAsset": "image@data:image/png;base64,AA"}]"#,
+        )
+        .unwrap();
+        let (html, warning) = pt_item_body(&pt_path, &tera, &cfg).unwrap();
+        assert_eq!(html, "<p>Press item</p>");
+        let warning = warning.unwrap();
+        assert!(warning.starts_with("warning: ") && warning.contains("index.pt.json"), "{warning}");
+        assert!(warning.contains("unsafe href \"\"") && warning.contains("unsafe src \"data:"), "{warning}");
+
+        fs::write(&pt_path, r#"[{"_type": "mystery"}]"#).unwrap();
+        let err = format!("{:#}", pt_item_body(&pt_path, &tera, &cfg).unwrap_err());
+        assert!(err.contains("no renderer") && err.contains("mystery"), "{err}");
     }
 
     #[test]
