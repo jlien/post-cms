@@ -194,6 +194,57 @@ struct SiteConfig {
     /// require posts (true, default). Sites with their own home page set false.
     #[serde(default = "default_true")]
     builtin_pages: bool,
+    /// llms.txt header and sections (`llms: {title, summary, details, mcp}`).
+    #[serde(default)]
+    llms: LlmsCfg,
+    /// robots.txt rules (`robots: {allow, disallow, sitemap, extra}`).
+    #[serde(default)]
+    robots: RobotsCfg,
+}
+
+/// site.yaml `llms:`. Every key is optional; unset keys fall back to the
+/// site title and tagline.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct LlmsCfg {
+    /// H1 of llms.txt (default: site `title`).
+    #[serde(default)]
+    title: Option<String>,
+    /// Blockquote summary under the H1 (default: site `tagline`, else a
+    /// generic line).
+    #[serde(default)]
+    summary: Option<String>,
+    /// Optional free-form markdown placed after the summary.
+    #[serde(default)]
+    details: Option<String>,
+    /// Emit the "MCP Servers" section pointing at `/mcp` (default true).
+    #[serde(default)]
+    mcp: Option<bool>,
+}
+
+/// site.yaml `robots:`. The default renders `User-agent: *`, `Allow: /`,
+/// and the sitemap line, as before.
+#[derive(Debug, Deserialize, Clone)]
+struct RobotsCfg {
+    #[serde(default = "default_robots_allow")]
+    allow: Vec<String>,
+    #[serde(default)]
+    disallow: Vec<String>,
+    /// Emit `Sitemap: <base_url>/sitemap.xml` (default true).
+    #[serde(default = "default_true")]
+    sitemap: bool,
+    /// Raw lines appended at the end (extra user-agent groups, comments).
+    #[serde(default)]
+    extra: Vec<String>,
+}
+
+impl Default for RobotsCfg {
+    fn default() -> Self {
+        RobotsCfg { allow: default_robots_allow(), disallow: Vec::new(), sitemap: true, extra: Vec::new() }
+    }
+}
+
+fn default_robots_allow() -> Vec<String> {
+    vec!["/".to_string()]
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -287,6 +338,8 @@ impl SiteConfig {
             trailing_slash: true,
             builtin_pages: true,
             sanity: None,
+            llms: LlmsCfg::default(),
+            robots: RobotsCfg::default(),
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -398,8 +451,14 @@ fn main() -> Result<()> {
         render_rss(&root, &dist, &posts)?;
     }
     render_sitemap(&root, &dist, &posts, &pages, &collections, cfg.builtin_pages)?;
-    render_robots(&dist, &site_base_url(&root))?;
-    render_llms_txt(&root, &dist, &posts)?;
+    let site_base = site_base_url(&root);
+    fs::write(dist.join("robots.txt"), robots_txt(&cfg.robots, &site_base))
+        .context("write robots.txt")?;
+    fs::write(
+        dist.join("llms.txt"),
+        llms_txt(&cfg, &site_base, &posts, &pages, &collections),
+    )
+    .context("write llms.txt")?;
     render_mcp_card(&root, &dist)?;
     render_search_index(&root, &dist, &posts, &collections)?;
     render_posts_markdown(&dist, &posts)?;
@@ -2153,48 +2212,133 @@ fn render_sitemap(
     Ok(())
 }
 
-fn render_robots(dist: &Path, site_base: &str) -> Result<()> {
-    fs::write(
-        dist.join("robots.txt"),
-        format!("User-agent: *\nAllow: /\nSitemap: {site_base}/sitemap.xml\n"),
-    )
-    .context("write robots.txt")?;
-    Ok(())
+/// robots.txt from site.yaml `robots:`. With no config this is exactly
+/// `User-agent: *`, `Allow: /`, and the sitemap line.
+fn robots_txt(cfg: &RobotsCfg, site_base: &str) -> String {
+    let mut out = String::from("User-agent: *\n");
+    for path in &cfg.allow {
+        out.push_str(&format!("Allow: {path}\n"));
+    }
+    for path in &cfg.disallow {
+        out.push_str(&format!("Disallow: {path}\n"));
+    }
+    if cfg.sitemap {
+        out.push_str(&format!("Sitemap: {site_base}/sitemap.xml\n"));
+    }
+    for line in &cfg.extra {
+        out.push_str(line.trim_end_matches('\n'));
+        out.push('\n');
+    }
+    out
+}
+
+/// One llms.txt list entry: `- [title](url): desc`, omitting an empty desc.
+fn llms_entry(title: &str, url: &str, desc: &str) -> String {
+    if desc.trim().is_empty() {
+        format!("- [{title}]({url})\n")
+    } else {
+        format!("- [{title}]({url}): {desc}\n")
+    }
 }
 
 /// llms.txt (https://llmstxt.org): a markdown index so LLM clients can
-/// discover the site's content without crawling HTML. Published posts only.
-fn render_llms_txt(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
+/// discover the site's content without crawling HTML. Lists published
+/// posts, pages, and collection items; header text comes from site.yaml.
+fn llms_txt(
+    cfg: &SiteConfig,
+    site_base: &str,
+    posts: &[Post],
+    pages: &[Page],
+    collections: &[Collection],
+) -> String {
+    let title = cfg.llms.title.clone().unwrap_or_else(|| cfg.title.clone());
+    let summary = cfg
+        .llms
+        .summary
+        .clone()
+        .or_else(|| Some(cfg.tagline.clone()).filter(|t| !t.trim().is_empty()))
+        .unwrap_or_else(|| "A machine-readable index of this site's published content.".to_string());
+    let mut out = format!("# {title}\n\n> {}\n\n", summary.trim());
+    if let Some(details) = cfg.llms.details.as_deref().filter(|d| !d.trim().is_empty()) {
+        out.push_str(details.trim());
+        out.push_str("\n\n");
+    }
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
-    let site_base = site_base_url(root);
-    let mut out = String::new();
-    out.push_str("# Post-CMS\n\n");
-    out.push_str(
-        "> A git-based publishing stack: content as files, static Rust build, \
-         no CMS. This file is a machine-readable index of all published posts.\n\n",
-    );
-    out.push_str("## Posts\n\n");
-    for post in published {
-        out.push_str(&format!(
-            "- [{title}]({base}{path}): {desc} ({date})\n",
-            title = post.meta.title,
-            base = site_base,
-            path = post.url_path(),
-            desc = post.meta.description,
-            date = post.meta.date,
+    if !published.is_empty() {
+        out.push_str("## Posts\n\n");
+        for post in published {
+            out.push_str(&format!(
+                "- [{title}]({base}{path}): {desc} ({date})\n",
+                title = post.meta.title,
+                base = site_base,
+                path = post.url_path(),
+                desc = post.meta.description,
+                date = post.meta.date,
+            ));
+        }
+        out.push('\n');
+    }
+    let mut page_lines = String::new();
+    if cfg.builtin_pages {
+        page_lines.push_str(&llms_entry("Home", &format!("{site_base}/"), ""));
+        page_lines.push_str(&llms_entry("Blog", &format!("{site_base}{}", page_url("/blog")), ""));
+        page_lines.push_str(&llms_entry("Contact", &format!("{site_base}{}", page_url("/contact")), ""));
+    }
+    for page in pages.iter().filter(|p| p.meta.published) {
+        page_lines.push_str(&llms_entry(
+            &page.meta.title,
+            &format!("{site_base}{}", page_url(&page.meta.site_path())),
+            &page.meta.description,
         ));
+    }
+    if !page_lines.is_empty() {
+        out.push_str("## Pages\n\n");
+        out.push_str(&page_lines);
+        out.push('\n');
+    }
+    // Same rule as the sitemap: collections with no published items are
+    // skipped; the index page is listed when the collection renders one.
+    for coll in collections {
+        let live: Vec<&CollectionItem> = coll.items.iter().filter(|i| i.published).collect();
+        if live.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## {}\n\n", coll.title));
+        if coll.index {
+            out.push_str(&llms_entry(
+                &coll.title,
+                &format!("{site_base}{}", page_url(&coll.url_prefix)),
+                "",
+            ));
+        }
+        for item in live {
+            let desc = match item.date {
+                Some(d) if !item.description.trim().is_empty() => format!("{} ({d})", item.description),
+                Some(d) => format!("({d})"),
+                None => item.description.clone(),
+            };
+            out.push_str(&llms_entry(
+                &item.title,
+                &format!("{site_base}{}", page_url(&coll.item_path(&item.slug))),
+                &desc,
+            ));
+        }
+        out.push('\n');
     }
     // MCP discovery section: agents reading llms.txt learn there is a
     // queryable tool endpoint (convention adopted by several MCP toolkits;
     // no standard makes clients auto-connect from here, but it costs nothing).
-    out.push_str("\n## MCP Servers\n\n");
-    out.push_str(&format!(
-        "- [Post-CMS MCP]({base}/mcp): read-only tools — list_posts, get_post, \
-         search. Query published content without auth.\n",
-        base = site_base,
-    ));
-    fs::write(dist.join("llms.txt"), out).context("write llms.txt")?;
-    Ok(())
+    if cfg.llms.mcp.unwrap_or(true) {
+        out.push_str("## MCP Servers\n\n");
+        out.push_str(&format!(
+            "- [{title} MCP]({site_base}/mcp): read-only tools — list_posts, get_post, \
+             search. Query published content without auth.\n",
+        ));
+    }
+    let trimmed = out.trim_end().len();
+    out.truncate(trimmed);
+    out.push('\n');
+    out
 }
 
 /// MCP discovery card (proposed SEP-1649/SEP-1960 convention):
@@ -2612,6 +2756,91 @@ mod tests {
             serde_yaml::from_str("trailing_slash: false\nbuiltin_pages: false\n").unwrap();
         assert!(!cfg.trailing_slash);
         assert!(!cfg.builtin_pages);
+    }
+
+    fn test_cfg(yaml: &str) -> SiteConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn robots_default_matches_previous_output() {
+        let cfg = test_cfg("title: X\n");
+        assert_eq!(
+            robots_txt(&cfg.robots, "https://example.com"),
+            "User-agent: *\nAllow: /\nSitemap: https://example.com/sitemap.xml\n"
+        );
+    }
+
+    #[test]
+    fn robots_reads_site_config() {
+        let cfg = test_cfg(
+            "robots:\n  disallow: [/preview/, /drafts/]\n  sitemap: false\n  extra: [\"User-agent: ExampleBot\", \"Disallow: /\"]\n",
+        );
+        assert_eq!(
+            robots_txt(&cfg.robots, "https://example.com"),
+            "User-agent: *\nAllow: /\nDisallow: /preview/\nDisallow: /drafts/\nUser-agent: ExampleBot\nDisallow: /\n"
+        );
+    }
+
+    fn sample_content() -> (Vec<Page>, Vec<Collection>) {
+        let page = |yaml: &str| Page { meta: serde_yaml::from_str(yaml).unwrap(), dir: PathBuf::new() };
+        let pages = vec![
+            page("title: Home\nslug: home\npath: /\n"),
+            page("title: Ops\nslug: ops\npath: /docs/ops\ndescription: Run ops.\n"),
+            page("title: Hidden\nslug: hidden\npublished: false\n"),
+        ];
+        let item = |slug: &str, published: bool| CollectionItem {
+            slug: slug.into(),
+            title: slug.to_uppercase(),
+            description: format!("About {slug}."),
+            date: None,
+            published,
+            fields: Default::default(),
+            dir: PathBuf::new(),
+        };
+        let coll = Collection {
+            name: "speakers".into(),
+            title: "Speakers".into(),
+            required: vec![],
+            types: Default::default(),
+            item_template: "collection-item.html".into(),
+            index_template: "collection.html".into(),
+            url_prefix: "/events/speakers".into(),
+            index: true,
+            items: vec![item("acme", true), item("draft", false)],
+        };
+        (pages, vec![coll])
+    }
+
+    #[test]
+    fn llms_lists_pages_and_collection_items() {
+        let cfg = test_cfg("title: Example\ntagline: An example site.\nbuiltin_pages: false\n");
+        let (pages, colls) = sample_content();
+        let out = llms_txt(&cfg, "https://example.com", &[], &pages, &colls);
+        assert!(out.starts_with("# Example\n\n> An example site.\n\n"));
+        assert!(out.contains("## Pages\n\n- [Home](https://example.com/)\n"));
+        assert!(out.contains("- [Ops](https://example.com/docs/ops/): Run ops.\n"));
+        assert!(!out.contains("Hidden"));
+        assert!(out.contains("## Speakers\n\n- [Speakers](https://example.com/events/speakers/)\n"));
+        assert!(out.contains("- [ACME](https://example.com/events/speakers/acme/): About acme.\n"));
+        assert!(!out.contains("DRAFT"));
+        assert!(!out.contains("## Posts"));
+        assert!(out.contains("- [Example MCP](https://example.com/mcp)"));
+        assert!(!out.to_lowercase().contains("post-cms"));
+        assert!(out.ends_with("auth.\n"));
+    }
+
+    #[test]
+    fn llms_header_and_mcp_are_configurable() {
+        let cfg = test_cfg(
+            "title: Example\nllms:\n  title: Example Docs\n  summary: Custom summary.\n  details: Extra notes.\n  mcp: false\n",
+        );
+        let out = llms_txt(&cfg, "https://example.com", &[], &[], &[]);
+        assert!(out.starts_with("# Example Docs\n\n> Custom summary.\n\nExtra notes.\n\n## Pages\n"));
+        assert!(!out.contains("MCP"));
+        let cfg = test_cfg("title: Example\nbuiltin_pages: false\n");
+        let out = llms_txt(&cfg, "https://example.com", &[], &[], &[]);
+        assert!(out.contains("> A machine-readable index of this site's published content.\n"));
     }
 
     fn fixtures() -> PathBuf {
