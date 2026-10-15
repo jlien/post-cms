@@ -16,8 +16,14 @@
 //! URLs are checked before they reach any template. A link `href` must be
 //! http(s), `mailto:`, `tel:`, a site path (`/x`, not `//x`), a `#fragment` or
 //! a `?query` ([`safe_href`]); anything else renders as plain text and is
-//! reported in `unhandled`. An image `src` must be http(s) or a site path
-//! ([`safe_src`]); anything else drops the image and is reported.
+//! reported in `warnings`. An image `src` must be http(s) or a site path
+//! ([`safe_src`]); anything else omits the image and is reported in
+//! `warnings`. Warnings do not fail a build; `unhandled` does.
+//!
+//! [`register_filters`] adds `safe_href` and `safe_src` as Tera filters, so
+//! templates can check URLs in custom block fields:
+//! `<a href="{{ block.url | safe_href }}">` prints the URL, or an empty
+//! string when it is not allowed.
 //!
 //! | Template | Renders | Context |
 //! |---|---|---|
@@ -49,7 +55,24 @@ pub struct PtOptions {
 pub struct PtOutput {
     pub html: String,
     /// One entry per unrenderable block: `"<_type>"` or `"<_type>: <reason>"`.
+    /// Callers should fail on these.
     pub unhandled: Vec<String>,
+    /// Content the renderer dropped but could render around: links with an
+    /// unsafe or missing href (text kept), images with an unsafe or missing
+    /// source (omitted). Callers should report these, not fail.
+    pub warnings: Vec<String>,
+}
+
+/// Register the `safe_href` and `safe_src` filters on a template set. Each
+/// returns the URL when it passes the check, else an empty string.
+pub fn register_filters(tera: &mut Tera) {
+    fn filter(
+        check: fn(&str) -> Option<&str>,
+    ) -> impl Fn(&Value, &std::collections::HashMap<String, Value>) -> tera::Result<Value> {
+        move |v, _| Ok(Value::String(v.as_str().and_then(check).unwrap_or("").to_string()))
+    }
+    tera.register_filter("safe_href", filter(safe_href));
+    tera.register_filter("safe_src", filter(safe_src));
 }
 
 /// Deepest nesting of custom blocks inside custom blocks (a callout in a
@@ -103,15 +126,16 @@ fn url_scheme(u: &str) -> Option<String> {
 }
 
 pub fn render(blocks: &Value, opts: &PtOptions, tera: Option<&Tera>) -> PtOutput {
-    let mut r = Renderer { opts, tera, unhandled: Vec::new(), depth: 0 };
+    let mut r = Renderer { opts, tera, unhandled: Vec::new(), warnings: Vec::new(), depth: 0 };
     let html = r.blocks(blocks);
-    PtOutput { html, unhandled: r.unhandled }
+    PtOutput { html, unhandled: r.unhandled, warnings: r.warnings }
 }
 
 struct Renderer<'a> {
     opts: &'a PtOptions,
     tera: Option<&'a Tera>,
     unhandled: Vec<String>,
+    warnings: Vec<String>,
     /// Current custom-block nesting depth.
     depth: usize,
 }
@@ -162,9 +186,9 @@ impl<'a> Renderer<'a> {
                             let s = self.image(block, src);
                             html.push_str(&s);
                         }
-                        None => self.unhandled.push(format!("image: unsafe src `{src}`")),
+                        None => self.warnings.push(format!("image: omitted, unsafe src {src:?}")),
                     },
-                    None => self.unhandled.push("image: no asset reference".into()),
+                    None => self.warnings.push("image: omitted, no asset reference".into()),
                 },
                 "divider" => {
                     let s = self
@@ -324,7 +348,7 @@ impl<'a> Renderer<'a> {
                         let raw = def.get("href").and_then(Value::as_str).unwrap_or("");
                         let Some(href) = safe_href(raw) else {
                             // Keep the text, drop the link.
-                            self.unhandled.push(format!("link: unsafe href `{raw}`"));
+                            self.warnings.push(format!("link: rendered as text, unsafe href {raw:?}"));
                             continue;
                         };
                         let blank = def.get("blank").and_then(Value::as_bool).unwrap_or(false);
@@ -792,7 +816,8 @@ mod tests {
             let out = render(&pt, &opts(), t);
             assert!(!out.html.contains("javascript"), "{}", out.html);
             assert!(out.html.starts_with("<p><strong>click</strong><a href="), "{}", out.html);
-            assert_eq!(out.unhandled, vec!["link: unsafe href `javascript:alert(1)`".to_string()]);
+            assert!(out.unhandled.is_empty(), "{:?}", out.unhandled);
+            assert_eq!(out.warnings, vec!["link: rendered as text, unsafe href \"javascript:alert(1)\"".to_string()]);
         }
     }
 
@@ -803,8 +828,53 @@ mod tests {
         for t in [None, Some(&tera)] {
             let out = render(&pt, &opts(), t);
             assert_eq!(out.html, "");
-            assert_eq!(out.unhandled, vec!["image: unsafe src `javascript:alert(1)`".to_string()]);
+            assert!(out.unhandled.is_empty(), "{:?}", out.unhandled);
+            assert_eq!(out.warnings, vec!["image: omitted, unsafe src \"javascript:alert(1)\"".to_string()]);
         }
+    }
+
+    #[test]
+    fn empty_href_and_missing_image_are_warnings() {
+        let pt = json!([
+            para(vec![span("Press", &["l1"])], json!([{"_type": "link", "_key": "l1", "href": ""}])),
+            para(vec![span("Ctl", &["l2"])], json!([{"_type": "link", "_key": "l2", "href": "java\nscript:x"}])),
+            {"_type": "image", "alt": "no asset"},
+            {"_type": "mystery"}
+        ]);
+        let out = render(&pt, &opts(), None);
+        assert_eq!(out.html, "<p>Press</p><p>Ctl</p>");
+        assert_eq!(
+            out.warnings,
+            vec![
+                "link: rendered as text, unsafe href \"\"".to_string(),
+                "link: rendered as text, unsafe href \"java\\nscript:x\"".to_string(),
+                "image: omitted, no asset reference".to_string(),
+            ]
+        );
+        // Unknown custom block types still fail.
+        assert_eq!(out.unhandled, vec!["mystery".to_string()]);
+    }
+
+    #[test]
+    fn safe_url_filters_for_custom_blocks() {
+        let mut tera = Tera::default();
+        register_filters(&mut tera);
+        tera.add_raw_template(
+            "pt/cta.html",
+            "<a href=\"{{ block.url | safe_href }}\"><img src=\"{{ block.icon | safe_src }}\"></a>",
+        )
+        .unwrap();
+        let pt = json!([
+            {"_type": "cta", "url": "/events/speakers", "icon": "https://cdn.example.com/i.png"},
+            {"_type": "cta", "url": "javascript:alert(1)", "icon": "data:image/png;base64,AA"}
+        ]);
+        let out = render(&pt, &opts(), Some(&tera));
+        assert_eq!(
+            out.html,
+            "<a href=\"&#x2F;events&#x2F;speakers\"><img src=\"https:&#x2F;&#x2F;cdn.example.com&#x2F;i.png\"></a>\
+             <a href=\"\"><img src=\"\"></a>"
+        );
+        assert!(out.unhandled.is_empty() && out.warnings.is_empty());
     }
 
     #[test]

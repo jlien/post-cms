@@ -29,10 +29,15 @@ fn main() {
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| fail(&format!("parse: {e}")));
     let blocks = json.get("blocks").cloned().unwrap_or(json);
     let tera = templates.map(|dir| {
-        tera::Tera::new(&format!("{dir}/**/*.html")).unwrap_or_else(|e| fail(&format!("templates: {e}")))
+        let mut t = tera::Tera::new(&format!("{dir}/**/*.html")).unwrap_or_else(|e| fail(&format!("templates: {e}")));
+        postcms_build::pt::register_filters(&mut t);
+        t
     });
     let out = render(&blocks, &opts, tera.as_ref());
     print!("{}", out.html);
+    for w in &out.warnings {
+        eprintln!("warning: {w}");
+    }
     if !out.unhandled.is_empty() {
         for u in &out.unhandled {
             eprintln!("unhandled: {u}");
