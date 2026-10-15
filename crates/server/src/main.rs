@@ -203,9 +203,9 @@ fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
                 ))
             }
         };
-        if !to.starts_with('/') {
+        if !valid_redirect_target(&to) {
             return Err(anyhow::anyhow!(
-                "{}: `{from}` target `{to}` must be an absolute path",
+                "{}: `{from}` target `{to}` must be an absolute path or an http(s) URL",
                 path.display()
             ));
         }
@@ -221,6 +221,14 @@ fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
 
 /// Exact-match lookup against the loaded map. Paths are compared
 /// slash-stripped, so /old-page, /old-page/ and old-page all match.
+/// A redirect target is a site path (`/x`) or a full http(s) URL for moves to
+/// another domain. Protocol-relative `//host` is rejected as ambiguous.
+fn valid_redirect_target(to: &str) -> bool {
+    (to.starts_with('/') && !to.starts_with("//"))
+        || to.starts_with("https://")
+        || to.starts_with("http://")
+}
+
 fn redirect_for(rel: &str) -> Option<&'static Redirect> {
     let rel = rel.trim_matches('/');
     REDIRECTS.get().and_then(|map| {
@@ -951,6 +959,14 @@ async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_targets_allow_paths_and_urls() {
+        assert!(valid_redirect_target("/platform/ops"));
+        assert!(valid_redirect_target("https://www.fixedsummit.com/"));
+        assert!(!valid_redirect_target("//evil.example"));
+        assert!(!valid_redirect_target("platform/ops"));
+    }
 
     #[test]
     fn slash_form_redirects_only_when_disabled() {

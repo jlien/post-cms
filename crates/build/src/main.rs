@@ -452,11 +452,14 @@ fn main() -> Result<()> {
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
-        "built dist/: {} posts ({} drafts skipped), {} pages, theme={:?}, home, blog, contact, 404, rss.xml, sitemap.xml, robots.txt, llms.txt",
+        "built dist/: {} posts ({} drafts skipped), {} pages, {} collections, theme={:?}, {}404, {}sitemap.xml, robots.txt, llms.txt",
         posts.len() - drafts,
         drafts,
         pages.iter().filter(|p| p.meta.published).count(),
-        theme_name
+        collections.len(),
+        theme_name,
+        if cfg.builtin_pages { "home, blog, contact, " } else { "" },
+        if posts.is_empty() { "" } else { "rss.xml, " },
     );
     Ok(())
 }
@@ -2109,8 +2112,18 @@ fn render_mcp_card(root: &Path, dist: &Path) -> Result<()> {
     Ok(())
 }
 
-fn site_base_url(_root: &Path) -> String {
-    std::env::var("SITE_BASE_URL").unwrap_or_else(|_| "http://localhost:8787".to_string())
+/// SITE_BASE_URL env, then site.yaml `base_url`, then the local origin.
+fn site_base_url(root: &Path) -> String {
+    if let Ok(v) = std::env::var("SITE_BASE_URL") {
+        if !v.is_empty() {
+            return v.trim_end_matches('/').to_string();
+        }
+    }
+    fs::read_to_string(root.join("site.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .and_then(|v| v.get("base_url").and_then(|b| b.as_str()).map(|s| s.trim_end_matches('/').to_string()))
+        .unwrap_or_else(|| "http://localhost:8787".to_string())
 }
 
 /// Build-time image optimization (replaces hand-running `sips`): walks dist/,
