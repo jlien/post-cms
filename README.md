@@ -51,6 +51,21 @@ an AI agent do all content operations.
 cargo run -p build      # renders dist/
 ```
 
+## Portable Text templates
+
+Collection items stored as `index.pt.json` render through `crates/build/src/pt.rs`. Custom block types need `templates/pt/<_type>.html` (the block is `block`; nested Portable Text fields arrive as `<field>_html`). Built-ins render with engine defaults unless the site adds an override:
+
+| Template | Context |
+|---|---|
+| `pt/image.html` | `src`, `alt`, `caption`, `width`, `height` (from the asset reference, else null), `block` |
+| `pt/table.html` | `rows` (arrays of cell strings), `has_header`, `block` |
+| `pt/divider.html` | `block` |
+| `pt/blockquote.html` | `text_html`, `block` |
+| `pt/list.html` | `kind` (`bullet`, `number`, ...), `tag` (`ul`/`ol`), `level` (1 = outermost), `items` (item HTML, nested lists included) |
+| `pt/marks/link.html` | `href`, `blank`, `text`, `text_html`, `mark` |
+
+Templates autoescape, so print `*_html` values with `| safe`. `pt-render --templates templates` uses the same overrides.
+
 ## Serve
 
 ```bash
