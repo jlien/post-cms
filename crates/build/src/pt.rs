@@ -298,13 +298,13 @@ mod tests {
     fn decorators_and_links() {
         let pt = json!([{
             "_type": "block", "style": "normal",
-            "markDefs": [{"_type": "link", "_key": "l1", "href": "https://happy.co/demo", "blank": true}],
+            "markDefs": [{"_type": "link", "_key": "l1", "href": "https://example.com/demo", "blank": true}],
             "children": [span("Book ", &["strong"]), span("a demo", &["strong", "l1"])]
         }]);
         let out = render(&pt, &opts(), None);
         assert_eq!(
             out.html,
-            "<p><strong>Book </strong><a href=\"https://happy.co/demo\" target=\"_blank\" rel=\"noopener\"><strong>a demo</strong></a></p>"
+            "<p><strong>Book </strong><a href=\"https://example.com/demo\" target=\"_blank\" rel=\"noopener\"><strong>a demo</strong></a></p>"
         );
     }
 
