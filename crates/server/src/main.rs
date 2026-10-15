@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn redirect_targets_allow_paths_and_urls() {
         assert!(valid_redirect_target("/platform/ops"));
-        assert!(valid_redirect_target("https://www.fixedsummit.com/"));
+        assert!(valid_redirect_target("https://www.example.org/"));
         assert!(!valid_redirect_target("//evil.example"));
         assert!(!valid_redirect_target("platform/ops"));
     }
