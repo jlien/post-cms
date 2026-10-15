@@ -385,7 +385,8 @@ fn main() -> Result<()> {
     // Live site renders at the site root.
     render_posts(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
-    let (collections, _ref_checks) = load_collections(&root.join("content"))?;
+    let sources = SourceCtx::from_env(&root, &cfg, &postcms_build::sanity::http_fetch);
+    let (collections, _ref_checks) = load_collections(&root.join("content"), &sources)?;
     render_collections(&tera, &dist, &collections, &styling, &cfg, "")?;
     if cfg.builtin_pages {
         render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
@@ -1062,6 +1063,7 @@ fn load_posts(dir: &Path) -> Result<Vec<Post>> {
 
 /// A cross-item reference to validate after all collections load:
 /// `<at>` names a meta.yaml whose `<field>` must be an item of `<target>`.
+#[derive(Debug)]
 struct RefCheck {
     at: String,
     field: String,
@@ -1069,13 +1071,46 @@ struct RefCheck {
     value: String,
 }
 
+/// How non-file collection sources (schema.yaml `source:`) are synced.
+struct SourceCtx<'a> {
+    /// `<root>/.cache/sanity`; each Sanity collection caches under `<name>/`.
+    cache_root: PathBuf,
+    /// SANITY_OFFLINE=1: build from the recorded responses, never fetch.
+    offline: bool,
+    /// site.yaml `sanity:` project and dataset, the defaults for every source.
+    sanity: postcms_build::sanity::SiteDefaults,
+    fetch: postcms_build::sanity::Fetch<'a>,
+}
+
+impl<'a> SourceCtx<'a> {
+    fn from_env(root: &Path, cfg: &SiteConfig, fetch: postcms_build::sanity::Fetch<'a>) -> Self {
+        SourceCtx {
+            cache_root: root.join(".cache").join("sanity"),
+            offline: std::env::var("SANITY_OFFLINE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            sanity: postcms_build::sanity::SiteDefaults {
+                project_id: cfg.sanity.as_ref().map(|c| c.project_id.clone()),
+                dataset: cfg.sanity.as_ref().map(|c| c.dataset.clone()),
+            },
+            fetch,
+        }
+    }
+}
+
 /// Load typed collections: every directory under content/ other than posts/
 /// pages/ is a collection if it has a schema.yaml. Each item is
 /// content/<collection>/<slug>/ with meta.yaml + index.mdx. Required fields
 /// (and optional type checks) from schema.yaml are enforced at build time —
 /// a missing or wrongly-typed field fails the build naming the exact file.
+/// A schema with `source: {type: sanity, ...}` reads its items from a GROQ
+/// query instead, materialized under `.cache/sanity/<collection>/items/` in
+/// the same layout, so the same validation applies (see `sanity` module).
 /// Returns (collections, deferred reference checks).
-fn load_collections(content_dir: &Path) -> Result<(Vec<Collection>, Vec<RefCheck>)> {
+fn load_collections(
+    content_dir: &Path,
+    sources: &SourceCtx,
+) -> Result<(Vec<Collection>, Vec<RefCheck>)> {
     let mut ref_checks: Vec<RefCheck> = Vec::new();
     let mut collections = Vec::new();
     let entries = fs::read_dir(content_dir)
@@ -1185,11 +1220,26 @@ fn load_collections(content_dir: &Path) -> Result<(Vec<Collection>, Vec<RefCheck
             .map(|p| format!("/{}", p.trim_matches('/')))
             .unwrap_or_else(|| format!("/{name}"));
         let index = schema.get("index").and_then(|v| v.as_bool()).unwrap_or(true);
-        for item_entry in fs::read_dir(&path)
-            .with_context(|| format!("read_dir {}", path.display()))?
+        let source = postcms_build::sanity::SanitySource::from_schema(schema.get("source"))
+            .with_context(|| format!("{}: source", schema_path.display()))?;
+        let items_dir = match &source {
+            Some(src) => postcms_build::sanity::sync(
+                src,
+                &sources.sanity,
+                &sources.cache_root.join(name),
+                sources.offline,
+                sources.fetch,
+            )
+            .with_context(|| {
+                format!("collection `{name}`: Sanity source ({})", schema_path.display())
+            })?,
+            None => path.clone(),
+        };
+        for item_entry in fs::read_dir(&items_dir)
+            .with_context(|| format!("read_dir {}", items_dir.display()))?
         {
             let item_path = item_entry
-                .with_context(|| format!("entry in {}", path.display()))?
+                .with_context(|| format!("entry in {}", items_dir.display()))?
                 .path();
             if !item_path.is_dir() {
                 continue;
@@ -2562,5 +2612,129 @@ mod tests {
             serde_yaml::from_str("trailing_slash: false\nbuiltin_pages: false\n").unwrap();
         assert!(!cfg.trailing_slash);
         assert!(!cfg.builtin_pages);
+    }
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sanity")
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        for file in walk_files(src) {
+            let to = dst.join(file.strip_prefix(src).unwrap());
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(&file, &to).unwrap();
+        }
+    }
+
+    fn no_net(_: &str, _: Option<&str>) -> Result<String> {
+        panic!("offline build fetched")
+    }
+
+    /// A site root whose `articles` collection is Sanity-backed, with the
+    /// recorded GROQ response in its cache (as left by an online build).
+    fn sanity_site(dir: &Path, response: &str) -> PathBuf {
+        let root = dir.join("sanity-site");
+        fs::create_dir_all(root.join("content/articles")).unwrap();
+        fs::copy(fixtures().join("articles/schema.yaml"), root.join("content/articles/schema.yaml"))
+            .unwrap();
+        fs::create_dir_all(root.join(".cache/sanity/articles")).unwrap();
+        fs::write(root.join(".cache/sanity/articles/response.json"), response).unwrap();
+        root
+    }
+
+    fn offline_ctx(root: &Path) -> SourceCtx<'static> {
+        SourceCtx {
+            cache_root: root.join(".cache/sanity"),
+            offline: true,
+            sanity: Default::default(),
+            fetch: &no_net,
+        }
+    }
+
+    fn render_site(root: &Path, dist: &Path) -> Vec<Collection> {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tera = load_tera(&repo, &repo.join("themes/default"), &repo.join("templates")).unwrap();
+        let style = Styling { css: String::new(), hash: "h".into(), theme: "default".into() };
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.sanity = Some(SanityCfg { project_id: "exmpl123".into(), dataset: "production".into() });
+        let (collections, _) = load_collections(&root.join("content"), &offline_ctx(root)).unwrap();
+        render_collections(&tera, dist, &collections, &style, &cfg, "").unwrap();
+        collections
+    }
+
+    #[test]
+    fn offline_sanity_build_matches_file_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_root = tmp.path().join("file-site");
+        copy_tree(&fixtures().join("files"), &file_root.join("content"));
+        let sanity_root = sanity_site(
+            tmp.path(),
+            &fs::read_to_string(fixtures().join("articles/response.json")).unwrap(),
+        );
+
+        let file_dist = tmp.path().join("file-dist");
+        let sanity_dist = tmp.path().join("sanity-dist");
+        let from_files = render_site(&file_root, &file_dist);
+        let from_sanity = render_site(&sanity_root, &sanity_dist);
+
+        let items = |c: &[Collection]| -> Vec<(String, String, Option<NaiveDate>, serde_json::Value)> {
+            c[0].items
+                .iter()
+                .map(|i| (i.slug.clone(), i.title.clone(), i.date, serde_json::Value::Object(i.fields.clone())))
+                .collect()
+        };
+        assert_eq!(from_sanity[0].items.len(), 3);
+        assert_eq!(items(&from_files), items(&from_sanity));
+
+        let tree = |dist: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+            let mut files: Vec<_> = walk_files(dist)
+                .into_iter()
+                .map(|f| (f.strip_prefix(dist).unwrap().to_path_buf(), fs::read(&f).unwrap()))
+                .collect();
+            files.sort();
+            files
+        };
+        let (a, b) = (tree(&file_dist), tree(&sanity_dist));
+        assert_eq!(a.len(), 4, "3 item pages + the index");
+        assert_eq!(
+            a.iter().map(|f| &f.0).collect::<Vec<_>>(),
+            b.iter().map(|f| &f.0).collect::<Vec<_>>()
+        );
+        for ((path, x), (_, y)) in a.iter().zip(&b) {
+            assert!(x == y, "{} differs between file and Sanity builds", path.display());
+        }
+        // Portable Text from the response went through the PT renderer.
+        let page = String::from_utf8(fs::read(sanity_dist.join("articles/edge-basics/index.html")).unwrap()).unwrap();
+        assert!(page.contains("<ol>") && page.contains("cdn.sanity.io/images/exmpl123/production/"), "{page}");
+    }
+
+    #[test]
+    fn sanity_items_get_the_same_validation_as_file_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorded = fs::read_to_string(fixtures().join("articles/response.json")).unwrap();
+
+        let bad_enum = recorded.replacen("\"kind\": \"guide\"", "\"kind\": \"webinar\"", 1);
+        let root = sanity_site(&tmp.path().join("enum"), &bad_enum);
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(err.contains("caching-guide/meta.yaml") && err.contains("`kind` value `webinar`"), "{err}");
+
+        let no_title = recorded.replacen("\"title\": \"Rollout Story\",", "", 1);
+        let root = sanity_site(&tmp.path().join("required"), &no_title);
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(err.contains("rollout-story/meta.yaml") && err.contains("required field `title`"), "{err}");
+
+        let bad_url = recorded.replacen("https://cdn.example.com/edge.png", "not a url", 1);
+        let root = sanity_site(&tmp.path().join("format"), &bad_url);
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(err.contains("`hero_url` value `not a url` is not a valid url"), "{err}");
+    }
+
+    #[test]
+    fn offline_build_without_a_recorded_response_fails_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sanity_site(tmp.path(), "{}");
+        fs::remove_file(root.join(".cache/sanity/articles/response.json")).unwrap();
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(err.contains("collection `articles`") && err.contains("SANITY_OFFLINE=1"), "{err}");
     }
 }

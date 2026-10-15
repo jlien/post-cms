@@ -1,0 +1,96 @@
+[
+  {
+    "_type": "block",
+    "_key": "b1",
+    "style": "h2",
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "s1",
+        "text": "Why cache",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "block",
+    "_key": "b2",
+    "style": "normal",
+    "markDefs": [
+      {
+        "_type": "link",
+        "_key": "l1",
+        "href": "https://example.com/cdn"
+      }
+    ],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "s2",
+        "text": "Static pages are ",
+        "marks": []
+      },
+      {
+        "_type": "span",
+        "_key": "s3",
+        "text": "fast",
+        "marks": [
+          "strong"
+        ]
+      },
+      {
+        "_type": "span",
+        "_key": "s4",
+        "text": " behind a ",
+        "marks": []
+      },
+      {
+        "_type": "span",
+        "_key": "s5",
+        "text": "CDN",
+        "marks": [
+          "l1"
+        ]
+      },
+      {
+        "_type": "span",
+        "_key": "s6",
+        "text": ".",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "block",
+    "_key": "b3",
+    "style": "normal",
+    "listItem": "bullet",
+    "level": 1,
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "s7",
+        "text": "Set long max-age on hashed assets",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "block",
+    "_key": "b4",
+    "style": "normal",
+    "listItem": "bullet",
+    "level": 1,
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "s8",
+        "text": "Purge HTML on publish",
+        "marks": []
+      }
+    ]
+  }
+]

@@ -277,7 +277,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tera",
+ "ureq",
 ]
 
 [[package]]

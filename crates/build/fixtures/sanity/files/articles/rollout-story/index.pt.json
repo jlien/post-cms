@@ -1,0 +1,34 @@
+[
+  {
+    "_type": "block",
+    "_key": "d1",
+    "style": "blockquote",
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "u1",
+        "text": "Builds went from minutes to seconds.",
+        "marks": []
+      }
+    ]
+  },
+  {
+    "_type": "divider",
+    "_key": "d2"
+  },
+  {
+    "_type": "block",
+    "_key": "d3",
+    "style": "normal",
+    "markDefs": [],
+    "children": [
+      {
+        "_type": "span",
+        "_key": "u2",
+        "text": "The rest is history.",
+        "marks": []
+      }
+    ]
+  }
+]
