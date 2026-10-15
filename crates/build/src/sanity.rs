@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -108,7 +109,18 @@ impl SanitySource {
             .or_else(|| site.dataset.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "production".to_string());
+        // These land in the host name and path, so only Sanity's own
+        // identifier alphabets are accepted.
+        if !valid_project_id(&project) {
+            bail!("source: sanity project_id `{project}` must match ^[a-z0-9]+$");
+        }
+        if !valid_dataset(&dataset) {
+            bail!("source: sanity dataset `{dataset}` must match ^[a-z0-9_-]+$");
+        }
         let version = self.api_version.trim_start_matches('v');
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            bail!("source: sanity api_version `{}` must look like v2025-02-19", self.api_version);
+        }
         let mut url = format!(
             "https://{project}.api.sanity.io/v{version}/data/query/{dataset}?query={}",
             encode(&self.query)
@@ -246,8 +258,26 @@ fn split_document(obj: &Map<String, Value>, src: &SanitySource) -> (Map<String, 
     (meta, body)
 }
 
+/// Sanity project IDs: lowercase letters and digits.
+pub fn valid_project_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Sanity dataset names: lowercase letters, digits, `_` and `-`.
+pub fn valid_dataset(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Whole-request limit for a Sanity fetch, so a stalled API cannot hang a build.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Blocking HTTPS GET with an optional Bearer token.
 pub fn http_fetch(url: &str, token: Option<&str>) -> Result<String> {
+    http_fetch_with_timeout(url, token, FETCH_TIMEOUT)
+}
+
+fn http_fetch_with_timeout(url: &str, token: Option<&str>, timeout: Duration) -> Result<String> {
     let mut req = ureq::get(url).header("Accept", "application/json");
     if let Some(t) = token {
         req = req.header("Authorization", &format!("Bearer {t}"));
@@ -255,6 +285,7 @@ pub fn http_fetch(url: &str, token: Option<&str>) -> Result<String> {
     let mut resp = req
         .config()
         .http_status_as_error(false)
+        .timeout_global(Some(timeout))
         .build()
         .call()
         .with_context(|| format!("GET {}", redact(url)))?;
@@ -338,6 +369,46 @@ mod tests {
             s.query_url(&site).unwrap(),
             "https://p1.api.sanity.io/v2024-01-01/data/query/staging?query=%2A"
         );
+    }
+
+    #[test]
+    fn query_url_rejects_unsafe_project_and_dataset() {
+        let raw: serde_yaml::Value = serde_yaml::from_str("type: sanity\nquery: '*'").unwrap();
+        let s = SanitySource::from_schema(Some(&raw)).unwrap().unwrap();
+        for (project, dataset) in [
+            ("evil.example/x", "production"),
+            ("p1@evil.example", "production"),
+            ("P1", "production"),
+            ("p1", "../other"),
+            ("p1", "prod?x=1"),
+            ("p1", "Prod"),
+        ] {
+            let site = SiteDefaults { project_id: Some(project.into()), dataset: Some(dataset.into()) };
+            assert!(s.query_url(&site).is_err(), "{project} {dataset}");
+        }
+        let site = SiteDefaults { project_id: Some("abc123".into()), dataset: Some("my_data-set".into()) };
+        assert!(s.query_url(&site).is_ok());
+        let mut bad_version = s.clone();
+        bad_version.api_version = "v1/../x".into();
+        assert!(bad_version.query_url(&site).is_err());
+    }
+
+    #[test]
+    fn http_fetch_times_out_on_stalled_server() {
+        // A listener that accepts and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = std::thread::spawn(move || {
+            let conn = listener.accept();
+            std::thread::sleep(Duration::from_secs(1));
+            drop(conn);
+        });
+        let start = std::time::Instant::now();
+        let err = http_fetch_with_timeout(&format!("http://{addr}/q"), None, Duration::from_millis(300));
+        assert!(err.is_err());
+        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert_eq!(FETCH_TIMEOUT, Duration::from_secs(30));
+        hold.join().unwrap();
     }
 
     #[test]

@@ -222,11 +222,29 @@ fn load_redirects(root: &StdPath) -> anyhow::Result<Vec<Redirect>> {
 /// Exact-match lookup against the loaded map. Paths are compared
 /// slash-stripped, so /old-page, /old-page/ and old-page all match.
 /// A redirect target is a site path (`/x`) or a full http(s) URL for moves to
-/// another domain. Protocol-relative `//host` is rejected as ambiguous.
+/// another domain. Protocol-relative `//host` and `/\host` (which browsers
+/// read as `//host`) are rejected, as is any control character.
 fn valid_redirect_target(to: &str) -> bool {
-    (to.starts_with('/') && !to.starts_with("//"))
-        || to.starts_with("https://")
-        || to.starts_with("http://")
+    if to.chars().any(|c| c.is_ascii_control()) {
+        return false;
+    }
+    is_local_path(to) || to.starts_with("https://") || to.starts_with("http://")
+}
+
+/// A same-site absolute path: one leading `/`, not followed by `/` or `\`.
+fn is_local_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")
+}
+
+/// Rewrite a request path into a same-site Location: a leading run of `/`
+/// and `\` collapses to a single `/`, so the result can never be read as a
+/// protocol-relative URL. `None` when the path holds control characters.
+fn local_location(path: &str) -> Option<String> {
+    if path.chars().any(|c| c.is_ascii_control()) {
+        return None;
+    }
+    let rest = path.trim_start_matches(['/', '\\']);
+    Some(format!("/{rest}"))
 }
 
 fn redirect_for(rel: &str) -> Option<&'static Redirect> {
@@ -238,6 +256,11 @@ fn redirect_for(rel: &str) -> Option<&'static Redirect> {
 }
 
 fn redirect_response(r: &Redirect) -> Response {
+    // Last line of defense: never emit a Location a browser could read as
+    // another host, whatever built it.
+    if !valid_redirect_target(&r.to) {
+        return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
+    }
     let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
     let mut resp = (status, String::new()).into_response();
     if let Ok(v) = HeaderValue::from_str(&r.to) {
@@ -326,6 +349,8 @@ fn repo_root() -> anyhow::Result<PathBuf> {
 }
 
 /// site.yaml `trailing_slash` (default true). When false, `/x/` 301s to `/x`.
+/// When true the server never redirects for slash form: `/x` and `/x/` both
+/// serve the same file, so there is no Location to build in that direction.
 static TRAILING_SLASH: OnceLock<bool> = OnceLock::new();
 
 fn load_trailing_slash(root: &StdPath) -> bool {
@@ -346,11 +371,10 @@ fn slash_redirect_with(trailing_slash: bool, path: &str, query: Option<&str>) ->
     if trailing_slash || path == "/" || !path.ends_with('/') {
         return None;
     }
-    let bare = path.trim_end_matches('/');
-    let bare = if bare.is_empty() { "/" } else { bare };
+    let bare = local_location(path.trim_end_matches('/'))?;
     Some(match query {
         Some(q) if !q.is_empty() => format!("{bare}?{q}"),
-        _ => bare.to_string(),
+        _ => bare,
     })
 }
 
@@ -978,5 +1002,44 @@ mod tests {
         );
         assert_eq!(slash_redirect_with(false, "/", None), None);
         assert_eq!(slash_redirect_with(false, "/pricing", None), None);
+    }
+
+    #[test]
+    fn slash_redirect_never_emits_protocol_relative_location() {
+        for (path, want) in [
+            ("//evil.example/", "/evil.example"),
+            ("///evil.example/", "/evil.example"),
+            ("/\\evil.example/", "/evil.example"),
+            ("/\\/evil.example/", "/evil.example"),
+            ("\\\\evil.example/", "/evil.example"),
+            ("//", "/"),
+        ] {
+            let to = slash_redirect_with(false, path, None).expect(path);
+            assert_eq!(to, want, "{path}");
+            assert!(valid_redirect_target(&to), "{path} -> {to}");
+        }
+        assert_eq!(
+            slash_redirect_with(false, "//evil.example/", Some("a=1")),
+            Some("/evil.example?a=1".into())
+        );
+        assert_eq!(slash_redirect_with(false, "/a\t/", None), None);
+    }
+
+    #[test]
+    fn redirect_targets_reject_backslash_and_control_chars() {
+        assert!(!valid_redirect_target("/\\evil.example"));
+        assert!(!valid_redirect_target("///evil.example"));
+        assert!(!valid_redirect_target("/ok\r\nSet-Cookie: x=1"));
+        assert!(valid_redirect_target("/a\\b"));
+    }
+
+    #[test]
+    fn redirect_response_refuses_unsafe_location() {
+        let r = Redirect { from: String::new(), to: "//evil.example".into(), status: 301 };
+        let resp = redirect_response(&r);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let ok = Redirect { from: String::new(), to: "/fine".into(), status: 301 };
+        assert_eq!(redirect_response(&ok).headers()[header::LOCATION], "/fine");
     }
 }

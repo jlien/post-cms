@@ -291,7 +291,7 @@ fn item_body(item: &CollectionItem, tera: &Tera, cfg: &SiteConfig) -> Result<Str
         let out = postcms_build::pt::render(&blocks, &cfg.pt_options(), Some(tera));
         if !out.unhandled.is_empty() {
             bail!(
-                "{}: Portable Text blocks with no renderer: {:?} (add templates/pt/<type>.html)",
+                "{}: Portable Text that could not be rendered: {:?} (add templates/pt/<type>.html, or fix unsafe links and images)",
                 pt_path.display(),
                 out.unhandled
             );

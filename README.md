@@ -64,7 +64,7 @@ Collection items stored as `index.pt.json` render through `crates/build/src/pt.r
 | `pt/list.html` | `kind` (`bullet`, `number`, ...), `tag` (`ul`/`ol`), `level` (1 = outermost), `items` (item HTML, nested lists included) |
 | `pt/marks/link.html` | `href`, `blank`, `text`, `text_html`, `mark` |
 
-Templates autoescape, so print `*_html` values with `| safe`. `pt-render --templates templates` uses the same overrides.
+Templates autoescape. Use `| safe` only for `*_html` values, which the engine rendered itself; never on `href`, `src`, `alt`, `caption`, or `block` fields. Link `href` values must be http(s), `mailto:`, `tel:`, a site path (`/x`), `#fragment`, or `?query`, and image `src` values must be http(s) or a site path; anything else is dropped (link text kept) and fails the build as unhandled. `pt::safe_href` and `pt::safe_src` expose the same checks. Custom blocks nest at most 32 levels. `pt-render --templates templates` uses the same overrides.
 
 ## Serve
 

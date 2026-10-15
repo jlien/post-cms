@@ -10,6 +10,14 @@
 //! the names below, it renders that element; otherwise the engine default is
 //! used, byte for byte. Values are raw (Tera autoescapes `.html` templates);
 //! `*_html` values are already-rendered HTML, so print them with `| safe`.
+//! Never use `| safe` on anything else: `href`, `src`, `alt`, `caption` and
+//! `block` fields come from content and must stay escaped.
+//!
+//! URLs are checked before they reach any template. A link `href` must be
+//! http(s), `mailto:`, `tel:`, a site path (`/x`, not `//x`), a `#fragment` or
+//! a `?query` ([`safe_href`]); anything else renders as plain text and is
+//! reported in `unhandled`. An image `src` must be http(s) or a site path
+//! ([`safe_src`]); anything else drops the image and is reported.
 //!
 //! | Template | Renders | Context |
 //! |---|---|---|
@@ -44,8 +52,58 @@ pub struct PtOutput {
     pub unhandled: Vec<String>,
 }
 
+/// Deepest nesting of custom blocks inside custom blocks (a callout in a
+/// callout ...). Deeper content is dropped and reported.
+pub const MAX_CUSTOM_DEPTH: usize = 32;
+
+/// A link target safe to put in `href`: http(s), mailto, tel, a site path,
+/// a fragment or a query. Returns the trimmed value, or `None` to drop it.
+pub fn safe_href(href: &str) -> Option<&str> {
+    let h = checked_url(href)?;
+    if h.starts_with('#') || h.starts_with('?') || is_site_path(h) {
+        return Some(h);
+    }
+    match url_scheme(h)?.as_str() {
+        "http" | "https" | "mailto" | "tel" => Some(h),
+        _ => None,
+    }
+}
+
+/// An image source safe to put in `src`: http(s) or a site path.
+pub fn safe_src(src: &str) -> Option<&str> {
+    let s = checked_url(src)?;
+    if is_site_path(s) {
+        return Some(s);
+    }
+    match url_scheme(s)?.as_str() {
+        "http" | "https" => Some(s),
+        _ => None,
+    }
+}
+
+/// Trim surrounding spaces; refuse empty values and any control character
+/// (browsers strip tabs and newlines inside a scheme, hiding it from a check).
+fn checked_url(u: &str) -> Option<&str> {
+    let u = u.trim_matches(' ');
+    (!u.is_empty() && !u.chars().any(|c| c.is_control())).then_some(u)
+}
+
+/// `/x` on this site; `//x` and `/\x` name another host.
+fn is_site_path(u: &str) -> bool {
+    u.starts_with('/') && !u.starts_with("//") && !u.starts_with("/\\")
+}
+
+/// The lowercase scheme of an absolute URL, when it has a valid one.
+fn url_scheme(u: &str) -> Option<String> {
+    let (scheme, _) = u.split_once(':')?;
+    let mut chars = scheme.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    ok.then(|| scheme.to_ascii_lowercase())
+}
+
 pub fn render(blocks: &Value, opts: &PtOptions, tera: Option<&Tera>) -> PtOutput {
-    let mut r = Renderer { opts, tera, unhandled: Vec::new() };
+    let mut r = Renderer { opts, tera, unhandled: Vec::new(), depth: 0 };
     let html = r.blocks(blocks);
     PtOutput { html, unhandled: r.unhandled }
 }
@@ -54,6 +112,8 @@ struct Renderer<'a> {
     opts: &'a PtOptions,
     tera: Option<&'a Tera>,
     unhandled: Vec<String>,
+    /// Current custom-block nesting depth.
+    depth: usize,
 }
 
 /// A list being built: entries are items, or a nested list that opened
@@ -97,10 +157,13 @@ impl<'a> Renderer<'a> {
                     html.push_str(&s);
                 }
                 "image" => match image_url(block, self.opts) {
-                    Some(src) => {
-                        let s = self.image(block, &src);
-                        html.push_str(&s);
-                    }
+                    Some(src) => match safe_src(&src) {
+                        Some(src) => {
+                            let s = self.image(block, src);
+                            html.push_str(&s);
+                        }
+                        None => self.unhandled.push(format!("image: unsafe src `{src}`")),
+                    },
                     None => self.unhandled.push("image: no asset reference".into()),
                 },
                 "divider" => {
@@ -258,7 +321,12 @@ impl<'a> Renderer<'a> {
                 });
                 if let Some(def) = def {
                     if def.get("_type").and_then(Value::as_str) == Some("link") {
-                        let href = def.get("href").and_then(Value::as_str).unwrap_or("");
+                        let raw = def.get("href").and_then(Value::as_str).unwrap_or("");
+                        let Some(href) = safe_href(raw) else {
+                            // Keep the text, drop the link.
+                            self.unhandled.push(format!("link: unsafe href `{raw}`"));
+                            continue;
+                        };
                         let blank = def.get("blank").and_then(Value::as_bool).unwrap_or(false);
                         let ctx = || {
                             json!({
@@ -353,7 +421,15 @@ impl<'a> Renderer<'a> {
                     .map(|a| !a.is_empty() && a.iter().all(|b| b.get("_type").is_some()))
                     .unwrap_or(false);
                 if is_pt {
+                    if self.depth >= MAX_CUSTOM_DEPTH {
+                        self.unhandled.push(format!(
+                            "{ty}: custom blocks nested deeper than {MAX_CUSTOM_DEPTH} levels"
+                        ));
+                        return String::new();
+                    }
+                    self.depth += 1;
                     let nested = self.blocks(v);
+                    self.depth -= 1;
                     ctx.insert(format!("{k}_html"), &nested);
                 }
             }
@@ -588,7 +664,7 @@ mod tests {
     fn override_link_mark() {
         let tera = tera_with(&[(
             "pt/marks/link.html",
-            "<a class=\"site-link\" href=\"{{ href | safe }}\"{% if blank %} target=\"_blank\"{% endif %} title=\"{{ text }}\">{{ text_html | safe }}</a>",
+            "<a class=\"site-link\" href=\"{{ href }}\"{% if blank %} target=\"_blank\"{% endif %} title=\"{{ text }}\">{{ text_html | safe }}</a>",
         )]);
         let pt = json!([para(
             vec![span("Read ", &[]), span("more", &["strong", "l1"])],
@@ -597,7 +673,7 @@ mod tests {
         let out = render(&pt, &opts(), Some(&tera));
         assert_eq!(
             out.html,
-            "<p>Read <a class=\"site-link\" href=\"https://example.com/a\" target=\"_blank\" title=\"more\"><strong>more</strong></a></p>"
+            "<p>Read <a class=\"site-link\" href=\"https:&#x2F;&#x2F;example.com&#x2F;a\" target=\"_blank\" title=\"more\"><strong>more</strong></a></p>"
         );
     }
 
@@ -612,7 +688,7 @@ mod tests {
     fn override_image_with_caption_and_size() {
         let tera = tera_with(&[(
             "pt/image.html",
-            "<figure class=\"site-figure\"><img src=\"{{ src | safe }}\" alt=\"{{ alt }}\"\
+            "<figure class=\"site-figure\"><img src=\"{{ src }}\" alt=\"{{ alt }}\"\
              {% if width %} width=\"{{ width }}\" height=\"{{ height }}\"{% endif %}>\
              {% if caption %}<figcaption>{{ caption }}</figcaption>{% endif %}</figure>",
         )]);
@@ -623,8 +699,8 @@ mod tests {
         let out = render(&pt, &opts(), Some(&tera));
         assert_eq!(
             out.html,
-            "<figure class=\"site-figure\"><img src=\"https://cdn.sanity.io/images/p1/production/abc123-800x600.png\" alt=\"Chart\" width=\"800\" height=\"600\"><figcaption>Q3 &amp; Q4</figcaption></figure>\
-             <figure class=\"site-figure\"><img src=\"https://cdn.example.com/x.jpg\" alt=\"\"></figure>"
+            "<figure class=\"site-figure\"><img src=\"https:&#x2F;&#x2F;cdn.sanity.io&#x2F;images&#x2F;p1&#x2F;production&#x2F;abc123-800x600.png\" alt=\"Chart\" width=\"800\" height=\"600\"><figcaption>Q3 &amp; Q4</figcaption></figure>\
+             <figure class=\"site-figure\"><img src=\"https:&#x2F;&#x2F;cdn.example.com&#x2F;x.jpg\" alt=\"\"></figure>"
         );
     }
 
@@ -674,6 +750,81 @@ mod tests {
              <figure><img src=\"https://cdn.sanity.io/images/p1/production/abc-10x20.jpg\" alt=\"a\" loading=\"lazy\"><figcaption>c</figcaption></figure>\
              <table><tr><th>h</th></tr><tr><td>v</td></tr></table><hr>"
         );
+    }
+
+    #[test]
+    fn link_href_allowlist() {
+        for ok in [
+            "https://example.com/a", "HTTP://example.com", "mailto:a@example.com",
+            "tel:+15550100", "/events/speakers", "#top", "?page=2", " /padded ",
+        ] {
+            assert!(safe_href(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)", "JavaScript:alert(1)", "java\tscript:alert(1)",
+            "data:text/html,x", "vbscript:x", "//example.com", "/\\example.com",
+            "relative/page", "", "  ", "\njavascript:x",
+        ] {
+            assert!(safe_href(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn image_src_allowlist() {
+        assert!(safe_src("https://cdn.example.com/x.png").is_some());
+        assert!(safe_src("/media/x.png").is_some());
+        for bad in ["data:image/png;base64,AAAA", "javascript:x", "//example.com/x.png", "mailto:a@example.com"] {
+            assert!(safe_src(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unsafe_link_renders_text_and_is_reported() {
+        let tera = tera_with(&[("pt/marks/link.html", "<a href=\"{{ href }}\">{{ text_html | safe }}</a>")]);
+        let pt = json!([para(
+            vec![span("click", &["strong", "l1"]), span(" ok", &["l2"])],
+            json!([
+                {"_type": "link", "_key": "l1", "href": "javascript:alert(1)"},
+                {"_type": "link", "_key": "l2", "href": "/fine"}
+            ])
+        )]);
+        for t in [None, Some(&tera)] {
+            let out = render(&pt, &opts(), t);
+            assert!(!out.html.contains("javascript"), "{}", out.html);
+            assert!(out.html.starts_with("<p><strong>click</strong><a href="), "{}", out.html);
+            assert_eq!(out.unhandled, vec!["link: unsafe href `javascript:alert(1)`".to_string()]);
+        }
+    }
+
+    #[test]
+    fn unsafe_image_src_is_dropped_and_reported() {
+        let tera = tera_with(&[("pt/image.html", "<img src=\"{{ src }}\">")]);
+        let pt = json!([{"_type": "image", "_sanityAsset": "image@javascript:alert(1)"}]);
+        for t in [None, Some(&tera)] {
+            let out = render(&pt, &opts(), t);
+            assert_eq!(out.html, "");
+            assert_eq!(out.unhandled, vec!["image: unsafe src `javascript:alert(1)`".to_string()]);
+        }
+    }
+
+    #[test]
+    fn custom_block_nesting_is_capped() {
+        let tera = tera_with(&[("pt/callout.html", "<aside>{{ body_html | safe }}</aside>")]);
+        let mut pt = json!([para(vec![span("leaf", &[])], json!([]))]);
+        for _ in 0..(MAX_CUSTOM_DEPTH + 5) {
+            pt = json!([{"_type": "callout", "body": pt}]);
+        }
+        let out = render(&pt, &opts(), Some(&tera));
+        assert!(!out.html.contains("leaf"));
+        assert_eq!(out.unhandled.len(), 1, "{:?}", out.unhandled);
+        assert!(out.unhandled[0].contains("nested deeper than 32 levels"), "{:?}", out.unhandled);
+
+        let mut ok = json!([para(vec![span("leaf", &[])], json!([]))]);
+        for _ in 0..MAX_CUSTOM_DEPTH {
+            ok = json!([{"_type": "callout", "body": ok}]);
+        }
+        let out = render(&ok, &opts(), Some(&tera));
+        assert!(out.html.contains("leaf") && out.unhandled.is_empty(), "{:?}", out.unhandled);
     }
 
     #[test]
