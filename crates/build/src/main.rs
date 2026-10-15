@@ -2523,8 +2523,8 @@ mod tests {
         let dist = Path::new("/tmp/dist");
         assert_eq!(out_dir_for(dist, "/"), PathBuf::from("/tmp/dist"));
         assert_eq!(
-            out_dir_for(dist, "/community/hs-sponsors/acme/"),
-            PathBuf::from("/tmp/dist/community/hs-sponsors/acme")
+            out_dir_for(dist, "/events/speakers/acme/"),
+            PathBuf::from("/tmp/dist/events/speakers/acme")
         );
     }
 
@@ -2540,17 +2540,17 @@ mod tests {
     #[test]
     fn collection_item_path_uses_prefix() {
         let c = Collection {
-            name: "hs-sponsors".into(),
-            title: "Sponsors".into(),
+            name: "speakers".into(),
+            title: "Speakers".into(),
             required: vec![],
             types: Default::default(),
             item_template: "collection-item.html".into(),
             index_template: "collection.html".into(),
-            url_prefix: "/community/hs-sponsors/".into(),
+            url_prefix: "/events/speakers/".into(),
             index: false,
             items: vec![],
         };
-        assert_eq!(c.item_path("acme"), "/community/hs-sponsors/acme");
+        assert_eq!(c.item_path("acme"), "/events/speakers/acme");
     }
 
     #[test]
