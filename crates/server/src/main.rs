@@ -1088,6 +1088,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("signup")).unwrap();
         std::fs::write(dir.join("signup/index.html"), "<p>signup</p>").unwrap();
+        std::fs::write(dir.join("signup/index.html.gz"), "gz").unwrap();
         std::fs::write(dir.join("about.html"), "<p>about</p>").unwrap();
         std::fs::write(dir.join("app.js"), "1").unwrap();
         std::fs::write(dir.join("404.html"), "<p>nope</p>").unwrap();
@@ -1158,9 +1159,15 @@ headers:
     fn index_alias_cannot_skip_a_page_rule() {
         let dist = temp_dist("alias");
         let cfg = SiteHeaders::from_site_yaml(HEADERS_YAML).unwrap();
-        for p in ["/signup", "/signup/index.html", "//signup/"] {
+        for p in ["/signup", "/signup/index.html", "//signup/", "/signup/index.html.gz"] {
             let resp = with_site_headers(&cfg, p, serve(&dist, p, false));
             assert_eq!(resp.status(), StatusCode::OK, "{p}");
+            assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
+        }
+        // Mixed case serves the same file on a case-insensitive filesystem
+        // (404 elsewhere); either way the rule headers are on the response.
+        for p in ["/SignUp", "/SIGNUP/Index.html", "/SignUp/index.html.GZ"] {
+            let resp = with_site_headers(&cfg, p, serve(&dist, p, false));
             assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
         }
     }

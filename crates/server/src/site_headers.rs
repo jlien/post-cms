@@ -233,12 +233,18 @@ fn validate_pattern(p: &str) -> Result<(), String> {
 }
 
 /// Canonical form for matching, the same file resolution `serve` uses:
-/// leading and trailing slashes trimmed, and a trailing `index.html` dropped,
-/// so `/signup`, `/signup/`, `//signup` and `/signup/index.html` all compare
-/// as `signup`. Without this a page could be fetched by an alias path that
-/// skips its headers.
+/// ASCII-lowercased, leading and trailing slashes trimmed, a trailing `.gz`
+/// dropped (the precompressed sibling is the same file), and a trailing
+/// `index.html` dropped, so `/signup`, `/signup/`, `//signup`,
+/// `/SignUp/Index.html` and `/signup/index.html.gz` all compare as `signup`.
+/// Without this a page could be fetched by an alias path that skips its
+/// headers.
 pub fn normalize(path: &str) -> String {
-    let mut p = path.trim_matches('/');
+    let lower = path.to_ascii_lowercase();
+    let mut p = lower.trim_matches('/');
+    if let Some(stripped) = p.strip_suffix(".gz") {
+        p = stripped;
+    }
     if p == "index.html" {
         p = "";
     } else if let Some(stripped) = p.strip_suffix("/index.html") {
@@ -342,7 +348,17 @@ headers:
     #[test]
     fn exact_path_matches_every_slash_form_and_index_alias() {
         let h = parse(SAMPLE).unwrap();
-        for p in ["/signup", "/signup/", "//signup", "/signup/index.html", "signup", "/SignUp"] {
+        for p in [
+            "/signup",
+            "/signup/",
+            "//signup",
+            "/signup/index.html",
+            "signup",
+            "/SignUp",
+            "/SIGNUP/Index.html",
+            "/signup/index.html.gz",
+            "/SignUp/INDEX.HTML.GZ",
+        ] {
             assert_eq!(
                 get(&h.resolve(p), "content-security-policy"),
                 Some("default-src 'self'"),
