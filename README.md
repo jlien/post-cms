@@ -134,6 +134,31 @@ Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 Cache-Control: HTML → `public, max-age=0, s-maxage=86400,
 stale-while-revalidate=604800`; RSS/sitemap/robots → `s-maxage=3600`.
 
+## Response headers
+
+`site.yaml` `headers:` adds response headers per path. The origin server (`crates/server`) reads it at startup.
+
+```yaml
+headers:
+  default:                         # every page, asset, redirect, and 404
+    X-Frame-Options: SAMEORIGIN
+  rules:                           # in order; a later rule wins per header
+    - path: /signup
+      headers:
+        Content-Security-Policy: "default-src 'self'; script-src 'self' forms.example.com"
+    - path: [/docs/*, /guides/*]
+      headers:
+        X-Robots-Tag: noindex
+```
+
+- `path` is a pattern or a list of patterns. Each starts with `/`. `*` matches any run of characters, `/` included, so `/docs/*` matches `/docs/a` and `/docs/a/b` but not `/docs`.
+- Matching ignores leading and trailing slashes, a trailing `.gz` (the precompressed sibling), a trailing `index.html`, and ASCII case, so `/signup`, `/signup/`, `/SignUp/Index.html`, and `/signup/index.html.gz` get the same headers. Query strings are not part of the match.
+- A response gets the `default` headers, then the headers of every matching rule in file order. A later value replaces an earlier one for the same header name.
+- Headers apply to every response from the static fallback: pages, assets, redirects (`redirects.yaml` and slash redirects), and 404s, all matched on the request path. `/health`, `/api/ask`, and `/mcp` get none.
+- The server always sends `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and a `Cache-Control` per file type. Site headers apply last, so a site can replace `Referrer-Policy` or `Cache-Control` for a path. A `Cache-Control` in `default` also replaces the server's value on redirects and 404s.
+- Validation at startup, which refuses to start on any error: names must be tokens (letters, digits, and ``!#$%&'*+-.^_`|~``); values must be non-empty strings with no control characters (CR, LF, NUL) and no surrounding whitespace; a name may appear once per map. These headers are rejected because the server owns them: hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-Range`, `Accept-Ranges`, `Location`, `Date`, `Server`, `Set-Cookie`, `Vary`, and `X-Content-Type-Options`.
+- The build does not emit a CDN `_headers` file. CDNs that read one combine every matching block instead of overriding per header, so the same config would mean something different there. Put the CDN in front of this origin and let it pass the headers through.
+
 ## MCP self-test
 
 ```bash

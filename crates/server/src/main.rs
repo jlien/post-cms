@@ -19,6 +19,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 
+mod site_headers;
+use site_headers::SiteHeaders;
+
 const HTML_CACHE_CONTROL: &str =
     "public, max-age=0, s-maxage=86400, stale-while-revalidate=604800";
 const XML_CACHE_CONTROL: &str = "public, s-maxage=3600";
@@ -69,6 +72,10 @@ fn main() -> anyhow::Result<()> {
     let redirects = load_redirects(&root)?;
     let _ = REDIRECTS.set(redirects);
     let _ = TRAILING_SLASH.set(load_trailing_slash(&root));
+    // site.yaml `headers:` is startup config too: a bad header name, a CR/LF
+    // in a value, or a server-owned header refuses to start.
+    let site_headers = load_site_headers(&root)?;
+    let _ = SITE_HEADERS.set(site_headers);
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -359,6 +366,38 @@ fn load_trailing_slash(root: &StdPath) -> bool {
         .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
         .and_then(|v| v.get("trailing_slash").and_then(|b| b.as_bool()))
         .unwrap_or(true)
+}
+
+static SITE_HEADERS: OnceLock<SiteHeaders> = OnceLock::new();
+
+fn load_site_headers(root: &StdPath) -> anyhow::Result<SiteHeaders> {
+    let path = root.join("site.yaml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(SiteHeaders::default());
+    };
+    let h = SiteHeaders::from_site_yaml(&raw).with_context(|| format!("{}", path.display()))?;
+    if !h.is_empty() {
+        eprintln!("headers: {}", site_headers::summary(&h));
+    }
+    Ok(h)
+}
+
+/// Add site.yaml `headers:` for `path` to a response from the static
+/// fallback (pages, assets, redirects, and 404s alike). Applied last, so a
+/// site value replaces the server's own Cache-Control or Referrer-Policy;
+/// headers the server must own are rejected at startup.
+fn with_site_headers(cfg: &SiteHeaders, path: &str, mut resp: Response) -> Response {
+    for (name, value) in cfg.resolve(path) {
+        resp.headers_mut().insert(name, value);
+    }
+    resp
+}
+
+fn site_headers_for(path: &str, resp: Response) -> Response {
+    match SITE_HEADERS.get() {
+        Some(cfg) if !cfg.is_empty() => with_site_headers(cfg, path, resp),
+        _ => resp,
+    }
 }
 
 /// The slash-free URL a request should 301 to, when the site uses
@@ -683,15 +722,16 @@ async fn serve_path(State(s): State<StaticDir>, req: Request) -> Response {
     // target in one hop. Otherwise normalize the slash form.
     if redirect_for(path).is_none() {
         if let Some(to) = slash_redirect(path, req.uri().query()) {
-            return redirect_response(&Redirect { from: String::new(), to, status: 301 });
+            let resp = redirect_response(&Redirect { from: String::new(), to, status: 301 });
+            return site_headers_for(path, resp);
         }
     }
-    serve(&s.0, path, gzip)
+    site_headers_for(path, serve(&s.0, path, gzip))
 }
 
 async fn index(State(s): State<StaticDir>, req: Request) -> Response {
     let gzip = wants_gzip(&req);
-    serve(&s.0, "index.html", gzip)
+    site_headers_for("/", serve(&s.0, "index.html", gzip))
 }
 
 async fn health() -> Response {
@@ -1041,5 +1081,105 @@ mod tests {
         assert!(resp.headers().get(header::LOCATION).is_none());
         let ok = Redirect { from: String::new(), to: "/fine".into(), status: 301 };
         assert_eq!(redirect_response(&ok).headers()[header::LOCATION], "/fine");
+    }
+
+    fn temp_dist(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("postcms-headers-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("signup")).unwrap();
+        std::fs::write(dir.join("signup/index.html"), "<p>signup</p>").unwrap();
+        std::fs::write(dir.join("signup/index.html.gz"), "gz").unwrap();
+        std::fs::write(dir.join("about.html"), "<p>about</p>").unwrap();
+        std::fs::write(dir.join("app.js"), "1").unwrap();
+        std::fs::write(dir.join("404.html"), "<p>nope</p>").unwrap();
+        dir
+    }
+
+    const HEADERS_YAML: &str = r#"
+headers:
+  default:
+    X-Frame-Options: SAMEORIGIN
+  rules:
+    - path: [/signup, /*.js]
+      headers:
+        Content-Security-Policy: "default-src 'self'"
+    - path: /signup
+      headers:
+        Referrer-Policy: no-referrer
+        Cache-Control: no-store
+"#;
+
+    #[test]
+    fn page_gets_rule_headers_and_keeps_security_headers() {
+        let dist = temp_dist("page");
+        let cfg = SiteHeaders::from_site_yaml(HEADERS_YAML).unwrap();
+        let resp = with_site_headers(&cfg, "/signup/", serve(&dist, "/signup/", false));
+        let h = resp.headers();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(h["content-security-policy"], "default-src 'self'");
+        assert_eq!(h["x-frame-options"], "SAMEORIGIN");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        // A rule replaces the server's own value, once.
+        assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(h.get_all(header::REFERRER_POLICY).iter().count(), 1);
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn other_pages_get_only_the_default() {
+        let dist = temp_dist("other");
+        let cfg = SiteHeaders::from_site_yaml(HEADERS_YAML).unwrap();
+        let resp = with_site_headers(&cfg, "/about.html", serve(&dist, "/about.html", false));
+        let h = resp.headers();
+        assert!(h.get("content-security-policy").is_none());
+        assert_eq!(h["x-frame-options"], "SAMEORIGIN");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::REFERRER_POLICY], "strict-origin-when-cross-origin");
+        assert_eq!(h[header::CACHE_CONTROL], HTML_CACHE_CONTROL);
+    }
+
+    #[test]
+    fn assets_404s_and_redirects_get_matching_headers() {
+        let dist = temp_dist("misc");
+        let cfg = SiteHeaders::from_site_yaml(HEADERS_YAML).unwrap();
+        let js = with_site_headers(&cfg, "/app.js", serve(&dist, "/app.js", false));
+        assert_eq!(js.headers()["content-security-policy"], "default-src 'self'");
+        let missing = with_site_headers(&cfg, "/missing", serve(&dist, "/missing", false));
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers()["x-frame-options"], "SAMEORIGIN");
+        assert!(missing.headers().get("content-security-policy").is_none());
+        let redirect = Redirect { from: String::new(), to: "/signup".into(), status: 301 };
+        let r = with_site_headers(&cfg, "/signup/", redirect_response(&redirect));
+        assert_eq!(r.headers()[header::LOCATION], "/signup");
+        assert_eq!(r.headers()["content-security-policy"], "default-src 'self'");
+    }
+
+    #[test]
+    fn index_alias_cannot_skip_a_page_rule() {
+        let dist = temp_dist("alias");
+        let cfg = SiteHeaders::from_site_yaml(HEADERS_YAML).unwrap();
+        for p in ["/signup", "/signup/index.html", "//signup/", "/signup/index.html.gz"] {
+            let resp = with_site_headers(&cfg, p, serve(&dist, p, false));
+            assert_eq!(resp.status(), StatusCode::OK, "{p}");
+            assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
+        }
+        // Mixed case serves the same file on a case-insensitive filesystem
+        // (404 elsewhere); either way the rule headers are on the response.
+        for p in ["/SignUp", "/SIGNUP/Index.html", "/SignUp/index.html.GZ"] {
+            let resp = with_site_headers(&cfg, p, serve(&dist, p, false));
+            assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
+        }
+    }
+
+    #[test]
+    fn startup_refuses_invalid_headers() {
+        let dir = env::temp_dir().join(format!("postcms-headers-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("site.yaml"), "headers:\n  default:\n    Content-Length: \"1\"\n").unwrap();
+        let err = load_site_headers(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("set by the server"), "{err:#}");
+        std::fs::write(dir.join("site.yaml"), "title: x\n").unwrap();
+        assert!(load_site_headers(&dir).unwrap().is_empty());
     }
 }
