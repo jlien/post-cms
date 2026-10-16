@@ -62,6 +62,9 @@ struct Collection {
     url_prefix: String,
     /// Whether to render the index page (schema.yaml `index`, default true).
     index: bool,
+    /// schema.yaml `references: {field: collection}`: fields whose values
+    /// are item slugs in another collection, resolved for templates as `refs`.
+    references: std::collections::BTreeMap<String, String>,
     items: Vec<CollectionItem>,
 }
 
@@ -69,6 +72,129 @@ impl Collection {
     fn item_path(&self, slug: &str) -> String {
         format!("{}/{}", self.url_prefix.trim_end_matches('/'), slug)
     }
+
+    /// `collection` in item and index contexts: name, title, and index URL.
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "title": self.title,
+            "url": page_url(&self.url_prefix),
+        })
+    }
+}
+
+/// meta.yaml `no_index: true` keeps a page or item out of sitemap.xml.
+fn is_no_index(fields: &serde_json::Map<String, serde_json::Value>) -> bool {
+    matches!(fields.get("no_index"), Some(serde_json::Value::Bool(true)))
+}
+
+/// Every meta.yaml key as template data (`fields.<key>` on collection items,
+/// `page.fields.<key>` on pages). Lists keep their string entries; nested
+/// mappings become null.
+fn yaml_to_fields(map: &serde_yaml::Mapping) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    for (k, v) in map {
+        let key = k.as_str().unwrap_or_default().to_string();
+        let json_v = match v {
+            serde_yaml::Value::String(s) => serde_json::Value::String(s.clone()),
+            serde_yaml::Value::Number(n) => {
+                serde_json::Value::Number(serde_json::Number::from_f64(n.as_f64().unwrap_or(0.0)).unwrap_or(serde_json::Number::from(0)))
+            }
+            serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
+            serde_yaml::Value::Sequence(seq) => serde_json::Value::Array(
+                seq.iter()
+                    .filter_map(|x| x.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                    .collect(),
+            ),
+            _ => serde_json::Value::Null,
+        };
+        fields.insert(key, json_v);
+    }
+    fields
+}
+
+/// Resolve an item's reference fields (schema.yaml `references:`) into
+/// `{field: {slug, title, description, url, published, fields}}`, or a list of
+/// those for list fields. One level deep: the referenced item's own
+/// references stay slugs in its `fields`. `None` when the collection declares
+/// no references, so templates of other collections see no `refs` at all.
+fn resolve_refs(
+    coll: &Collection,
+    item: &CollectionItem,
+    collections: &[Collection],
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    if coll.references.is_empty() {
+        return Ok(None);
+    }
+    let mut refs = serde_json::Map::new();
+    for (field, target) in &coll.references {
+        let Some(value) = item.fields.get(field) else { continue };
+        let target_coll = collections.iter().find(|c| &c.name == target).ok_or_else(|| {
+            anyhow::anyhow!(
+                "collection `{}` item `{}`: field `{}` references collection `{}`, which does not exist",
+                coll.name,
+                item.slug,
+                field,
+                target
+            )
+        })?;
+        let one = |slug: &str| -> Result<serde_json::Value> {
+            let found = target_coll.items.iter().find(|i| i.slug == slug).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "collection `{}` item `{}`: field `{}` references `{}`, no such item in collection `{}`",
+                    coll.name,
+                    item.slug,
+                    field,
+                    slug,
+                    target
+                )
+            })?;
+            Ok(serde_json::json!({
+                "slug": found.slug,
+                "title": found.title,
+                "description": found.description,
+                "url": page_url(&target_coll.item_path(&found.slug)),
+                "published": found.published,
+                "fields": found.fields,
+            }))
+        };
+        let resolved = match value {
+            serde_json::Value::String(s) => one(s)?,
+            serde_json::Value::Array(list) => serde_json::Value::Array(
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(one)
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            _ => continue,
+        };
+        refs.insert(field.clone(), resolved);
+    }
+    Ok(Some(refs))
+}
+
+/// Context shared by item pages (live and draft): title, slug, description,
+/// date, fields, collection, and refs when the schema declares references.
+fn item_ctx(
+    coll: &Collection,
+    item: &CollectionItem,
+    collections: &[Collection],
+    body: &str,
+) -> Result<TeraContext> {
+    let mut ctx = TeraContext::new();
+    ctx.insert("title", &item.title);
+    ctx.insert("slug", &item.slug);
+    ctx.insert("description", &item.description);
+    if let Some(d) = item.date {
+        ctx.insert("date", &d.to_string());
+    }
+    ctx.insert("fields", &item.fields);
+    ctx.insert("collection", &coll.summary());
+    if let Some(refs) = resolve_refs(coll, item, collections)? {
+        ctx.insert("refs", &refs);
+    }
+    ctx.insert("body", body);
+    Ok(ctx)
 }
 
 /// URL style for every emitted link (sitemap, search index, llms.txt, RSS,
@@ -142,6 +268,10 @@ struct PageMeta {
     /// Template to render with (default page.html).
     #[serde(default)]
     template: Option<String>,
+    /// Every meta.yaml key (known and extra, e.g. `no_index`, `seo_title`,
+    /// `og_image`), exposed to templates as `page.fields`.
+    #[serde(skip)]
+    fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl PageMeta {
@@ -162,6 +292,7 @@ impl PageMeta {
         ctx.insert("lang", &self.lang);
         ctx.insert("description", &self.description);
         ctx.insert("url", &page_url(&self.site_path()));
+        ctx.insert("page", &serde_json::json!({ "fields": self.fields }));
         ctx.insert("body", body);
         ctx
     }
@@ -200,6 +331,11 @@ struct SiteConfig {
     /// robots.txt rules (`robots: {allow, disallow, sitemap, extra}`).
     #[serde(default)]
     robots: RobotsCfg,
+    /// Site origin with no trailing slash, passed to every template as
+    /// `base_url`. main() sets it from `site_base_url` (SITE_BASE_URL env,
+    /// then site.yaml `base_url`, then the local origin).
+    #[serde(default)]
+    base_url: String,
 }
 
 /// site.yaml `llms:`. Every key is optional; unset keys fall back to the
@@ -333,6 +469,7 @@ impl SiteConfig {
             sanity: None,
             llms: LlmsCfg::default(),
             robots: RobotsCfg::default(),
+            base_url: String::new(),
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -342,6 +479,7 @@ impl SiteConfig {
         ctx.insert("site_title", &self.title);
         // Available to every template (headers/footers), not just home.html.
         ctx.insert("site_tagline", &self.tagline);
+        ctx.insert("base_url", &self.base_url);
         ctx.insert("theme", &style.theme);
         ctx.insert("root", root);
         ctx.insert("lang", "en");
@@ -418,7 +556,8 @@ fn main() -> Result<()> {
     // Theme asset kit (fonts, icons, images) → dist/assets/<theme>/
     copy_theme_assets(&theme_dir, &dist, &theme_name)?;
 
-    let cfg = SiteConfig::load(&root);
+    let mut cfg = SiteConfig::load(&root);
+    cfg.base_url = site_base_url(&root);
     let _ = TRAILING_SLASH.set(cfg.trailing_slash);
     let posts_dir = root.join("content/posts");
     let posts = if posts_dir.is_dir() { load_posts(&posts_dir)? } else { Vec::new() };
@@ -443,7 +582,8 @@ fn main() -> Result<()> {
     if !posts.is_empty() {
         render_rss(&root, &dist, &posts)?;
     }
-    render_sitemap(&root, &dist, &posts, &pages, &collections, cfg.builtin_pages)?;
+    let redirect_sources = load_redirect_sources(&root)?;
+    render_sitemap(&root, &dist, &posts, &pages, &collections, cfg.builtin_pages, &redirect_sources)?;
     let site_base = site_base_url(&root);
     fs::write(dist.join("robots.txt"), robots_txt(&cfg.robots, &site_base))
         .context("write robots.txt")?;
@@ -1264,7 +1404,7 @@ fn load_collections(
         // references: {field: collection} — the value names an item in
         // another typed collection (cross-item integrity). Validated after
         // all collections load, since the target may be defined later.
-        let references: std::collections::HashMap<String, String> = schema
+        let references: std::collections::BTreeMap<String, String> = schema
             .get("references")
             .and_then(|v| v.as_mapping())
             .map(|m| {
@@ -1501,24 +1641,7 @@ fn load_collections(
                 .and_then(|v| v.as_str())
                 .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
             // Every meta key flows to the template as `fields.<key>`.
-            let mut fields = serde_json::Map::new();
-            for (k, v) in &map {
-                let key = k.as_str().unwrap_or_default().to_string();
-                let json_v = match v {
-                    serde_yaml::Value::String(s) => serde_json::Value::String(s.clone()),
-                    serde_yaml::Value::Number(n) => {
-                        serde_json::Value::Number(serde_json::Number::from_f64(n.as_f64().unwrap_or(0.0)).unwrap_or(serde_json::Number::from(0)))
-                    }
-                    serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
-                    serde_yaml::Value::Sequence(seq) => serde_json::Value::Array(
-                        seq.iter()
-                            .filter_map(|x| x.as_str().map(|s| serde_json::Value::String(s.to_string())))
-                            .collect(),
-                    ),
-                    _ => serde_json::Value::Null,
-                };
-                fields.insert(key, json_v);
-            }
+            let fields = yaml_to_fields(&map);
             items.push(CollectionItem {
                 slug,
                 title: get_str("title"),
@@ -1542,6 +1665,7 @@ fn load_collections(
             index_template,
             url_prefix,
             index,
+            references,
             items,
         });
     }
@@ -1641,20 +1765,12 @@ fn render_draft_collections(
             } else {
                 String::new()
             };
-            let mut ctx = TeraContext::new();
-            ctx.insert("title", &item.title);
-            ctx.insert("slug", &item.slug);
-            ctx.insert("description", &item.description);
-            if let Some(d) = item.date {
-                ctx.insert("date", &d.to_string());
-            }
-            ctx.insert("fields", &item.fields);
+            let mut ctx = item_ctx(coll, item, collections, &body)?;
             if let Some(serde_json::Value::String(notes)) =
                 item.fields.get("agent_notes").cloned()
             {
                 ctx.insert("agent_notes", &notes);
             }
-            ctx.insert("body", &body);
             ctx.insert("draft", &true);
             ctx.extend(cfg.base_ctx(style, root));
             let html = tera
@@ -1704,15 +1820,7 @@ fn render_collections(
         }
         for item in coll.items.iter().filter(|i| i.published) {
             let body = item_body(item, tera, cfg)?;
-            let mut ctx = TeraContext::new();
-            ctx.insert("title", &item.title);
-            ctx.insert("slug", &item.slug);
-            ctx.insert("description", &item.description);
-            if let Some(d) = item.date {
-                ctx.insert("date", &d.to_string());
-            }
-            ctx.insert("fields", &item.fields);
-            ctx.insert("body", &body);
+            let mut ctx = item_ctx(coll, item, collections, &body)?;
             ctx.insert("url", &page_url(&coll.item_path(&item.slug)));
             ctx.extend(cfg.base_ctx(style, root));
             let html = tera
@@ -1728,6 +1836,11 @@ fn render_collections(
             for (k, v) in &item.fields {
                 row.insert(k.clone(), v.clone());
             }
+            // Index rows carry resolved references too, unless the item has
+            // its own `refs` field (kept as is).
+            if let Some(refs) = resolve_refs(coll, item, collections)? {
+                row.entry("refs").or_insert(serde_json::Value::Object(refs));
+            }
             listed.push(serde_json::Value::Object(row));
         }
         if !coll.index {
@@ -1736,6 +1849,7 @@ fn render_collections(
         let mut ctx = TeraContext::new();
         ctx.insert("coll_name", &coll.name);
         ctx.insert("coll_title", &coll.title);
+        ctx.insert("collection", &coll.summary());
         ctx.insert("items", &listed);
         ctx.insert("url", &page_url(&coll.url_prefix));
         ctx.extend(cfg.base_ctx(style, root));
@@ -2109,8 +2223,11 @@ fn load_pages(dir: &Path) -> Result<Vec<Page>> {
         }
         let raw = fs::read_to_string(&meta_path)
             .with_context(|| format!("read {}", meta_path.display()))?;
-        let meta: PageMeta =
+        let mut meta: PageMeta =
             serde_yaml::from_str(&raw).with_context(|| format!("parse {}", meta_path.display()))?;
+        if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
+            meta.fields = yaml_to_fields(&map);
+        }
         pages.push(Page { meta, dir: path });
     }
     Ok(pages)
@@ -2165,6 +2282,28 @@ fn render_rss(root: &Path, dist: &Path, posts: &[Post]) -> Result<()> {
     Ok(())
 }
 
+/// Source paths of redirects.yaml (slash-trimmed), which never belong in
+/// sitemap.xml. Missing file: none. Same shape the origin loads: a mapping
+/// whose keys are paths.
+fn load_redirect_sources(root: &Path) -> Result<std::collections::HashSet<String>> {
+    let path = root.join("redirects.yaml");
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    match parsed {
+        serde_yaml::Value::Null => Ok(Default::default()),
+        serde_yaml::Value::Mapping(map) => Ok(map
+            .keys()
+            .filter_map(|k| k.as_str())
+            .map(|k| k.trim_matches('/').to_string())
+            .collect()),
+        _ => bail!("{}: must be a mapping of from -> to", path.display()),
+    }
+}
+
 fn render_sitemap(
     root: &Path,
     dist: &Path,
@@ -2172,26 +2311,57 @@ fn render_sitemap(
     pages: &[Page],
     collections: &[Collection],
     builtin_pages: bool,
+    redirect_sources: &std::collections::HashSet<String>,
 ) -> Result<()> {
+    let xml = sitemap_xml(
+        &site_base_url(root),
+        posts,
+        pages,
+        collections,
+        builtin_pages,
+        redirect_sources,
+    );
+    fs::write(dist.join("sitemap.xml"), xml).context("write sitemap.xml")?;
+    Ok(())
+}
+
+/// sitemap.xml: published pages, posts, and collection items, minus any
+/// page or item whose meta sets `no_index: true` and any path that is a
+/// redirects.yaml source.
+fn sitemap_xml(
+    site_base: &str,
+    posts: &[Post],
+    pages: &[Page],
+    collections: &[Collection],
+    builtin_pages: bool,
+    redirect_sources: &std::collections::HashSet<String>,
+) -> String {
+    let listed = |path: &str| !redirect_sources.contains(path.trim_matches('/'));
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
-    let live_pages: Vec<&Page> = pages.iter().filter(|p| p.meta.published).collect();
-    let site_base = site_base_url(root);
+    let live_pages: Vec<&Page> = pages
+        .iter()
+        .filter(|p| p.meta.published && !is_no_index(&p.meta.fields))
+        .collect();
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
     if builtin_pages {
-        xml.push_str(&format!("<url><loc>{}/</loc></url>\n", site_base));
-        xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url("/blog")));
-        xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url("/contact")));
+        for path in ["/", "/blog", "/contact"] {
+            if listed(path) {
+                xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url(path)));
+            }
+        }
     }
     for page in &live_pages {
-        xml.push_str(&format!(
-            "<url><loc>{}{}</loc></url>\n",
-            site_base,
-            page_url(&page.meta.site_path())
-        ));
+        let path = page.meta.site_path();
+        if listed(&path) {
+            xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url(&path)));
+        }
     }
     for post in published.iter().copied() {
+        if !listed(&post.url_path()) {
+            continue;
+        }
         xml.push_str(&format!(
             "<url><loc>{}</loc><lastmod>{}</lastmod></url>\n",
             format!("{}{}", site_base, post.url_path()),
@@ -2206,7 +2376,7 @@ fn render_sitemap(
         if live_items.is_empty() {
             continue;
         }
-        if coll.index {
+        if coll.index && listed(&coll.url_prefix) {
             xml.push_str(&format!(
                 "<url><loc>{}{}</loc></url>\n",
                 site_base,
@@ -2214,16 +2384,15 @@ fn render_sitemap(
             ));
         }
         for item in live_items {
-            xml.push_str(&format!(
-                "<url><loc>{}{}</loc></url>\n",
-                site_base,
-                page_url(&coll.item_path(&item.slug))
-            ));
+            let path = coll.item_path(&item.slug);
+            if is_no_index(&item.fields) || !listed(&path) {
+                continue;
+            }
+            xml.push_str(&format!("<url><loc>{}{}</loc></url>\n", site_base, page_url(&path)));
         }
     }
     xml.push_str("</urlset>\n");
-    fs::write(dist.join("sitemap.xml"), xml).context("write sitemap.xml")?;
-    Ok(())
+    xml
 }
 
 /// robots.txt from site.yaml `robots:`. With no config this is exactly
@@ -2756,6 +2925,7 @@ mod tests {
             index_template: "collection.html".into(),
             url_prefix: "/events/speakers/".into(),
             index: false,
+            references: Default::default(),
             items: vec![],
         };
         assert_eq!(c.item_path("acme"), "/events/speakers/acme");
@@ -2821,6 +2991,7 @@ mod tests {
             index_template: "collection.html".into(),
             url_prefix: "/events/speakers".into(),
             index: true,
+            references: Default::default(),
             items: vec![item("acme", true), item("draft", false)],
         };
         (pages, vec![coll])
@@ -3004,5 +3175,229 @@ mod tests {
         fs::remove_file(root.join(".cache/sanity/articles/response.json")).unwrap();
         let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
         assert!(err.contains("collection `articles`") && err.contains("SANITY_OFFLINE=1"), "{err}");
+    }
+
+    // ---- E12: template data ---------------------------------------------
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    fn raw_tera(templates: &[(&str, &str)]) -> Tera {
+        let mut tera = Tera::default();
+        tera.add_raw_templates(templates.to_vec()).unwrap();
+        tera
+    }
+
+    /// Tera autoescapes `/` in .html templates; compare on plain slashes.
+    fn unslash(html: &str) -> String {
+        html.replace("&#x2F;", "/")
+    }
+
+    fn plain_style() -> Styling {
+        Styling { css: String::new(), hash: "h".into(), theme: "default".into() }
+    }
+
+    /// `articles` reference `authors` (one author, a list of reviewers);
+    /// authors reference `teams`, which must stay a slug (one level deep).
+    fn reference_site(root: &Path) {
+        write(root, "content/teams/schema.yaml", "title: Teams\n");
+        write(root, "content/teams/platform/meta.yaml", "title: Platform\npublished: true\n");
+        write(
+            root,
+            "content/authors/schema.yaml",
+            "title: Authors\nurl_prefix: /people\nreferences:\n  team: teams\n",
+        );
+        write(
+            root,
+            "content/authors/ada/meta.yaml",
+            "title: Ada\ndescription: Writes guides.\npublished: true\nteam: platform\nrole: Editor\n",
+        );
+        write(root, "content/authors/lin/meta.yaml", "title: Lin\npublished: true\nteam: platform\n");
+        write(
+            root,
+            "content/articles/schema.yaml",
+            "title: Articles\nreferences:\n  author: authors\n  reviewers: authors\n",
+        );
+        write(
+            root,
+            "content/articles/edge-basics/meta.yaml",
+            "title: Edge Basics\npublished: true\nauthor: ada\nreviewers: [lin, ada]\n",
+        );
+        write(root, "content/articles/edge-basics/index.mdx", "Body.\n");
+        write(root, "content/articles/no-author/meta.yaml", "title: No Author\npublished: true\n");
+    }
+
+    fn ref_templates() -> Tera {
+        raw_tera(&[
+            (
+                "collection-item.html",
+                "{{ base_url }}|{{ collection.name }}|{{ collection.title }}|{{ collection.url }}|\
+                 {% if refs is defined %}{% if refs.author %}{{ refs.author.title }}@{{ refs.author.url }}\
+                 ({{ refs.author.fields.role | default(value='') }};team={{ refs.author.fields.team }};\
+                 nested={{ refs.author.refs is defined }})|{% for r in refs.reviewers %}{{ r.slug }},{% endfor %}\
+                 {% else %}none{% endif %}{% else %}no-refs{% endif %}",
+            ),
+            (
+                "collection.html",
+                "{{ base_url }}|{{ coll_name }}|{{ collection.name }}|{{ collection.title }}|\
+                 {% for i in items %}{{ i.title }}={% if i.refs is defined and i.refs.author %}{{ i.refs.author.title }}{% else %}-{% endif %};{% endfor %}",
+            ),
+        ])
+    }
+
+    fn built(root: &Path) -> Vec<Collection> {
+        load_collections(&root.join("content"), &offline_ctx(root)).unwrap().0
+    }
+
+    #[test]
+    fn references_resolve_one_level_deep_for_items_and_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        reference_site(&root);
+        let collections = built(&root);
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.base_url = "https://example.com".into();
+        let dist = tmp.path().join("dist");
+        render_collections(&ref_templates(), &dist, &collections, &plain_style(), &cfg, "").unwrap();
+        let read = |rel: &str| unslash(&fs::read_to_string(dist.join(rel)).unwrap());
+
+        assert_eq!(
+            read("articles/edge-basics/index.html"),
+            "https://example.com|articles|Articles|/articles/|Ada@/people/ada/(Editor;team=platform;nested=false)|lin,ada,"
+        );
+        assert_eq!(read("articles/no-author/index.html"), "https://example.com|articles|Articles|/articles/|none");
+        // Authors resolve their own team reference; teams declare none.
+        assert!(read("people/ada/index.html").starts_with("https://example.com|authors|Authors|/people/|"));
+        assert!(read("teams/platform/index.html").ends_with("|no-refs"), "{}", read("teams/platform/index.html"));
+        assert_eq!(
+            read("articles/index.html"),
+            "https://example.com|articles|articles|Articles|Edge Basics=Ada;No Author=-;"
+        );
+    }
+
+    #[test]
+    fn unknown_reference_fails_the_build_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        reference_site(&root);
+        write(&root, "content/articles/edge-basics/meta.yaml", "title: Edge Basics\npublished: true\nauthor: grace\n");
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(
+            err.contains("edge-basics/meta.yaml") && err.contains("`author` references `grace`") && err.contains("`authors`"),
+            "{err}"
+        );
+
+        // resolve_refs names the item too, if it is ever reached unvalidated.
+        reference_site(&root);
+        let mut collections = built(&root);
+        let articles = collections.iter_mut().find(|c| c.name == "articles").unwrap();
+        articles.items[0].fields.insert("author".into(), "grace".into());
+        let articles = collections.iter().find(|c| c.name == "articles").unwrap();
+        let err = format!("{:#}", resolve_refs(articles, &articles.items[0], &collections).unwrap_err());
+        assert!(err.contains("collection `articles` item `edge-basics`") && err.contains("`grace`"), "{err}");
+    }
+
+    #[test]
+    fn pages_expose_every_meta_key_as_page_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        write(
+            &root,
+            "content/pages/about/meta.yaml",
+            "title: About\nslug: about\nno_index: true\nseo_title: About Example\nog_image: https://example.com/og.png\n",
+        );
+        write(&root, "content/pages/about/index.mdx", "Hi.\n");
+        write(&root, "content/pages/plain/meta.yaml", "title: Plain\nslug: plain\n");
+        write(&root, "content/pages/plain/index.mdx", "Hi.\n");
+        let pages = load_pages(&root.join("content/pages")).unwrap();
+        let tera = raw_tera(&[(
+            "page.html",
+            "{{ base_url }}|{{ page.fields.seo_title | default(value=title) }}|\
+             {{ page.fields.og_image | default(value='') }}|{{ page.fields.no_index | default(value=false) }}|{{ page.fields.slug }}",
+        )]);
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.base_url = "https://example.com".into();
+        let dist = tmp.path().join("dist");
+        render_pages(&tera, &dist, &pages, &plain_style(), &cfg, "").unwrap();
+        assert_eq!(
+            unslash(&fs::read_to_string(dist.join("about/index.html")).unwrap()),
+            "https://example.com|About Example|https://example.com/og.png|true|about"
+        );
+        assert_eq!(
+            unslash(&fs::read_to_string(dist.join("plain/index.html")).unwrap()),
+            "https://example.com|Plain||false|plain"
+        );
+    }
+
+    #[test]
+    fn builtin_templates_get_base_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tera = raw_tera(&[
+            ("home.html", "home {{ base_url }}"),
+            ("blog.html", "blog {{ base_url }}"),
+            ("contact.html", "contact {{ base_url }}"),
+            ("404.html", "404 {{ base_url }}"),
+        ]);
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.base_url = "https://example.com".into();
+        let dist = tmp.path();
+        render_home(&tera, dist, &[], &plain_style(), &cfg, "").unwrap();
+        render_blog(&tera, dist, &[], &plain_style(), &cfg, "").unwrap();
+        render_contact(&tera, dist, &plain_style(), &cfg, "").unwrap();
+        render_404(&tera, dist, &plain_style(), &cfg, "").unwrap();
+        for (file, want) in [
+            ("index.html", "home https://example.com"),
+            ("blog/index.html", "blog https://example.com"),
+            ("contact/index.html", "contact https://example.com"),
+            ("404.html", "404 https://example.com"),
+        ] {
+            assert_eq!(unslash(&fs::read_to_string(dist.join(file)).unwrap()), want);
+        }
+        // site.yaml `base_url` parses straight into the config too.
+        assert_eq!(test_cfg("base_url: https://example.com\n").base_url, "https://example.com");
+    }
+
+    #[test]
+    fn sitemap_skips_no_index_and_redirect_sources() {
+        let (mut pages, mut colls) = sample_content();
+        let none = std::collections::HashSet::new();
+        let before = sitemap_xml("https://example.com", &[], &pages, &colls, true, &none);
+        assert!(before.contains("<loc>https://example.com/docs/ops/</loc>"));
+        assert!(before.contains("<loc>https://example.com/events/speakers/acme/</loc>"));
+        assert!(before.contains("<loc>https://example.com/blog/</loc>"));
+
+        pages[1].meta.fields.insert("no_index".into(), true.into());
+        colls[0].items[0].fields.insert("no_index".into(), true.into());
+        let redirects: std::collections::HashSet<String> =
+            ["blog".to_string(), "".to_string()].into_iter().collect();
+        let after = sitemap_xml("https://example.com", &[], &pages, &colls, true, &redirects);
+        assert!(!after.contains("/docs/ops/"), "{after}");
+        assert!(!after.contains("/events/speakers/acme/"), "{after}");
+        assert!(!after.contains("<loc>https://example.com/blog/</loc>"), "{after}");
+        assert!(!after.contains("<loc>https://example.com/</loc>"), "{after}");
+        assert!(after.contains("<loc>https://example.com/contact/</loc>"), "{after}");
+        assert!(after.contains("<loc>https://example.com/events/speakers/</loc>"), "{after}");
+
+        // `no_index: false` and string values change nothing.
+        pages[1].meta.fields.insert("no_index".into(), false.into());
+        colls[0].items[0].fields.insert("no_index".into(), "true".into());
+        assert_eq!(sitemap_xml("https://example.com", &[], &pages, &colls, true, &none), before);
+    }
+
+    #[test]
+    fn redirect_sources_load_slash_trimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(load_redirect_sources(tmp.path()).unwrap().is_empty());
+        write(tmp.path(), "redirects.yaml", "# comment only\n");
+        assert!(load_redirect_sources(tmp.path()).unwrap().is_empty());
+        write(tmp.path(), "redirects.yaml", "/old-page/: {to: /new-page/, status: 302}\n/events/old: /events/\n");
+        let got = load_redirect_sources(tmp.path()).unwrap();
+        assert!(got.contains("old-page") && got.contains("events/old") && got.len() == 2, "{got:?}");
+        write(tmp.path(), "redirects.yaml", "- /a\n");
+        let err = format!("{:#}", load_redirect_sources(tmp.path()).unwrap_err());
+        assert!(err.contains("redirects.yaml") && err.contains("mapping"), "{err}");
     }
 }

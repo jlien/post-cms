@@ -51,6 +51,43 @@ an AI agent do all content operations.
 cargo run -p build      # renders dist/
 ```
 
+## Template data
+
+Every template (pages, collection items and indexes, home, blog, contact, 404) gets `base_url`: the site origin with no trailing slash, from the `SITE_BASE_URL` env var, then site.yaml `base_url`, then `http://localhost:8787`. For example, a canonical tag: `<link rel="canonical" href="{{ base_url }}{{ url }}">`.
+
+Pages (`content/pages/<slug>/meta.yaml`) accept any extra keys beyond `title`, `slug`, `description`, `path`, `template`, `lang`, and `published`. Templates see every key, known and extra, as `page.fields`, the same way collection items see `fields`:
+
+```yaml
+title: About
+slug: about
+seo_title: About Example
+og_image: https://example.com/og.png
+no_index: true
+```
+
+```html
+<title>{{ page.fields.seo_title | default(value=title) }}</title>
+```
+
+Collection item and index templates get `collection`: `{name, title, url}` (`url` is the index path). Index templates also keep `coll_name` and `coll_title`.
+
+A schema can declare reference fields whose values are item slugs in another collection. The build fails, naming the file, when a value is not an item of the target collection:
+
+```yaml
+# content/articles/schema.yaml
+references:
+  author: authors      # author: ada
+  reviewers: authors   # reviewers: [ada, lin]
+```
+
+Item templates of that collection get `refs.<field>`: `{slug, title, description, url, published, fields}` for a single slug, or a list of those for a list of slugs. Rows in `items` on the collection index carry the same `refs`, unless an item has its own `refs` field. Resolution is one level deep: a referenced item's own references stay slugs in its `fields`. Collections without `references` get no `refs`.
+
+```html
+{% if refs.author %}<a href="{{ refs.author.url }}">{{ refs.author.title }}</a>{% endif %}
+```
+
+`sitemap.xml` leaves out any page or collection item whose meta sets `no_index: true` (a YAML boolean), and any path that is a source in `redirects.yaml`. The page itself still builds; emitting a `noindex` robots tag is up to the template (`page.fields.no_index`, `fields.no_index`).
+
 ## Portable Text templates
 
 Collection items stored as `index.pt.json` render through `crates/build/src/pt.rs`. Custom block types need `templates/pt/<_type>.html` (the block is `block`; nested Portable Text fields arrive as `<field>_html`). Built-ins render with engine defaults unless the site adds an override:
