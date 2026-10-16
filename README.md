@@ -122,6 +122,46 @@ Collection items stored as `index.pt.json` render through `crates/build/src/pt.r
 
 Templates autoescape. Use `| safe` only for `*_html` values, which the engine rendered itself; never on `href`, `src`, `alt`, `caption`, or `block` fields. Link `href` values must be http(s), `mailto:`, `tel:`, a site path (`/x`), `#fragment`, or `?query`, and image `src` values must be http(s) or a site path; anything else is dropped (link text kept, image omitted) and printed as a warning naming the item; the build still succeeds. Unknown custom block types still fail the build. Templates can apply the same checks to custom block fields with the `safe_href` and `safe_src` filters, for example `{{ block.url | safe_href }}`, which print the URL or an empty string. Custom blocks nest at most 32 levels. `pt-render --templates templates` uses the same overrides.
 
+## Images
+
+`site.yaml` `images:` turns on a build-time image pipeline (`crates/build/src/images.rs`). Without the block nothing changes: the helpers below print a plain `<img>` with the original URL, and the build output is byte-identical.
+
+```yaml
+images:
+  allowed_hosts: [cdn.example.com, "*.media.example.org"]   # remote hosts images may come from
+  # every key below is optional; these are the defaults
+  widths: [320, 480, 640, 768, 1024, 1280, 1600, 1920]
+  formats: [webp]          # add avif for AVIF too (slower: rav1e, pure Rust)
+  webp_quality: 75
+  avif_quality: 55
+  avif_speed: 8            # 1 slow/small to 10 fast
+  jpeg_quality: 80
+  fallback_width: 1280     # the single <img src> fallback when a modern format is on
+  max_bytes: 26214400      # per response
+  max_pixels: 50000000     # width x height, checked from the header before decoding
+  timeout_secs: 30
+  cache_dir: .cache/images # relative to the site root; IMAGES_CACHE_DIR overrides
+  output_dir: assets/img   # under dist/
+```
+
+Templates:
+
+```jinja
+{{ image(src=item.cover, alt=item.title, sizes="(min-width: 60em) 33vw, 100vw", class="card__img") }}
+{{ image(src=hero, alt="", loading="eager", fetchpriority="high") }}
+<div style="background-image: url({{ bg | image_url }})"></div>
+<meta property="og:image" content="{{ cover | image_url(width=1200, absolute=true) }}">
+```
+
+`image()` takes `src`, `alt`, `sizes` (default `auto, 100vw` when lazy, else `100vw`), `class`, `loading` (`lazy` default, or `eager`), `fetchpriority`, and optional `width`/`height` to override the attributes. It prints a `<picture>` with one `<source>` per modern format and an `<img>` with `width`, `height` (the largest variant's size, for layout stability), `loading`, and `decoding="async"`. When the `<picture>` wrapper must not affect layout, add `picture { display: contents; }`. If CSS sets the image's `width: auto`, the browser sizes it from `sizes`, so keep `sizes` at least as wide as the slot. `image_url` returns the local URL of the largest fallback variant, or of `width` (clamped to the source); `absolute=true` prefixes `base_url`. Portable Text image blocks without a `pt/image.html` override render through `image()`; an override can call `image(src=src, alt=alt, width=width, height=height)` itself.
+
+How it works: rendering records each call and prints a placeholder. After every page is rendered, the build fetches each distinct source once (in parallel), reads its size from the header, writes `/<output_dir>/<hash>-<width>.<ext>` variants (in parallel), and replaces the placeholders, before precompression. Only images a template uses are fetched and written.
+
+- Sources: `https://` URLs on `allowed_hosts`, and site paths (`/assets/...`) resolved inside `dist/`. Other hosts and plain http keep their URL silently. A failed fetch, a refused image, or an unsupported format keeps its URL with a `warning: image <url>: <reason>` line; the build still succeeds.
+- Variants: the configured widths below the source width plus the source width itself (never upscaled), in each modern format, plus a fallback in the source format (JPEG, PNG, or WebP). EXIF orientation is applied, then all metadata is dropped. SVG, GIF, and animated PNG/WebP are copied unchanged under a hashed name.
+- Cache: fetched bytes are stored by sha256 under `cache_dir/src/`, URLs map to them in `cache_dir/urls/`, and encoded variants live in `cache_dir/out/`. Remote URLs are treated as immutable: delete the cache to refetch. `IMAGES_OFFLINE=1` builds from the cache only. Output names include a fingerprint of the quality settings, so changing them never reuses a cached name. `IMAGES_JOBS` sets the encode threads (default: all cores).
+- Security: https only, the host must be allowed on every redirect hop (at most 3), the resolver drops loopback, private, link-local, CGNAT, and other reserved addresses (so DNS cannot point an allowed name inward), no proxy, a global timeout, a body cap, and a pixel cap before decode. Output and cache names are hex digests and numbers only; site paths cannot leave `dist/` (`..`, encoded separators, and symlinks are refused). An SVG with script, event handlers, `foreignObject`, entity declarations, link animations, or references other than `#fragment` and inline raster `data:image/...` is refused. The origin server sends SVG with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox`.
+
 ## Serve
 
 ```bash

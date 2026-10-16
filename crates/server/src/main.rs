@@ -46,6 +46,7 @@ fn content_type_for(path: &StdPath) -> (&'static str, &'static str) {
         Some("png") => ("image/png", "public, max-age=31536000, immutable"),
         Some("jpg") | Some("jpeg") => ("image/jpeg", "public, max-age=31536000, immutable"),
         Some("webp") => ("image/webp", "public, max-age=31536000, immutable"),
+        Some("avif") => ("image/avif", "public, max-age=31536000, immutable"),
         Some("gif") => ("image/gif", "public, max-age=31536000, immutable"),
         Some("mp4") => ("video/mp4", "public, max-age=31536000, immutable"),
         Some("webm") => ("video/webm", "public, max-age=31536000, immutable"),
@@ -438,7 +439,13 @@ fn harden(resp: &mut Response) {
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin"));
     headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    // An SVG opened directly is a document: no script, no outside loads.
+    if headers.get(header::CONTENT_TYPE).is_some_and(|v| v == "image/svg+xml") {
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(SVG_CSP));
+    }
 }
+
+const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
 
 /// Serve a file under dist/. A bare path that resolves to a directory is
 /// treated as ".../index.html" (so /about/ and /about both work). Path
@@ -1023,6 +1030,20 @@ async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_types_and_svg_policy() {
+        assert_eq!(content_type_for(StdPath::new("a/b.avif")).0, "image/avif");
+        let root = std::env::temp_dir().join(format!("postcms-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("x.svg"), "<svg/>").unwrap();
+        std::fs::write(root.join("x.png"), "png").unwrap();
+        let svg = serve(&root, "x.svg", false);
+        assert_eq!(svg.headers()[header::CONTENT_SECURITY_POLICY], SVG_CSP);
+        let png = serve(&root, "x.png", false);
+        assert!(png.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn redirect_targets_allow_paths_and_urls() {

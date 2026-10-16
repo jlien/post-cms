@@ -20,6 +20,8 @@ chrono.workspace = true
 serde_json.workspace = true
 fastembed.workspace = true
 image.workspace = true
+webp.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
