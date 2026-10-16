@@ -432,6 +432,66 @@ fn not_found(root: PathBuf) -> Response {
     }
 }
 
+// ---- Case-sensitive path resolution ---------------------------------------
+//
+// URLs are case-sensitive, and so is a Linux origin: `/Pricing` is not
+// `/pricing/`. A case-insensitive filesystem (macOS APFS, Windows NTFS) would
+// happily open `pricing/` for `/Pricing`, so local runs disagreed with
+// production. Every component of a resolved path must therefore match an
+// on-disk name byte-for-byte (which also rules out Unicode-normalization
+// aliases on APFS). Directory listings are cached and revalidated against
+// the directory's mtime, so a request costs one stat per component and no
+// directory scan unless a rebuild changed that directory.
+
+type DirListing = (std::time::SystemTime, std::sync::Arc<std::collections::HashSet<std::ffi::OsString>>);
+
+static DIR_NAMES: OnceLock<std::sync::RwLock<HashMap<PathBuf, DirListing>>> = OnceLock::new();
+
+/// Cap on cached directories; a rebuild that drops directories leaves stale
+/// keys behind, so the cache is cleared rather than allowed to grow.
+const DIR_CACHE_MAX: usize = 4096;
+
+/// Does `dir` hold an entry named exactly `name`?
+fn dir_has_entry(dir: &StdPath, name: &str) -> bool {
+    let Ok(mtime) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let cache = DIR_NAMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Ok(map) = cache.read() {
+        if let Some((cached, names)) = map.get(dir) {
+            if *cached == mtime {
+                return names.contains(std::ffi::OsStr::new(name));
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let names: std::collections::HashSet<_> = entries.flatten().map(|e| e.file_name()).collect();
+    let found = names.contains(std::ffi::OsStr::new(name));
+    if let Ok(mut map) = cache.write() {
+        if map.len() >= DIR_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(dir.to_path_buf(), (mtime, std::sync::Arc::new(names)));
+    }
+    found
+}
+
+/// True when every `/`-separated component of `rel` (already checked for
+/// traversal and empty segments) names an entry under `root` with exactly
+/// that spelling.
+fn exact_case(root: &StdPath, rel: &str) -> bool {
+    let mut dir = root.to_path_buf();
+    for seg in rel.split('/') {
+        if !dir_has_entry(&dir, seg) {
+            return false;
+        }
+        dir.push(seg);
+    }
+    true
+}
+
 /// Security + CDN headers applied to every successful file response.
 fn harden(resp: &mut Response) {
     let headers = resp.headers_mut();
@@ -463,8 +523,15 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     }
 
     let mut file = root.join(&rel);
+    let mut file_rel = rel.clone();
     if file.is_dir() {
         file = file.join("index.html");
+        file_rel.push_str("/index.html");
+    }
+    // Case-insensitive filesystems would open `Pricing/` for `pricing/`;
+    // only an exact on-disk spelling serves.
+    if !exact_case(root, &file_rel) {
+        return not_found(root.clone());
     }
     let (content_type, cache_control) = content_type_for(&file);
 
@@ -476,7 +543,7 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
         .map_or(false, |e| {
             ["html", "htm", "css", "js", "json", "xml", "txt", "svg", "md"].contains(&e)
         });
-    if accept_gzip && compressible && gz_path.exists() {
+    if accept_gzip && compressible && gz_path.exists() && exact_case(root, &format!("{file_rel}.gz")) {
         match std::fs::read(&gz_path) {
             Ok(bytes) => {
                 let mut resp = (StatusCode::OK, bytes).into_response();
@@ -1164,12 +1231,108 @@ headers:
             assert_eq!(resp.status(), StatusCode::OK, "{p}");
             assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
         }
-        // Mixed case serves the same file on a case-insensitive filesystem
-        // (404 elsewhere); either way the rule headers are on the response.
+        // Mixed case is a 404 on every filesystem, and the 404 still carries
+        // the rule headers (header matching ignores case).
         for p in ["/SignUp", "/SIGNUP/Index.html", "/SignUp/index.html.GZ"] {
             let resp = with_site_headers(&cfg, p, serve(&dist, p, false));
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{p}");
             assert_eq!(resp.headers()["content-security-policy"], "default-src 'self'", "{p}");
+            assert_eq!(resp.headers()["x-frame-options"], "SAMEORIGIN", "{p}");
         }
+    }
+
+    fn case_dist(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("postcms-case-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pricing")).unwrap();
+        std::fs::create_dir_all(dir.join("events/speakers")).unwrap();
+        std::fs::write(dir.join("pricing/index.html"), "<p>pricing</p>").unwrap();
+        std::fs::write(dir.join("pricing/index.html.gz"), "gz").unwrap();
+        std::fs::write(dir.join("events/speakers/index.html"), "<p>speakers</p>").unwrap();
+        std::fs::write(dir.join("Report.pdf"), "pdf").unwrap();
+        std::fs::write(dir.join("404.html"), "<p>nope</p>").unwrap();
+        dir
+    }
+
+    #[test]
+    fn mixed_case_request_is_not_found() {
+        let dist = case_dist("mixed");
+        for p in [
+            "/Pricing",
+            "/PRICING/",
+            "/pricing/Index.html",
+            "/pricing/index.HTML",
+            "/Events/speakers/",
+            "/events/Speakers",
+            "/report.pdf",
+            "/REPORT.PDF",
+        ] {
+            let resp = serve(&dist, p, false);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{p}");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], HTML_CACHE_CONTROL, "{p}");
+        }
+        // gzip negotiation cannot reach a file through a case alias either.
+        assert_eq!(serve(&dist, "/Pricing/", true).status(), StatusCode::NOT_FOUND);
+        assert_eq!(serve(&dist, "/pricing/index.html.GZ", false).status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn exact_case_and_index_aliases_still_serve() {
+        let dist = case_dist("exact");
+        for p in [
+            "/pricing",
+            "/pricing/",
+            "//pricing/",
+            "/pricing/index.html",
+            "/events/speakers",
+            "/events/speakers/",
+            "/events/speakers/index.html",
+            "/Report.pdf",
+        ] {
+            let resp = serve(&dist, p, false);
+            assert_eq!(resp.status(), StatusCode::OK, "{p}");
+        }
+        let gz = serve(&dist, "/pricing/", true);
+        assert_eq!(gz.status(), StatusCode::OK);
+        assert_eq!(gz.headers()[header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[test]
+    fn case_check_follows_rebuilds() {
+        let dist = case_dist("rebuild");
+        assert_eq!(serve(&dist, "/pricing/", false).status(), StatusCode::OK);
+        // A rebuild renames the directory: the old spelling stops serving and
+        // the new one starts, without a restart.
+        std::fs::rename(dist.join("pricing"), dist.join("plans")).unwrap();
+        assert_eq!(serve(&dist, "/pricing/", false).status(), StatusCode::NOT_FOUND);
+        assert_eq!(serve(&dist, "/plans/", false).status(), StatusCode::OK);
+        std::fs::create_dir_all(dist.join("new-page")).unwrap();
+        std::fs::write(dist.join("new-page/index.html"), "<p>new</p>").unwrap();
+        assert_eq!(serve(&dist, "/new-page", false).status(), StatusCode::OK);
+        assert_eq!(serve(&dist, "/New-Page", false).status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn traversal_and_encoding_unchanged() {
+        let dist = case_dist("traversal");
+        for p in ["/../etc/passwd", "/pricing/../pricing/", "/pricing/./", "/%2e%2e/etc/passwd", "/pric%69ng/"] {
+            assert_eq!(serve(&dist, p, false).status(), StatusCode::NOT_FOUND, "{p}");
+        }
+    }
+
+    #[test]
+    fn redirects_match_case_sensitively_before_files() {
+        let _ = REDIRECTS.set(vec![Redirect {
+            from: "old-page".into(),
+            to: "/events/speakers/".into(),
+            status: 301,
+        }]);
+        let dist = case_dist("redirects");
+        let resp = serve(&dist, "/old-page/", false);
+        assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(resp.headers()[header::LOCATION], "/events/speakers/");
+        // Redirect keys were always exact-match; a case variant is not a hit.
+        assert_eq!(serve(&dist, "/Old-Page", false).status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
