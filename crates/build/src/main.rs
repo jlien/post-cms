@@ -65,6 +65,10 @@ struct Collection {
     /// schema.yaml `references: {field: collection}`: fields whose values
     /// are item slugs in another collection, resolved for templates as `refs`.
     references: std::collections::BTreeMap<String, String>,
+    /// schema.yaml `expose_to_pages` (default false): page templates see every
+    /// item in `collections.<name>`, drafts included. For data collections
+    /// (people, logos) whose items never render pages of their own.
+    expose_to_pages: bool,
     items: Vec<CollectionItem>,
 }
 
@@ -81,6 +85,61 @@ impl Collection {
             "url": page_url(&self.url_prefix),
         })
     }
+
+    /// Whether page templates may see this item: published items always,
+    /// drafts only in an `expose_to_pages` collection.
+    fn exposes(&self, item: &CollectionItem) -> bool {
+        item.published || self.expose_to_pages
+    }
+}
+
+/// `collections` in every template: `{<name>: {name, title, url, items}}`,
+/// built once per build. `url` is the index path, or null when the schema
+/// sets `index: false`. `items` holds the exposed items (see
+/// `Collection::exposes`), newest first by `date`, undated items last in slug
+/// order. Each row is `{slug, title, description, url, date, published,
+/// fields, refs}`: `url` and `date` are null when the item has no page (a
+/// draft) or no date, and `refs` is present only when the schema declares
+/// references. `resolve_refs` keeps exposed items from referencing hidden
+/// drafts, so a page never shows one through a reference.
+fn page_collections(collections: &[Collection]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    for coll in collections {
+        let mut exposed: Vec<&CollectionItem> = coll.items.iter().filter(|i| coll.exposes(i)).collect();
+        // Items arrive in slug order; the stable sort keeps it for ties.
+        exposed.sort_by(|a, b| match (a.date, b.date) {
+            (Some(x), Some(y)) => y.cmp(&x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        let mut rows = Vec::with_capacity(exposed.len());
+        for item in exposed {
+            let mut row = serde_json::json!({
+                "slug": item.slug,
+                "title": item.title,
+                "description": item.description,
+                "url": if item.published { serde_json::Value::String(page_url(&coll.item_path(&item.slug))) } else { serde_json::Value::Null },
+                "date": item.date.map(|d| d.to_string()),
+                "published": item.published,
+                "fields": item.fields,
+            });
+            if let Some(refs) = resolve_refs(coll, item, collections)? {
+                row["refs"] = serde_json::Value::Object(refs);
+            }
+            rows.push(row);
+        }
+        out.insert(
+            coll.name.clone(),
+            serde_json::json!({
+                "name": coll.name,
+                "title": coll.title,
+                "url": if coll.index { serde_json::Value::String(page_url(&coll.url_prefix)) } else { serde_json::Value::Null },
+                "items": rows,
+            }),
+        );
+    }
+    Ok(out)
 }
 
 /// meta.yaml `no_index: true` keeps a page or item out of sitemap.xml.
@@ -115,8 +174,10 @@ fn yaml_to_fields(map: &serde_yaml::Mapping) -> serde_json::Map<String, serde_js
 
 /// Resolve an item's reference fields (schema.yaml `references:`) into
 /// `{field: {slug, title, description, url, published, fields}}`, or a list of
-/// those for list fields. A published item may only reference published
-/// items (the build fails by name otherwise); a draft may reference drafts.
+/// those for list fields. A published item, or a draft in an
+/// `expose_to_pages` collection, may only reference published items or items
+/// of `expose_to_pages` collections (the build fails by name otherwise; `url`
+/// is null for such a draft target); other drafts may reference drafts.
 /// One level deep: the referenced item's own
 /// references stay slugs in its `fields`. `None` when the collection declares
 /// no references, so templates of other collections see no `refs` at all.
@@ -151,22 +212,33 @@ fn resolve_refs(
                     target
                 )
             })?;
-            // A published page never exposes a draft's title, URL, or fields.
-            if item.published && !found.published {
+            // A published page never exposes a draft's title, URL, or fields,
+            // unless the draft's collection opts in with `expose_to_pages`.
+            // Items pages can see (published, or exposed drafts) follow the
+            // same rule, so `collections` never leaks a hidden draft either.
+            let visible = coll.exposes(item);
+            if visible && !target_coll.exposes(found) {
                 bail!(
-                    "collection `{}` item `{}`: field `{}` references `{}`, which is unpublished in collection `{}` (publish it or remove the reference)",
+                    "collection `{}` item `{}`: field `{}` references `{}`, which is unpublished in collection `{}` (publish it, remove the reference, or set `expose_to_pages: true` on `{}`)",
                     coll.name,
                     item.slug,
                     field,
                     slug,
+                    target,
                     target
                 );
             }
+            // An exposed draft has no page, so a visible item gets no link to it.
+            let url = if visible && !found.published {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(page_url(&target_coll.item_path(&found.slug)))
+            };
             Ok(serde_json::json!({
                 "slug": found.slug,
                 "title": found.title,
                 "description": found.description,
-                "url": page_url(&target_coll.item_path(&found.slug)),
+                "url": url,
                 "published": found.published,
                 "fields": found.fields,
             }))
@@ -349,6 +421,10 @@ struct SiteConfig {
     /// then site.yaml `base_url`, then the local origin).
     #[serde(default)]
     base_url: String,
+    /// `collections` in every template (see `page_collections`); main() fills
+    /// it once after loading collections.
+    #[serde(skip)]
+    page_collections: serde_json::Map<String, serde_json::Value>,
 }
 
 /// site.yaml `llms:`. Every key is optional; unset keys fall back to the
@@ -483,6 +559,7 @@ impl SiteConfig {
             llms: LlmsCfg::default(),
             robots: RobotsCfg::default(),
             base_url: String::new(),
+            page_collections: serde_json::Map::new(),
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -496,6 +573,7 @@ impl SiteConfig {
         ctx.insert("theme", &style.theme);
         ctx.insert("root", root);
         ctx.insert("lang", "en");
+        ctx.insert("collections", &self.page_collections);
         ctx
     }
 }
@@ -580,11 +658,14 @@ fn main() -> Result<()> {
     // Default pages (about, privacy, terms, ...) — optional directory.
     let pages = load_pages(&root.join("content/pages")).unwrap_or_default();
 
+    let sources = SourceCtx::from_env(&root, &cfg, &postcms_build::sanity::http_fetch);
+    let (collections, _ref_checks) = load_collections(&root.join("content"), &sources)?;
+    // Built once; every template reads it as `collections`.
+    cfg.page_collections = page_collections(&collections)?;
+
     // Live site renders at the site root.
     render_posts(&tera, &dist, &posts, &styling, &cfg, "")?;
     render_pages(&tera, &dist, &pages, &styling, &cfg, "")?;
-    let sources = SourceCtx::from_env(&root, &cfg, &postcms_build::sanity::http_fetch);
-    let (collections, _ref_checks) = load_collections(&root.join("content"), &sources)?;
     render_collections(&tera, &dist, &collections, &styling, &cfg, "")?;
     if cfg.builtin_pages {
         render_home(&tera, &dist, &posts, &styling, &cfg, "")?;
@@ -1446,6 +1527,12 @@ fn load_collections(
             .map(|p| format!("/{}", p.trim_matches('/')))
             .unwrap_or_else(|| format!("/{name}"));
         let index = schema.get("index").and_then(|v| v.as_bool()).unwrap_or(true);
+        let expose_to_pages = match schema.get("expose_to_pages") {
+            None => false,
+            Some(v) => v.as_bool().ok_or_else(|| {
+                anyhow::anyhow!("{}: `expose_to_pages` must be true or false", schema_path.display())
+            })?,
+        };
         let source = postcms_build::sanity::SanitySource::from_schema(schema.get("source"))
             .with_context(|| format!("{}: source", schema_path.display()))?;
         let items_dir = match &source {
@@ -1679,6 +1766,7 @@ fn load_collections(
             url_prefix,
             index,
             references,
+            expose_to_pages,
             items,
         });
     }
@@ -2960,6 +3048,7 @@ mod tests {
             url_prefix: "/events/speakers/".into(),
             index: false,
             references: Default::default(),
+            expose_to_pages: false,
             items: vec![],
         };
         assert_eq!(c.item_path("acme"), "/events/speakers/acme");
@@ -3026,6 +3115,7 @@ mod tests {
             url_prefix: "/events/speakers".into(),
             index: true,
             references: Default::default(),
+            expose_to_pages: false,
             items: vec![item("acme", true), item("draft", false)],
         };
         (pages, vec![coll])
@@ -3310,6 +3400,169 @@ mod tests {
             read("articles/index.html"),
             "https://example.com|articles|articles|Articles|Edge Basics=Ada;No Author=-;"
         );
+    }
+
+    /// `people` is a data collection (drafts, no pages); `logos` has a
+    /// draft; `articles` mixes dated and undated items and references people.
+    fn page_collections_site(root: &Path, expose_people: bool) {
+        write(
+            root,
+            "content/people/schema.yaml",
+            &format!("title: People\nindex: false\nexpose_to_pages: {expose_people}\n"),
+        );
+        write(root, "content/people/ada/meta.yaml", "title: Ada\nrole: Editor\n");
+        write(root, "content/people/lin/meta.yaml", "title: Lin\nrole: Writer\n");
+        write(root, "content/logos/schema.yaml", "title: Logos\n");
+        write(root, "content/logos/acme/meta.yaml", "title: Acme\npublished: true\n");
+        write(root, "content/logos/secret/meta.yaml", "title: Secret\npublished: false\n");
+        write(
+            root,
+            "content/articles/schema.yaml",
+            "title: Articles\nreferences:\n  author: people\n",
+        );
+        write(root, "content/articles/a-undated/meta.yaml", "title: Undated\npublished: true\n");
+        write(root, "content/articles/b-old/meta.yaml", "title: Old\npublished: true\ndate: 2024-01-01\n");
+        write(
+            root,
+            "content/articles/c-new/meta.yaml",
+            "title: New\npublished: true\ndate: 2025-06-01\nauthor: ada\n",
+        );
+        write(root, "content/articles/d-draft/meta.yaml", "title: Draft\ndate: 2026-01-01\nauthor: lin\n");
+    }
+
+    fn page_with_template(root: &Path, tpl: &str) -> (Tera, Vec<Page>) {
+        write(root, "content/pages/about/meta.yaml", "title: About\nslug: about\ntemplate: about.html\n");
+        write(root, "content/pages/about/index.mdx", "Hi.\n");
+        let tera = raw_tera(&[("about.html", tpl)]);
+        (tera, load_pages(&root.join("content/pages")).unwrap())
+    }
+
+    fn render_about(root: &Path, dist: &Path, tpl: &str) -> Result<String> {
+        let collections = built(root);
+        let (tera, pages) = page_with_template(root, tpl);
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.page_collections = page_collections(&collections)?;
+        render_pages(&tera, dist, &pages, &plain_style(), &cfg, "")?;
+        Ok(unslash(&fs::read_to_string(dist.join("about/index.html")).unwrap()))
+    }
+
+    #[test]
+    fn page_collections_hide_drafts_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        let out = render_about(
+            &root,
+            &tmp.path().join("dist"),
+            "{{ collections.logos.title }}@{{ collections.logos.url }}:\
+             {% for i in collections.logos.items %}{{ i.slug }}={{ i.url }};{% endfor %}",
+        )
+        .unwrap();
+        assert_eq!(out, "Logos@/logos/:acme=/logos/acme/;");
+    }
+
+    #[test]
+    fn page_collections_sort_newest_first_with_undated_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        let out = render_about(
+            &root,
+            &tmp.path().join("dist"),
+            "{% for i in collections.articles.items %}{{ i.slug }}({{ i.date | default(value='-') }}),{% endfor %}",
+        )
+        .unwrap();
+        // d-draft is newest but unpublished, so it is not there.
+        assert_eq!(out, "c-new(2025-06-01),b-old(2024-01-01),a-undated(-),");
+    }
+
+    #[test]
+    fn expose_to_pages_exposes_data_items_without_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        let out = render_about(
+            &root,
+            &tmp.path().join("dist"),
+            "{{ collections.people.url | default(value='no-index') }}:\
+             {% for p in collections.people.items %}{{ p.title }}/{{ p.fields.role }}/{{ p.published }}/{{ p.url | default(value='no-page') }};{% endfor %}",
+        )
+        .unwrap();
+        assert_eq!(out, "no-index:Ada/Editor/false/no-page;Lin/Writer/false/no-page;");
+    }
+
+    #[test]
+    fn page_collections_resolve_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        let out = render_about(
+            &root,
+            &tmp.path().join("dist"),
+            "{% for i in collections.articles.items %}{{ i.slug }}:\
+             {% if i.refs.author %}{{ i.refs.author.title }}/{{ i.refs.author.fields.role }}/{{ i.refs.author.url | default(value='no-page') }}{% else %}-{% endif %};{% endfor %}",
+        )
+        .unwrap();
+        assert_eq!(out, "c-new:Ada/Editor/no-page;b-old:-;a-undated:-;");
+    }
+
+    #[test]
+    fn exposed_items_cannot_reference_hidden_drafts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        // A data item pointing at a draft logo would show the draft on a page.
+        write(&root, "content/people/schema.yaml", "title: People\nexpose_to_pages: true\nreferences:\n  logo: logos\n");
+        write(&root, "content/people/ada/meta.yaml", "title: Ada\nlogo: secret\n");
+        let err = format!("{:#}", page_collections(&built(&root)).unwrap_err());
+        assert!(
+            err.contains("collection `people` item `ada`") && err.contains("`secret`") && err.contains("expose_to_pages"),
+            "{err}"
+        );
+        // Pointing at a published logo is fine.
+        write(&root, "content/people/ada/meta.yaml", "title: Ada\nlogo: acme\n");
+        assert!(page_collections(&built(&root)).is_ok());
+    }
+
+    #[test]
+    fn expose_to_pages_must_be_a_boolean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, true);
+        write(&root, "content/people/schema.yaml", "title: People\nexpose_to_pages: yes please\n");
+        let err = format!("{:#}", load_collections(&root.join("content"), &offline_ctx(&root)).unwrap_err());
+        assert!(err.contains("people/schema.yaml") && err.contains("expose_to_pages"), "{err}");
+    }
+
+    #[test]
+    fn builtin_pages_and_item_templates_see_collections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("site");
+        page_collections_site(&root, false);
+        // Without expose_to_pages, a published article cannot cite a person.
+        let err = format!("{:#}", page_collections(&built(&root)).unwrap_err());
+        assert!(err.contains("`ada`") && err.contains("expose_to_pages: true"), "{err}");
+        write(&root, "content/articles/c-new/meta.yaml", "title: New\npublished: true\ndate: 2025-06-01\n");
+        let collections = built(&root);
+        let mut cfg = SiteConfig::default_theme_config();
+        cfg.page_collections = page_collections(&collections).unwrap();
+        // Without expose_to_pages the draft-only people collection is empty.
+        assert_eq!(cfg.page_collections["people"]["items"], serde_json::json!([]));
+        let tpl = "{% for i in collections.logos.items %}{{ i.slug }}{% endfor %}";
+        let tera = raw_tera(&[
+            ("home.html", tpl),
+            ("404.html", tpl),
+            ("collection-item.html", tpl),
+            ("collection.html", tpl),
+        ]);
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        render_home(&tera, &dist, &[], &plain_style(), &cfg, "").unwrap();
+        render_404(&tera, &dist, &plain_style(), &cfg, "").unwrap();
+        render_collections(&tera, &dist, &collections, &plain_style(), &cfg, "").unwrap();
+        for f in ["index.html", "404.html", "articles/c-new/index.html", "logos/index.html"] {
+            assert_eq!(fs::read_to_string(dist.join(f)).unwrap(), "acme", "{f}");
+        }
     }
 
     #[test]
