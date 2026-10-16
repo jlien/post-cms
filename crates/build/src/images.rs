@@ -21,9 +21,9 @@
 //! only, so no source name reaches the file system.
 //!
 //! Raster images (JPEG, PNG, static WebP) are resized to the configured
-//! widths (never upscaled), encoded as AVIF and/or WebP plus a fallback in
-//! the source format, with metadata dropped (EXIF orientation is applied
-//! first). SVG, GIF and animated PNG/WebP are copied as they are; an SVG with
+//! widths (never upscaled), encoded as AVIF and/or WebP plus one fallback
+//! (a progressive JPEG, or PNG when a pixel is transparent), with metadata
+//! dropped (EXIF orientation is applied first). SVG, GIF and animated PNG/WebP are copied as they are; an SVG with
 //! script, event handlers, `foreignObject` or external references is refused
 //! and keeps its original URL. Sources the pipeline does not handle (another
 //! host, plain http, a failed fetch) render with their original URL and a
@@ -122,7 +122,7 @@ fn default_avif_speed() -> u8 {
     8
 }
 fn default_jpeg_quality() -> u8 {
-    80
+    82
 }
 fn default_fallback_width() -> u32 {
     1280
@@ -200,7 +200,7 @@ impl ImagesCfg {
     /// output name, so a settings change never reuses a cached file name.
     fn settings(&self) -> String {
         format!(
-            "v1|webp{}|avif{}s{}|jpeg{}|png",
+            "v2|webp{}|avif{}s{}|jpeg{}p|png",
             self.webp_quality, self.avif_quality, self.avif_speed, self.jpeg_quality
         )
     }
@@ -435,7 +435,7 @@ impl Enc {
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
-    /// Resized and re-encoded; `fallback` is the source format.
+    /// Resized and re-encoded; `fallback` is JPEG, or PNG for real transparency.
     Raster { fallback: Enc },
     /// Copied byte for byte (SVG, GIF, animated PNG/WebP).
     Passthrough { ext: &'static str },
@@ -633,9 +633,10 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg) -> Result<(u32, u32, Kind), String> {
         ImageFormat::Gif => Kind::Passthrough { ext: "gif" },
         ImageFormat::Png if is_apng(bytes) => Kind::Passthrough { ext: "png" },
         ImageFormat::WebP if is_animated_webp(bytes) => Kind::Passthrough { ext: "webp" },
-        ImageFormat::Png => Kind::Raster { fallback: Enc::Png },
+        // PNG/WebP: a PNG fallback for now; resolve_one switches it to JPEG
+        // unless a pixel is actually transparent.
+        ImageFormat::Png | ImageFormat::WebP => Kind::Raster { fallback: Enc::Png },
         ImageFormat::Jpeg => Kind::Raster { fallback: Enc::Jpeg },
-        ImageFormat::WebP => Kind::Raster { fallback: Enc::Webp },
         other => return Err(format!("unsupported format {other:?}")),
     };
     let mut dec = reader(bytes, fmt, cfg.max_pixels)
@@ -648,6 +649,10 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg) -> Result<(u32, u32, Kind), String> {
     if w as u64 * h as u64 > cfg.max_pixels {
         return Err(format!("{w}x{h} is over max_pixels ({})", cfg.max_pixels));
     }
+    let kind = match kind {
+        Kind::Raster { fallback: Enc::Png } if !dec.color_type().has_alpha() => Kind::Raster { fallback: Enc::Jpeg },
+        k => k,
+    };
     use image::metadata::Orientation::*;
     let swap = matches!(dec.orientation().unwrap_or(NoTransforms), Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH);
     Ok(if swap { (h, w, kind) } else { (w, h, kind) })
@@ -690,8 +695,13 @@ fn encode(img: &DynamicImage, enc: Enc, cfg: &ImagesCfg) -> Result<Vec<u8>, Stri
             .map_err(|e| format!("avif: {e}"))?;
         }
         Enc::Jpeg => {
-            let e = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, cfg.jpeg_quality);
-            img.to_rgb8().write_with_encoder(e).map_err(|e| format!("jpeg: {e}"))?;
+            // progressive, baseline 4:2:0; no metadata segments are written
+            let rgb = img.to_rgb8();
+            let (w, h) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()));
+            let (Ok(w), Ok(h)) = (w, h) else { return Err("jpeg: over 65535 px".into()) };
+            let mut e = jpeg_encoder::Encoder::new(&mut buf, cfg.jpeg_quality);
+            e.set_progressive(true);
+            e.encode(rgb.as_raw(), w, h, jpeg_encoder::ColorType::Rgb).map_err(|e| format!("jpeg: {e}"))?;
         }
         Enc::Png => {
             let e = image::codecs::png::PngEncoder::new_with_quality(
@@ -795,12 +805,14 @@ struct State {
 }
 
 /// Totals from [`Pipeline::finish`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Stats {
     pub sources: usize,
     pub files: usize,
     pub bytes: u64,
-    pub fallbacks: usize,
+    /// Sources that failed (fetch error, refused, unsupported) and kept
+    /// their original URL: `(url, reason)`, sorted by URL.
+    pub kept: Vec<(String, String)>,
 }
 
 pub struct Pipeline {
@@ -979,8 +991,13 @@ impl Pipeline {
 
     fn resolve_one(&self, src: &str) -> Result<Arc<Source>, Option<String>> {
         let bytes = self.load(src)?;
-        let (width, height, kind) = probe(&bytes, &self.cfg).map_err(Some)?;
+        let (width, height, mut kind) = probe(&bytes, &self.cfg).map_err(Some)?;
         let content = sha_hex(&bytes);
+        if let Kind::Raster { fallback: Enc::Png } = kind {
+            if !self.uses_alpha(&content, &bytes).map_err(Some)? {
+                kind = Kind::Raster { fallback: Enc::Jpeg };
+            }
+        }
         if src.starts_with('/') {
             // local files go through the same cache, so finish() reads one place
             let f = self.src_file(&content);
@@ -990,6 +1007,21 @@ impl Pipeline {
         }
         let id = sha_hex(format!("{content}|{}", self.cfg.settings()).as_bytes())[..16].to_string();
         Ok(Arc::new(Source { content, id, width, height, kind }))
+    }
+
+    /// Whether any pixel is not fully opaque (decodes once; the answer is
+    /// cached by content hash so warm builds skip the decode).
+    fn uses_alpha(&self, content: &str, bytes: &[u8]) -> Result<bool, String> {
+        let f = self.cache.join("alpha").join(content);
+        match std::fs::read(&f).ok().as_deref() {
+            Some(b"1") => return Ok(true),
+            Some(b"0") => return Ok(false),
+            _ => {}
+        }
+        let img = decode(bytes, &self.cfg)?;
+        let used = img.to_rgba8().pixels().any(|p| p.0[3] != 255);
+        write_atomic(&f, if used { b"1" } else { b"0" }).map_err(|e| format!("cache: {e}"))?;
+        Ok(used)
     }
 
     /// Widths for a source `w` px wide: the configured ones below it, plus
@@ -1153,7 +1185,15 @@ impl Pipeline {
                 let html = self.materialize(&mut st, &req);
                 st.done[i] = Some(html);
             }
-            stats.fallbacks = st.resolved.values().filter(|r| r.is_err()).count();
+            stats.kept = st
+                .resolved
+                .iter()
+                .filter_map(|(src, r)| match r {
+                    Err(Some(why)) => Some((src.clone(), why.clone())),
+                    _ => None,
+                })
+                .collect();
+            stats.kept.sort();
             stats.sources = st.outputs.len();
             replacements = st.done.iter().enumerate().map(|(i, h)| (i, h.clone().unwrap_or_default())).collect();
             work = st

@@ -19,3 +19,4 @@ ureq = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "avif"] }
 webp = { version = "0.3", default-features = false }
 sha2 = "0.10"
+jpeg-encoder = "0.7"

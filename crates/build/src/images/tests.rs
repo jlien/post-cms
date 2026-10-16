@@ -231,24 +231,25 @@ fn widths_never_upscale_and_markup_is_complete() {
     let m = p.request_img(img(&url));
     let html = f.render(&p, &format!("<p>{m}</p>"));
     let files = f.out_files();
-    // 320, 480 and the source width 500 in WebP, plus one PNG fallback (500 < 1280)
+    // 320, 480 and the source width 500 in WebP, plus one fallback (500 < 1280):
+    // JPEG, since the PNG has no transparency
     assert_eq!(files.len(), 4, "{files:?}");
     let id = &files[0][..16];
     assert_eq!(
         html,
         format!(
             "<p><picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-320.webp 320w, /assets/img/{id}-480.webp 480w, /assets/img/{id}-500.webp 500w\" sizes=\"auto, 100vw\">\
-             <img src=\"/assets/img/{id}-500.png\" alt=\"A\" width=\"500\" height=\"250\" loading=\"lazy\" decoding=\"async\"></picture></p>"
+             <img src=\"/assets/img/{id}-500.jpg\" alt=\"A\" width=\"500\" height=\"250\" loading=\"lazy\" decoding=\"async\"></picture></p>"
         )
     );
-    for (name, w, h) in [("320.webp", 320, 160), ("480.webp", 480, 240), ("500.webp", 500, 250), ("500.png", 500, 250)] {
+    for (name, w, h) in [("320.webp", 320, 160), ("480.webp", 480, 240), ("500.webp", 500, 250), ("500.jpg", 500, 250)] {
         assert_eq!(dims_of(&f.dist.join(format!("assets/img/{id}-{name}"))), (w, h), "{name}");
     }
     for n in &files {
         let (stem, ext) = n.split_once('.').unwrap();
         let (hash, width) = stem.split_once('-').unwrap();
         assert!(hash.len() == 16 && hash.bytes().all(|c| c.is_ascii_hexdigit()), "{n}");
-        assert!(width.bytes().all(|c| c.is_ascii_digit()) && matches!(ext, "webp" | "png"), "{n}");
+        assert!(width.bytes().all(|c| c.is_ascii_digit()) && matches!(ext, "webp" | "jpg"), "{n}");
     }
 }
 
@@ -281,11 +282,11 @@ fn options_are_passed_through_and_escaped() {
     };
     let html = f.render(&p, &p.request_img(a));
     let id = &f.out_files()[0][..16];
-    // no modern formats: a plain <img> with a PNG srcset
+    // no modern formats: a plain <img> with a fallback srcset
     assert_eq!(
         html,
         format!(
-            "<img src=\"/assets/img/{id}-100.png\" srcset=\"/assets/img/{id}-100.png 100w\" sizes=\"(min-width: 60em) 33vw, 100vw\" \
+            "<img src=\"/assets/img/{id}-100.jpg\" srcset=\"/assets/img/{id}-100.jpg 100w\" sizes=\"(min-width: 60em) 33vw, 100vw\" \
              alt=\"Say &quot;hi&quot; &amp; &lt;b&gt;\" class=\"card__img\" width=\"100\" height=\"50\" loading=\"eager\" decoding=\"async\" fetchpriority=\"high\">"
         )
     );
@@ -304,7 +305,7 @@ fn avif_and_webp_sources_in_config_order() {
     let avif = files.iter().find(|n| n.ends_with("-96.avif")).unwrap();
     let bytes = std::fs::read(f.dist.join("assets/img").join(avif)).unwrap();
     assert_eq!(&bytes[4..12], b"ftypavif");
-    assert_eq!(files.len(), 5, "{files:?}"); // 2 avif + 2 webp + 1 png
+    assert_eq!(files.len(), 5, "{files:?}"); // 2 avif + 2 webp + 1 jpg
 }
 
 #[test]
@@ -502,9 +503,9 @@ fn image_url_picks_largest_or_requested_width() {
     let id = &f.out_files()[0][..16];
     assert_eq!(
         html,
-        format!("/assets/img/{id}-1920.png|https://example.com/assets/img/{id}-1200.png|/assets/img/{id}-2000.png")
+        format!("/assets/img/{id}-1920.jpg|https://example.com/assets/img/{id}-1200.jpg|/assets/img/{id}-2000.jpg")
     );
-    assert_eq!(dims_of(&f.dist.join(format!("assets/img/{id}-1200.png"))), (1200, 600));
+    assert_eq!(dims_of(&f.dist.join(format!("assets/img/{id}-1200.jpg"))), (1200, 600));
 }
 
 #[test]
@@ -556,9 +557,53 @@ fn templates_and_portable_text_render_through_the_pipeline() {
     assert_eq!(
         html,
         format!(
-            "<div style=\"background-image:url(/assets/img/{id}-40.png)\"><picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-40.webp 40w\" sizes=\"50vw\"><img src=\"/assets/img/{id}-40.png\" alt=\"c\" width=\"40\" height=\"20\" loading=\"lazy\" decoding=\"async\"></picture></div>\n\
-             <figure><picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-40.webp 40w\" sizes=\"auto, 100vw\"><img src=\"/assets/img/{id}-40.png\" alt=\"Chart\" width=\"40\" height=\"20\" loading=\"lazy\" decoding=\"async\"></picture><figcaption>Q3</figcaption></figure>"
+            "<div style=\"background-image:url(/assets/img/{id}-40.jpg)\"><picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-40.webp 40w\" sizes=\"50vw\"><img src=\"/assets/img/{id}-40.jpg\" alt=\"c\" width=\"40\" height=\"20\" loading=\"lazy\" decoding=\"async\"></picture></div>\n\
+             <figure><picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-40.webp 40w\" sizes=\"auto, 100vw\"><img src=\"/assets/img/{id}-40.jpg\" alt=\"Chart\" width=\"40\" height=\"20\" loading=\"lazy\" decoding=\"async\"></picture><figcaption>Q3</figcaption></figure>"
         )
     );
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "one fetch per source");
+}
+
+// ---- fallbacks ----
+
+fn rgba_png(w: u32, h: u32, alpha: u8) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(w, h, |x, _| image::Rgba([x as u8, 9, 9, if x == 0 { alpha } else { 255 }]));
+    let mut b = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(img).write_to(&mut b, ImageFormat::Png).unwrap();
+    b.into_inner()
+}
+
+#[test]
+fn fallback_is_progressive_jpeg_unless_pixels_are_transparent() {
+    let f = Fixture::new();
+    let opaque = format!("https://{HOST}/opaque.png"); // RGBA channel, every pixel opaque
+    let clear = format!("https://{HOST}/clear.png"); // one transparent column
+    let p = f.pipeline(
+        cfg_yaml("  widths: [32]\n"),
+        false,
+        vec![(&opaque, ok(rgba_png(64, 32, 255))), (&clear, ok(rgba_png(64, 32, 0)))],
+    );
+    let html = f.render(&p, &format!("{}\n{}", p.request_img(img(&opaque)), p.request_img(img(&clear))));
+    let mut lines = html.lines();
+    let (a, b) = (lines.next().unwrap(), lines.next().unwrap());
+    assert!(a.contains("-32.jpg\" alt"), "{a}");
+    assert!(b.contains("-32.png\" alt"), "{b}");
+    let jpg = f.out_files().into_iter().find(|n| n.ends_with(".jpg")).unwrap();
+    let bytes = std::fs::read(f.dist.join("assets/img").join(jpg)).unwrap();
+    assert!(bytes.windows(2).any(|w| w == [0xFF, 0xC2]), "not progressive (no SOF2)");
+    assert!(!bytes.windows(4).any(|w| w == b"Exif"));
+    // the alpha answer is cached, so a warm build does not decode again
+    assert_eq!(std::fs::read_dir(f.root.join(".cache/images/alpha")).unwrap().count(), 2);
+}
+
+#[test]
+fn failed_sources_are_listed_in_the_stats() {
+    let f = Fixture::new();
+    let gone = format!("https://{HOST}/gone.png");
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&gone, RawResponse { status: 403, ..Default::default() })]);
+    let body = format!("{}{}", p.request_img(img(&gone)), p.request_img(img("https://elsewhere.example.org/x.png")));
+    std::fs::write(f.dist.join("page.html"), body).unwrap();
+    let stats = p.finish(2).unwrap();
+    // the foreign host is not ours, so it is not a failure
+    assert_eq!(stats.kept, vec![(gone.clone(), "HTTP 403".to_string())]);
 }

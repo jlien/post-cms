@@ -859,9 +859,12 @@ fn finish_images(p: &postcms_build::images::Pipeline) -> Result<()> {
         s.sources,
         s.files,
         s.bytes,
-        s.fallbacks,
+        s.kept.len(),
         t.elapsed().as_secs_f64()
     );
+    for (url, why) in &s.kept {
+        println!("  kept original URL: {url} ({why})");
+    }
     Ok(())
 }
 

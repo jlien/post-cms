@@ -135,7 +135,7 @@ images:
   webp_quality: 75
   avif_quality: 55
   avif_speed: 8            # 1 slow/small to 10 fast
-  jpeg_quality: 80
+  jpeg_quality: 82        # fallback JPEGs are progressive
   fallback_width: 1280     # the single <img src> fallback when a modern format is on
   max_bytes: 26214400      # per response
   max_pixels: 50000000     # width x height, checked from the header before decoding
@@ -157,8 +157,9 @@ Templates:
 
 How it works: rendering records each call and prints a placeholder. After every page is rendered, the build fetches each distinct source once (in parallel), reads its size from the header, writes `/<output_dir>/<hash>-<width>.<ext>` variants (in parallel), and replaces the placeholders, before precompression. Only images a template uses are fetched and written.
 
-- Sources: `https://` URLs on `allowed_hosts`, and site paths (`/assets/...`) resolved inside `dist/`. Other hosts and plain http keep their URL silently. A failed fetch, a refused image, or an unsupported format keeps its URL with a `warning: image <url>: <reason>` line; the build still succeeds.
-- Variants: the configured widths below the source width plus the source width itself (never upscaled), in each modern format, plus a fallback in the source format (JPEG, PNG, or WebP). EXIF orientation is applied, then all metadata is dropped. SVG, GIF, and animated PNG/WebP are copied unchanged under a hashed name.
+- Sources: `https://` URLs on `allowed_hosts`, and site paths (`/assets/...`) resolved inside `dist/`. Other hosts and plain http keep their URL silently.
+- Failures: a source that fails (an HTTP error such as 403, a refused or oversized image, an unsupported format, or a cache miss offline) keeps its original URL and the build still succeeds. Each prints `warning: image <url>: <reason>` when it fails, and the build summary lists them all again (`kept original URL: <url> (<reason>)`) after the `images:` totals line.
+- Variants: the configured widths below the source width plus the source width itself (never upscaled), in each modern format, plus one fallback at `fallback_width`: a progressive JPEG, or a PNG only when some pixel is actually transparent (the alpha channel is scanned, not just declared; the answer is cached). EXIF orientation is applied, then all metadata is dropped. SVG, GIF, and animated PNG/WebP are copied unchanged under a hashed name.
 - Cache: fetched bytes are stored by sha256 under `cache_dir/src/`, URLs map to them in `cache_dir/urls/`, and encoded variants live in `cache_dir/out/`. Remote URLs are treated as immutable: delete the cache to refetch. `IMAGES_OFFLINE=1` builds from the cache only. Output names include a fingerprint of the quality settings, so changing them never reuses a cached name. `IMAGES_JOBS` sets the encode threads (default: all cores).
 - Security: https only, the host must be allowed on every redirect hop (at most 3), the resolver drops loopback, private, link-local, CGNAT, and other reserved addresses (so DNS cannot point an allowed name inward), no proxy, a global timeout, a body cap, and a pixel cap before decode. Output and cache names are hex digests and numbers only; site paths cannot leave `dist/` (`..`, encoded separators, and symlinks are refused). An SVG with script, event handlers, `foreignObject`, entity declarations, link animations, or references other than `#fragment` and inline raster `data:image/...` is refused. The origin server sends SVG with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox`.
 

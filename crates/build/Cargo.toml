@@ -22,6 +22,7 @@ fastembed.workspace = true
 image.workspace = true
 webp.workspace = true
 sha2.workspace = true
+jpeg-encoder.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

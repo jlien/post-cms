@@ -64,9 +64,9 @@ fn build_renders_image_helper_and_reuses_cache() {
         .collect();
     let id = &files[0][..16];
     assert!(html.contains(&format!(
-        "<picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-32.webp 32w, /assets/img/{id}-64.webp 64w\" sizes=\"50vw\"><img src=\"/assets/img/{id}-64.png\" alt=\"Hero\" width=\"64\" height=\"32\" loading=\"lazy\" decoding=\"async\"></picture>"
+        "<picture><source type=\"image/webp\" srcset=\"/assets/img/{id}-32.webp 32w, /assets/img/{id}-64.webp 64w\" sizes=\"50vw\"><img src=\"/assets/img/{id}-64.jpg\" alt=\"Hero\" width=\"64\" height=\"32\" loading=\"lazy\" decoding=\"async\"></picture>"
     )), "{html}");
-    assert!(html.contains(&format!("content=\"https://www.example.com/assets/img/{id}-64.png\"")), "{html}");
+    assert!(html.contains(&format!("content=\"https://www.example.com/assets/img/{id}-64.jpg\"")), "{html}");
     // the precompressed copy carries the final markup too
     let gz = fs::read(root.join("dist/about/index.html.gz")).unwrap();
     let mut unzipped = String::new();
