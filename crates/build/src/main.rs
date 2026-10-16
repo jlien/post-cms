@@ -3204,7 +3204,7 @@ mod tests {
     /// authors reference `teams`, which must stay a slug (one level deep).
     fn reference_site(root: &Path) {
         write(root, "content/teams/schema.yaml", "title: Teams\n");
-        write(root, "content/teams/platform/meta.yaml", "title: Platform\npublished: true\n");
+        write(root, "content/teams/core/meta.yaml", "title: Core\npublished: true\n");
         write(
             root,
             "content/authors/schema.yaml",
@@ -3213,9 +3213,9 @@ mod tests {
         write(
             root,
             "content/authors/ada/meta.yaml",
-            "title: Ada\ndescription: Writes guides.\npublished: true\nteam: platform\nrole: Editor\n",
+            "title: Ada\ndescription: Writes guides.\npublished: true\nteam: core\nrole: Editor\n",
         );
-        write(root, "content/authors/lin/meta.yaml", "title: Lin\npublished: true\nteam: platform\n");
+        write(root, "content/authors/lin/meta.yaml", "title: Lin\npublished: true\nteam: core\n");
         write(
             root,
             "content/articles/schema.yaml",
@@ -3266,12 +3266,12 @@ mod tests {
 
         assert_eq!(
             read("articles/edge-basics/index.html"),
-            "https://example.com|articles|Articles|/articles/|Ada@/people/ada/(Editor;team=platform;nested=false)|lin,ada,"
+            "https://example.com|articles|Articles|/articles/|Ada@/people/ada/(Editor;team=core;nested=false)|lin,ada,"
         );
         assert_eq!(read("articles/no-author/index.html"), "https://example.com|articles|Articles|/articles/|none");
         // Authors resolve their own team reference; teams declare none.
         assert!(read("people/ada/index.html").starts_with("https://example.com|authors|Authors|/people/|"));
-        assert!(read("teams/platform/index.html").ends_with("|no-refs"), "{}", read("teams/platform/index.html"));
+        assert!(read("teams/core/index.html").ends_with("|no-refs"), "{}", read("teams/core/index.html"));
         assert_eq!(
             read("articles/index.html"),
             "https://example.com|articles|articles|Articles|Edge Basics=Ada;No Author=-;"
