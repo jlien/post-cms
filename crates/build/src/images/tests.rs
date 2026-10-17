@@ -200,7 +200,8 @@ fn private_and_reserved_addresses_are_not_public() {
         "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
         "224.0.0.1", "255.255.255.255", "192.0.2.1", "198.18.0.1", "240.0.0.1", "::1", "::", "fc00::1",
         "fd12::1", "fe80::1", "ff02::1", "2001:db8::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
-        "64:ff9b::a00:1", "::127.0.0.1",
+        "64:ff9b::a00:1", "::127.0.0.1", "2002:7f00:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+        "64:ff9b:1::a00:1", "fec0::1",
     ] {
         assert!(!is_public_ip(ip.parse().unwrap()), "{ip} treated as public");
     }
@@ -332,57 +333,117 @@ fn pixel_limit_is_checked_before_decoding() {
     let html = f.render(&p, &p.request_img(img(&url)));
     assert_eq!(html, format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">"));
     assert!(f.out_files().is_empty());
-    assert!(probe(&png_claiming(50_000, 50_000), &cfg_yaml("  max_pixels: 1000000\n")).unwrap_err().contains("max_pixels"));
+    assert!(probe(&png_claiming(50_000, 50_000), &cfg_yaml("  max_pixels: 1000000\n"), false).unwrap_err().contains("max_pixels"));
 }
 
 // ---- passthrough ----
 
 #[test]
-fn svg_is_copied_as_is_and_unsafe_svg_keeps_its_url() {
+fn remote_svg_keeps_its_url_and_local_svg_is_copied() {
     let f = Fixture::new();
-    let good = format!("https://{HOST}/logo.svg");
-    let bad = format!("https://{HOST}/evil.svg");
-    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 120 40"><use xlink:href="#a"/><path id="a" d="M0 0h1"/></svg>"##.to_vec();
-    let evil = br#"<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><rect/></svg>"#.to_vec();
-    let p = f.pipeline(cfg_yaml(""), false, vec![(&good, ok(svg.clone())), (&bad, ok(evil))]);
-    let body = format!("{}|{}", p.request_img(img(&good)), p.request_img(img(&bad)));
-    let html = f.render(&p, &body);
-    let files = f.out_files();
-    assert_eq!(files.len(), 1);
-    assert!(files[0].ends_with(".svg"));
-    assert_eq!(std::fs::read(f.dist.join("assets/img").join(&files[0])).unwrap(), svg);
-    assert_eq!(
-        html,
-        format!(
-            "<img src=\"/assets/img/{}\" alt=\"A\" width=\"120\" height=\"40\" loading=\"lazy\" decoding=\"async\">|<img src=\"{bad}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">",
-            files[0]
-        )
-    );
+    // Plain, plus the review's bypasses of a markup blocklist: a
+    // namespace-prefixed script element and an entity-encoded link animation.
+    let svgs: [(&str, &[u8]); 4] = [
+        ("logo", br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 40"><path d="M0 0h1"/></svg>"##),
+        ("ns-script", br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></svg>"#),
+        ("html-script", br#"<svg xmlns="http://www.w3.org/2000/svg"><h:script xmlns:h="http://www.w3.org/1999/xhtml">alert(1)</h:script></svg>"#),
+        ("entity-set", br#"<svg xmlns="http://www.w3.org/2000/svg"><a><set attributeName="&#104;ref" to="&#106;avascript:alert(1)"/><text>x</text></a></svg>"#),
+    ];
+    let urls: Vec<String> = svgs.iter().map(|(n, _)| format!("https://{HOST}/{n}.svg")).collect();
+    let files: Vec<(&str, RawResponse)> = urls.iter().zip(svgs.iter()).map(|(u, (_, b))| (u.as_str(), ok(b.to_vec()))).collect();
+    let local = svgs[0].1.to_vec();
+    std::fs::create_dir_all(f.dist.join("media")).unwrap();
+    std::fs::write(f.dist.join("media/logo.svg"), &local).unwrap();
+    let p = f.pipeline(cfg_yaml(""), false, files);
+    let mut body: Vec<String> = urls.iter().map(|u| p.request_img(img(u))).collect();
+    body.push(p.request_img(img("/media/logo.svg")));
+    std::fs::write(f.dist.join("page.html"), body.join("\n")).unwrap();
+    let stats = p.finish(4).unwrap();
+    let html = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+    let lines: Vec<&str> = html.lines().collect();
+    for (line, u) in lines.iter().zip(&urls) {
+        assert_eq!(*line, format!("<img src=\"{u}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">"));
+    }
+    assert_eq!(stats.kept.len(), 4, "{:?}", stats.kept);
+    assert!(stats.kept.iter().all(|(_, why)| why.contains("remote SVG")), "{:?}", stats.kept);
+    // nothing remote reached dist (the local copy shares bytes with logo.svg)
+    let out = f.out_files();
+    assert_eq!(out.len(), 1);
+    assert_eq!(std::fs::read(f.dist.join("assets/img").join(&out[0])).unwrap(), local);
+    assert_eq!(lines[4], format!("<img src=\"/assets/img/{}\" alt=\"A\" width=\"120\" height=\"40\" loading=\"lazy\" decoding=\"async\">", out[0]));
 }
 
 #[test]
-fn svg_checks() {
-    for bad in [
-        &b"<svg><script>alert(1)</script></svg>"[..],
-        b"<svg><a href=\"javascript:alert(1)\"><rect/></a></svg>",
-        b"<svg ONCLICK = \"x()\"></svg>",
-        b"<svg><rect/onmouseover='x()'/></svg>",
-        b"<svg><foreignObject><div/></foreignObject></svg>",
-        b"<svg><image href=\"https://tracker.example/x.png\"/></svg>",
-        b"<svg><rect style=\"fill:url(https://x.example/a)\"/></svg>",
-        b"<!DOCTYPE svg [<!ENTITY x \"y\">]><svg></svg>",
-        b"<svg><image href=\"data:image/svg+xml;base64,PHN2Zz4=\"/></svg>",
-        b"<svg><a href=\"#x\"><set attributeName=\"href\" to=\"https://x.example\"/></a></svg>",
-        b"<svg><a href =\n \"https://x.example\"/><set attributeName = \"href\"/></svg>",
-        b"<svg><a xlink:href=\"&#x6a;avascript:x\"/></svg>",
-    ] {
-        assert!(svg_problem(bad).is_some(), "{}", String::from_utf8_lossy(bad));
-    }
-    assert_eq!(svg_problem(b"<svg class=\"one\" opacity=\"1\"><rect fill=\"url(#g)\"/><use href=\"#a\"/></svg>"), None);
-    assert_eq!(svg_problem(b"<svg><image xlink:href=\"data:image/png;base64,iVBO\"/><animate xlink:href=\"#a\" attributeName=\"opacity\"/></svg>"), None);
+fn svg_dims_from_attributes_or_viewbox() {
     assert_eq!(svg_dims(b"<svg width=\"24px\" height=\"12\"></svg>"), (24, 12));
     assert_eq!(svg_dims(b"<svg viewBox=\"0 0 300.4 150\"></svg>"), (300, 150));
     assert_eq!(svg_dims(b"<svg width=\"100%\"></svg>"), (0, 0));
+}
+
+// ---- broken data ----
+
+fn truncated_png() -> Vec<u8> {
+    let b = png(300, 200);
+    b[..b.len() / 2].to_vec()
+}
+
+fn truncated_jpeg() -> Vec<u8> {
+    let img = image::RgbImage::from_fn(300, 200, |x, y| image::Rgb([x as u8, y as u8, 7]));
+    let mut b = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(img).write_to(&mut b, ImageFormat::Jpeg).unwrap();
+    let b = b.into_inner();
+    b[..b.len() / 2].to_vec()
+}
+
+fn cache_entries(f: &Fixture, sub: &str) -> usize {
+    std::fs::read_dir(f.root.join(".cache/images").join(sub)).map_or(0, |rd| rd.count())
+}
+
+#[test]
+fn truncated_images_keep_their_url_and_leave_no_cache_online_and_offline() {
+    for (name, bytes) in [("cut.png", truncated_png()), ("cut.jpg", truncated_jpeg())] {
+        let f = Fixture::new();
+        let url = format!("https://{HOST}/{name}");
+        let want = format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">");
+        // online: fetched, fails, original URL, cache evicted, build succeeds
+        let p = f.pipeline(cfg_yaml("  widths: [100]\n"), false, vec![(&url, ok(bytes.clone()))]);
+        std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+        let stats = p.finish(2).unwrap();
+        assert_eq!(std::fs::read_to_string(f.dist.join("page.html")).unwrap(), want, "{name}");
+        assert_eq!(stats.kept.len(), 1, "{name}: {:?}", stats.kept);
+        assert_eq!((cache_entries(&f, "src"), cache_entries(&f, "urls"), cache_entries(&f, "out")), (0, 0, 0), "{name}");
+        assert!(f.out_files().is_empty(), "{name}");
+        // offline after that: not in the cache, original URL
+        let p = f.pipeline(cfg_yaml("  widths: [100]\n"), true, vec![]);
+        assert_eq!(f.render(&p, &p.request_img(img(&url))), want, "{name}");
+        // offline with a poisoned cache (bad bytes indexed as good): same, and evicted
+        let content = sha_hex(&bytes);
+        write_atomic(&p.src_file(&content), &bytes).unwrap();
+        write_atomic(&p.url_index(&url), content.as_bytes()).unwrap();
+        let p = f.pipeline(cfg_yaml("  widths: [100]\n"), true, vec![]);
+        assert_eq!(f.render(&p, &p.request_img(img(&url))), want, "{name}");
+        assert_eq!((cache_entries(&f, "src"), cache_entries(&f, "urls")), (0, 0), "{name}");
+    }
+}
+
+#[test]
+fn a_decode_failure_after_the_header_check_does_not_fail_the_build() {
+    // An intact header and a corrupt body: probe passes for JPEG-free PNG
+    // data, decode fails in finish; the page keeps the URL, others still work.
+    let f = Fixture::new();
+    let bad = format!("https://{HOST}/bad.png");
+    let good = format!("https://{HOST}/good.png");
+    let mut b = png(300, 200);
+    let idat = b.windows(4).position(|w| w == b"IDAT").unwrap() + 4;
+    for x in &mut b[idat..idat + 40] {
+        *x ^= 0x5a;
+    }
+    let p = f.pipeline(cfg_yaml("  widths: [100]\n"), false, vec![(&bad, ok(b)), (&good, ok(png(300, 200)))]);
+    let html = f.render(&p, &format!("{}\n{}", p.request_img(img(&bad)), p.request_img(img(&good))));
+    let mut lines = html.lines();
+    assert_eq!(lines.next().unwrap(), format!("<img src=\"{bad}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">"));
+    assert!(lines.next().unwrap().starts_with("<picture>"));
+    assert_eq!(f.out_files().len(), 2, "only the good image's files");
 }
 
 #[test]
@@ -404,7 +465,7 @@ fn gif_and_animated_images_pass_through() {
     apng.splice(at..at, [0, 0, 0, 8, b'a', b'c', b'T', b'L', 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert!(is_apng(&apng));
     assert!(!is_apng(&png(2, 2)));
-    assert!(matches!(probe(&apng, &cfg_yaml("")).unwrap().2, Kind::Passthrough { ext: "png" }));
+    assert!(matches!(probe(&apng, &cfg_yaml(""), false).unwrap().2, Kind::Passthrough { ext: "png" }));
 }
 
 // ---- cache ----

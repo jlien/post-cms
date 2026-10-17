@@ -23,9 +23,12 @@
 //! Raster images (JPEG, PNG, static WebP) are resized to the configured
 //! widths (never upscaled), encoded as AVIF and/or WebP plus one fallback
 //! (a progressive JPEG, or PNG when a pixel is transparent), with metadata
-//! dropped (EXIF orientation is applied first). SVG, GIF and animated PNG/WebP are copied as they are; an SVG with
-//! script, event handlers, `foreignObject` or external references is refused
-//! and keeps its original URL. Sources the pipeline does not handle (another
+//! dropped (EXIF orientation is applied first). GIF and animated PNG/WebP
+//! are copied as they are. SVG is copied only from site paths (files the
+//! site already serves); a remote SVG keeps its original URL with a warning,
+//! because SVG is a document format and no blocklist reliably makes untrusted
+//! markup safe to serve from the site. A source whose data fails to decode
+//! keeps its original URL too, and its cache entries are removed. Sources the pipeline does not handle (another
 //! host, plain http, a failed fetch) render with their original URL and a
 //! warning, so a build never breaks on one bad image.
 
@@ -301,7 +304,8 @@ fn fetch_checked(url: &str, cfg: &ImagesCfg, transport: &Transport) -> Result<Ve
 
 /// True for addresses on the public internet: not loopback, private,
 /// link-local, CGNAT, multicast, documentation, or other reserved ranges
-/// (IPv4-mapped and NAT64 IPv6 are checked as their IPv4 address).
+/// (IPv4-mapped and NAT64 IPv6 are checked as their IPv4 address; 6to4,
+/// Teredo, local-use NAT64 and site-local IPv6 are refused outright).
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -333,7 +337,11 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
                 || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x2001 && s[1] == 0)
+                || s[0] == 0x2002
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
                 || s[0..6] == [0, 0, 0, 0, 0, 0])
         }
     }
@@ -471,79 +479,6 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
         && String::from_utf8_lossy(bytes).to_ascii_lowercase().contains("<svg")
 }
 
-/// Refuse an SVG that could run script or load anything when opened directly:
-/// script, event handler attributes, foreignObject, embedded documents,
-/// entity declarations, `javascript:`, animations that target links, and
-/// references other than `#fragment` or an inline raster `data:image/…`.
-pub fn svg_problem(bytes: &[u8]) -> Option<String> {
-    let Ok(text) = std::str::from_utf8(bytes) else { return Some("not UTF-8".into()) };
-    let t = text.to_ascii_lowercase();
-    for bad in ["<script", "<foreignobject", "<iframe", "<embed", "<object", "<!entity", "javascript:", "data:text", "@import", "<handler", "<listener", ] {
-        if t.contains(bad) {
-            return Some(format!("contains {bad:?}"));
-        }
-    }
-    let b = t.as_bytes();
-    for i in 1..b.len().saturating_sub(2) {
-        // an attribute named on*: whitespace or '/' or quote before "on", letters, then '='
-        if (b[i - 1].is_ascii_whitespace() || b[i - 1] == b'/' || b[i - 1] == b'"' || b[i - 1] == b'\'') && b[i] == b'o' && b[i + 1] == b'n' {
-            let mut j = i + 2;
-            while j < b.len() && b[j].is_ascii_alphabetic() {
-                j += 1;
-            }
-            let mut k = j;
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            if j > i + 2 && k < b.len() && b[k] == b'=' {
-                return Some("event handler attribute".into());
-            }
-        }
-    }
-    // href / xlink:href / src / url() must point inside the document
-    // (whitespace around `=` and inside `url(` dropped first).
-    let mut norm = String::with_capacity(t.len());
-    for c in t.chars() {
-        if c.is_whitespace() && (norm.ends_with('=') || norm.ends_with('(')) {
-            continue;
-        }
-        if c == '=' || c == '(' {
-            while norm.ends_with(char::is_whitespace) {
-                norm.pop();
-            }
-        }
-        norm.push(c);
-    }
-    let t = norm;
-    for target in ["attributename=\"href\"", "attributename=\"xlink:href\"", "attributename='href'", "attributename='xlink:href'"] {
-        if t.contains(target) {
-            return Some("animation of a link".into());
-        }
-    }
-    let inline = |v: &str| {
-        v.starts_with('#') || ["png", "jpeg", "jpg", "gif", "webp"].iter().any(|f| v.starts_with(&format!("data:image/{f};")))
-    };
-    for key in ["href=", "src="] {
-        let mut from = 0;
-        while let Some(p) = t[from..].find(key) {
-            let v = t[from + p + key.len()..].trim_start_matches(['"', '\'', ' ']);
-            if !inline(v) {
-                return Some(format!("external reference ({key})"));
-            }
-            from += p + key.len();
-        }
-    }
-    let mut from = 0;
-    while let Some(p) = t[from..].find("url(") {
-        let v = t[from + p + 4..].trim_start_matches(['"', '\'', ' ']);
-        if !inline(v) {
-            return Some("external reference (url())".into());
-        }
-        from += p + 4;
-    }
-    None
-}
-
 /// `width`/`height` of the root `<svg>` in px, else from `viewBox`.
 fn svg_dims(bytes: &[u8]) -> (u32, u32) {
     let t = String::from_utf8_lossy(bytes);
@@ -602,6 +537,13 @@ fn is_apng(b: &[u8]) -> bool {
     false
 }
 
+/// A complete JPEG ends with EOI (FF D9), allowing trailing zero padding.
+fn jpeg_has_eoi(b: &[u8]) -> bool {
+    let end = b.iter().rposition(|x| *x != 0).map_or(0, |i| i + 1);
+    let tail = &b[end.saturating_sub(1024)..end];
+    tail.windows(2).any(|w| w == [0xFF, 0xD9])
+}
+
 /// A WebP with the VP8X animation flag or an `ANIM` chunk.
 fn is_animated_webp(b: &[u8]) -> bool {
     b.len() > 21 && &b[12..16] == b"VP8X" && (b[20] & 0x02) != 0
@@ -620,10 +562,10 @@ fn reader(bytes: &[u8], fmt: ImageFormat, max_pixels: u64) -> ImageReader<Cursor
 
 /// Format, display size and handling of `bytes`, from the header only; the
 /// pixel limit is checked here, before anything is decoded.
-fn probe(bytes: &[u8], cfg: &ImagesCfg) -> Result<(u32, u32, Kind), String> {
+fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind), String> {
     if looks_like_svg(bytes) {
-        if let Some(p) = svg_problem(bytes) {
-            return Err(format!("unsafe SVG: {p}"));
+        if !local {
+            return Err("remote SVG is not copied (served from its host)".into());
         }
         let (w, h) = svg_dims(bytes);
         return Ok((w, h, Kind::Passthrough { ext: "svg" }));
@@ -639,6 +581,9 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg) -> Result<(u32, u32, Kind), String> {
         ImageFormat::Jpeg => Kind::Raster { fallback: Enc::Jpeg },
         other => return Err(format!("unsupported format {other:?}")),
     };
+    if fmt == ImageFormat::Jpeg && !jpeg_has_eoi(bytes) {
+        return Err("truncated JPEG (no end-of-image marker)".into());
+    }
     let mut dec = reader(bytes, fmt, cfg.max_pixels)
         .into_decoder()
         .map_err(|e| format!("header: {e}"))?;
@@ -668,40 +613,59 @@ fn decode(bytes: &[u8], cfg: &ImagesCfg) -> Result<DynamicImage, String> {
     Ok(img)
 }
 
+/// True when some pixel is not fully opaque. No copy for 8-bit RGBA.
+fn real_alpha(img: &DynamicImage) -> bool {
+    match img {
+        _ if !img.color().has_alpha() => false,
+        DynamicImage::ImageRgba8(b) => b.pixels().any(|p| p.0[3] != 255),
+        DynamicImage::ImageLumaA8(b) => b.pixels().any(|p| p.0[1] != 255),
+        other => other.to_rgba8().pixels().any(|p| p.0[3] != 255),
+    }
+}
+
+/// The decoded image as 8-bit RGB (no real alpha) or RGBA, converted once;
+/// resizes keep the layout, so every encoder below borrows the pixels.
+fn normalize(img: DynamicImage) -> DynamicImage {
+    let alpha = real_alpha(&img);
+    match img {
+        DynamicImage::ImageRgb8(_) => img,
+        DynamicImage::ImageRgba8(_) if alpha => img,
+        other if alpha => DynamicImage::ImageRgba8(other.to_rgba8()),
+        other => DynamicImage::ImageRgb8(other.to_rgb8()),
+    }
+}
+
+/// Encode an image produced by [`normalize`] (8-bit RGB or RGBA).
 fn encode(img: &DynamicImage, enc: Enc, cfg: &ImagesCfg) -> Result<Vec<u8>, String> {
-    let alpha = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] != 255);
+    let (w, h) = (img.width(), img.height());
     let mut buf = Cursor::new(Vec::new());
     match enc {
         Enc::Webp => {
-            let (w, h) = (img.width(), img.height());
-            let mem = if alpha {
-                let px = img.to_rgba8();
-                webp::Encoder::from_rgba(&px, w, h).encode_simple(false, cfg.webp_quality as f32)
-            } else {
-                let px = img.to_rgb8();
-                webp::Encoder::from_rgb(&px, w, h).encode_simple(false, cfg.webp_quality as f32)
-            }
-            .map_err(|e| format!("webp: {e:?}"))?;
+            let e = match img {
+                DynamicImage::ImageRgba8(b) => webp::Encoder::from_rgba(b.as_raw(), w, h),
+                DynamicImage::ImageRgb8(b) => webp::Encoder::from_rgb(b.as_raw(), w, h),
+                _ => return Err("webp: image not normalized".into()),
+            };
+            let mem = e.encode_simple(false, cfg.webp_quality as f32).map_err(|e| format!("webp: {e:?}"))?;
             return Ok(mem.to_vec());
         }
         Enc::Avif => {
             let e = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut buf, cfg.avif_speed, cfg.avif_quality)
                 .with_num_threads(Some(1));
-            if alpha {
-                img.to_rgba8().write_with_encoder(e)
-            } else {
-                DynamicImage::ImageRgb8(img.to_rgb8()).write_with_encoder(e)
-            }
-            .map_err(|e| format!("avif: {e}"))?;
+            img.write_with_encoder(e).map_err(|e| format!("avif: {e}"))?;
         }
         Enc::Jpeg => {
-            // progressive, baseline 4:2:0; no metadata segments are written
-            let rgb = img.to_rgb8();
-            let (w, h) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()));
-            let (Ok(w), Ok(h)) = (w, h) else { return Err("jpeg: over 65535 px".into()) };
+            // progressive, 4:2:0; no metadata segments are written
+            let (Ok(w16), Ok(h16)) = (u16::try_from(w), u16::try_from(h)) else {
+                return Err("jpeg: over 65535 px".into());
+            };
             let mut e = jpeg_encoder::Encoder::new(&mut buf, cfg.jpeg_quality);
             e.set_progressive(true);
-            e.encode(rgb.as_raw(), w, h, jpeg_encoder::ColorType::Rgb).map_err(|e| format!("jpeg: {e}"))?;
+            match img {
+                DynamicImage::ImageRgb8(b) => e.encode(b.as_raw(), w16, h16, jpeg_encoder::ColorType::Rgb),
+                other => e.encode(other.to_rgb8().as_raw(), w16, h16, jpeg_encoder::ColorType::Rgb),
+            }
+            .map_err(|e| format!("jpeg: {e}"))?;
         }
         Enc::Png => {
             let e = image::codecs::png::PngEncoder::new_with_quality(
@@ -709,11 +673,49 @@ fn encode(img: &DynamicImage, enc: Enc, cfg: &ImagesCfg) -> Result<Vec<u8>, Stri
                 image::codecs::png::CompressionType::Best,
                 image::codecs::png::FilterType::Adaptive,
             );
-            if alpha { img.to_rgba8().write_with_encoder(e) } else { img.to_rgb8().write_with_encoder(e) }
-                .map_err(|e| format!("png: {e}"))?;
+            img.write_with_encoder(e).map_err(|e| format!("png: {e}"))?;
         }
     }
     Ok(buf.into_inner())
+}
+
+/// A counting semaphore bounding how many full-size images are decoded and
+/// held at once (memory: about `slots x max_pixels x 8` bytes at worst).
+struct Slots {
+    free: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl Slots {
+    fn new(n: usize) -> Slots {
+        Slots { free: Mutex::new(n.max(1)), cv: std::sync::Condvar::new() }
+    }
+    fn acquire(&self) -> SlotGuard<'_> {
+        let mut f = self.free.lock().unwrap();
+        while *f == 0 {
+            f = self.cv.wait(f).unwrap();
+        }
+        *f -= 1;
+        SlotGuard(self)
+    }
+}
+
+struct SlotGuard<'a>(&'a Slots);
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
+/// Concurrent decodes: `IMAGES_DECODES`, else min(cores, 4).
+fn default_decode_slots() -> usize {
+    std::env::var("IMAGES_DECODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(4))
 }
 
 /// Percent-decode a site path; `None` on bad escapes or a decoded NUL.
@@ -824,6 +826,7 @@ pub struct Pipeline {
     nonce: String,
     transport: Box<Transport>,
     state: Mutex<State>,
+    decodes: Slots,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -903,6 +906,7 @@ impl Pipeline {
             nonce,
             transport,
             state: Mutex::new(State::default()),
+            decodes: Slots::new(default_decode_slots()),
         }
     }
 
@@ -991,13 +995,26 @@ impl Pipeline {
 
     fn resolve_one(&self, src: &str) -> Result<Arc<Source>, Option<String>> {
         let bytes = self.load(src)?;
-        let (width, height, mut kind) = probe(&bytes, &self.cfg).map_err(Some)?;
         let content = sha_hex(&bytes);
-        if let Kind::Raster { fallback: Enc::Png } = kind {
-            if !self.uses_alpha(&content, &bytes).map_err(Some)? {
-                kind = Kind::Raster { fallback: Enc::Jpeg };
+        let probed = probe(&bytes, &self.cfg, src.starts_with('/')).and_then(|(w, h, kind)| match kind {
+            Kind::Raster { fallback: Enc::Png } => {
+                let alpha = self.uses_alpha(&content, &bytes)?;
+                Ok((w, h, Kind::Raster { fallback: if alpha { Enc::Png } else { Enc::Jpeg } }))
             }
-        }
+            k => Ok((w, h, k)),
+        });
+        let (width, height, kind) = match probed {
+            Ok(v) => v,
+            Err(e) => {
+                // A broken download must not stay cached as if it were good.
+                // A refused remote SVG is policy, not bad data: its bytes may
+                // be shared with a local copy, so leave the cache alone.
+                if src.starts_with('/') || !looks_like_svg(&bytes) {
+                    self.evict(src, &content, None);
+                }
+                return Err(Some(e));
+            }
+        };
         if src.starts_with('/') {
             // local files go through the same cache, so finish() reads one place
             let f = self.src_file(&content);
@@ -1018,10 +1035,32 @@ impl Pipeline {
             Some(b"0") => return Ok(false),
             _ => {}
         }
-        let img = decode(bytes, &self.cfg)?;
-        let used = img.to_rgba8().pixels().any(|p| p.0[3] != 255);
+        let used = {
+            let _slot = self.decodes.acquire();
+            real_alpha(&decode(bytes, &self.cfg).map_err(|e| format!("decode: {e}"))?)
+        };
         write_atomic(&f, if used { b"1" } else { b"0" }).map_err(|e| format!("cache: {e}"))?;
         Ok(used)
+    }
+
+    /// Forget a source: its cached bytes, URL index entry, alpha answer, and
+    /// (with an output id) its cached variants and files already in dist.
+    fn evict(&self, src: &str, content: &str, id: Option<&str>) {
+        let _ = std::fs::remove_file(self.src_file(content));
+        let _ = std::fs::remove_file(self.cache.join("alpha").join(content));
+        if !src.starts_with('/') {
+            let _ = std::fs::remove_file(self.url_index(src));
+        }
+        if let Some(id) = id {
+            let prefix = format!("{id}-");
+            for dir in [self.cache.join("out"), self.dist.join(&self.cfg.output_dir)] {
+                for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
     }
 
     /// Widths for a source `w` px wide: the configured ones below it, plus
@@ -1185,17 +1224,6 @@ impl Pipeline {
                 let html = self.materialize(&mut st, &req);
                 st.done[i] = Some(html);
             }
-            stats.kept = st
-                .resolved
-                .iter()
-                .filter_map(|(src, r)| match r {
-                    Err(Some(why)) => Some((src.clone(), why.clone())),
-                    _ => None,
-                })
-                .collect();
-            stats.kept.sort();
-            stats.sources = st.outputs.len();
-            replacements = st.done.iter().enumerate().map(|(i, h)| (i, h.clone().unwrap_or_default())).collect();
             work = st
                 .outputs
                 .values()
@@ -1218,16 +1246,65 @@ impl Pipeline {
         std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
         let files = AtomicUsize::new(0);
         let bytes = std::sync::atomic::AtomicU64::new(0);
+        // A source that fails here (truncated or corrupt data the header
+        // check passed) keeps its original URL; the build goes on.
+        let failed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
         run_parallel(work.len(), jobs, |i| {
             let (s, outs) = &work[i];
-            let (n, b) = self.write_outputs(s, outs, &out_dir)?;
-            files.fetch_add(n, Ordering::Relaxed);
-            bytes.fetch_add(b, Ordering::Relaxed);
+            match self.write_outputs(s, outs, &out_dir) {
+                Ok((n, b)) => {
+                    files.fetch_add(n, Ordering::Relaxed);
+                    bytes.fetch_add(b, Ordering::Relaxed);
+                }
+                Err(e) => failed.lock().unwrap().push((i, e)),
+            }
             Ok(())
         })?;
+        let failed = failed.into_inner().unwrap();
         {
             let mut st = self.state.lock().unwrap();
-            for (s, outs) in &work {
+            let mut bad_ids = BTreeSet::new();
+            for (i, why) in &failed {
+                let s = &work[*i].0;
+                bad_ids.insert(s.id.clone());
+                st.outputs.remove(&s.id);
+                let srcs: Vec<String> = st
+                    .resolved
+                    .iter()
+                    .filter(|(_, r)| matches!(r, Ok(x) if x.id == s.id))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for src in srcs {
+                    eprintln!("warning: image {src}: {why}; kept the original URL");
+                    self.evict(&src, &s.content, Some(&s.id));
+                    st.resolved.insert(src, Err(Some(why.clone())));
+                }
+            }
+            // redo the markup of every request that pointed at a failed source
+            for i in 0..st.requests.len() {
+                let stale = matches!(st.resolved.get(st.requests[i].src()), Some(Err(_)))
+                    && st.done[i].as_deref().is_some_and(|h| bad_ids.iter().any(|id| h.contains(id.as_str())));
+                if stale {
+                    let req = st.requests[i].clone();
+                    let html = self.materialize(&mut st, &req);
+                    st.done[i] = Some(html);
+                }
+            }
+            stats.kept = st
+                .resolved
+                .iter()
+                .filter_map(|(src, r)| match r {
+                    Err(Some(why)) => Some((src.clone(), why.clone())),
+                    _ => None,
+                })
+                .collect();
+            stats.kept.sort();
+            stats.sources = st.outputs.len();
+            replacements = st.done.iter().enumerate().map(|(i, h)| (i, h.clone().unwrap_or_default())).collect();
+            for (i, (s, outs)) in work.iter().enumerate() {
+                if failed.iter().any(|(f, _)| *f == i) {
+                    continue;
+                }
                 match s.kind {
                     Kind::Passthrough { .. } => {
                         st.passthrough_written.insert(s.id.clone());
@@ -1259,8 +1336,9 @@ impl Pipeline {
         let cached = |o: &Out| self.cache.join("out").join(self.out_name(s, *o));
         let missing: Vec<Out> = outs.iter().copied().filter(|o| !cached(o).is_file()).collect();
         if !missing.is_empty() {
+            let _slot = self.decodes.acquire();
             let raw = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
-            let img = decode(&raw, &self.cfg).map_err(|e| format!("image {}: {e}", s.id))?;
+            let img = normalize(decode(&raw, &self.cfg).map_err(|e| format!("decode: {e}"))?);
             drop(raw);
             // largest first, each resize from the previous step (fewer pixels to filter)
             let mut by_width: BTreeMap<std::cmp::Reverse<u32>, Vec<Enc>> = BTreeMap::new();
@@ -1274,7 +1352,7 @@ impl Pipeline {
                     cur = cur.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
                 }
                 for enc in encs {
-                    let bytes = encode(&cur, enc, &self.cfg).map_err(|e| format!("image {} {w}w: {e}", s.id))?;
+                    let bytes = encode(&cur, enc, &self.cfg).map_err(|e| format!("encode {w}w: {e}"))?;
                     write_atomic(&cached(&Out { width: w, enc }), &bytes).map_err(ctx)?;
                 }
             }
