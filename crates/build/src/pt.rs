@@ -34,6 +34,9 @@
 //! | `pt/list.html` | one list (each nesting level) | `kind` (`listItem`, e.g. `bullet`, `number`), `tag` (`ul`/`ol`), `level` (1 = outermost), `items` (array of item HTML, nested lists included) |
 //! | `pt/marks/link.html` | link annotation | `href`, `blank`, `text` (plain), `text_html` (inner HTML with decorators), `mark` (the mark definition) |
 //!
+//! With the image pipeline on ([`PtOptions::images`]), an image block with no
+//! `pt/image.html` override renders through it (see `crate::images`).
+//!
 //! A template that fails to render is reported in `unhandled` as
 //! `"<name>: template error: …"`.
 
@@ -48,6 +51,9 @@ pub struct PtOptions {
     pub sanity_dataset: String,
     /// Optional width hint appended to Sanity image URLs (`?w=…&auto=format`).
     pub image_width: Option<u32>,
+    /// Build-time image pipeline (site.yaml `images:`). When set, image
+    /// blocks without a `pt/image.html` override render through it.
+    pub images: Option<std::sync::Arc<crate::images::Pipeline>>,
 }
 
 /// Result of a render: the HTML plus anything that could not be rendered.
@@ -386,6 +392,19 @@ impl<'a> Renderer<'a> {
         if let Some(html) = self.with_override("image", ctx) {
             return html;
         }
+        if let Some(p) = &self.opts.images {
+            let img = p.request_img(crate::images::ImgArgs {
+                src: src.to_string(),
+                alt: alt.to_string(),
+                width,
+                height,
+                ..Default::default()
+            });
+            return format!(
+                "<figure>{img}{}</figure>",
+                caption.map(|c| format!("<figcaption>{}</figcaption>", esc(c))).unwrap_or_default()
+            );
+        }
         format!(
             "<figure><img src=\"{}\" alt=\"{}\" loading=\"lazy\">{}</figure>",
             esc(src),
@@ -557,7 +576,7 @@ mod tests {
     }
 
     fn opts() -> PtOptions {
-        PtOptions { sanity_project_id: "p1".into(), sanity_dataset: "production".into(), image_width: None }
+        PtOptions { sanity_project_id: "p1".into(), sanity_dataset: "production".into(), image_width: None, images: None }
     }
 
     #[test]

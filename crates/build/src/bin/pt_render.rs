@@ -31,6 +31,7 @@ fn main() {
     let tera = templates.map(|dir| {
         let mut t = tera::Tera::new(&format!("{dir}/**/*.html")).unwrap_or_else(|e| fail(&format!("templates: {e}")));
         postcms_build::pt::register_filters(&mut t);
+        postcms_build::images::register(&mut t, None, "");
         t
     });
     let out = render(&blocks, &opts, tera.as_ref());

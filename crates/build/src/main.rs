@@ -425,6 +425,10 @@ struct SiteConfig {
     /// it once after loading collections.
     #[serde(skip)]
     page_collections: serde_json::Map<String, serde_json::Value>,
+    /// The image pipeline when site.yaml has `images:` (main() sets it;
+    /// see `postcms_build::images`).
+    #[serde(skip)]
+    images: Option<std::sync::Arc<postcms_build::images::Pipeline>>,
 }
 
 /// site.yaml `llms:`. Every key is optional; unset keys fall back to the
@@ -494,6 +498,7 @@ impl SiteConfig {
             sanity_project_id: project,
             sanity_dataset: dataset,
             image_width: Some(1600),
+            images: self.images.clone(),
         }
     }
 }
@@ -560,6 +565,7 @@ impl SiteConfig {
             robots: RobotsCfg::default(),
             base_url: String::new(),
             page_collections: serde_json::Map::new(),
+            images: None,
         }
     }
     fn base_ctx(&self, style: &Styling, root: &str) -> TeraContext {
@@ -636,7 +642,7 @@ fn main() -> Result<()> {
         );
     }
     let templates_dir = root.join("templates");
-    let tera = load_tera(&root, &theme_dir, &templates_dir)?;
+    let mut tera = load_tera(&root, &theme_dir, &templates_dir)?;
     let style = compile_theme_css(&root, &theme_dir, &theme_name)?;
     let css_hash = sha256_hex(style.as_bytes());
     let styling = Styling {
@@ -650,6 +656,17 @@ fn main() -> Result<()> {
     let mut cfg = SiteConfig::load(&root);
     cfg.base_url = validate_base_url(&site_base_url(&root))?;
     let _ = TRAILING_SLASH.set(cfg.trailing_slash);
+    // ---- image pipeline (site.yaml `images:`, opt-in) -----------------------
+    let images_cfg = postcms_build::images::ImagesCfg::from_site_yaml(
+        &fs::read_to_string(root.join("site.yaml")).unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    cfg.images = images_cfg.map(|ic| {
+        let offline = std::env::var("IMAGES_OFFLINE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let transport = postcms_build::images::ureq_transport(ic.timeout_secs);
+        std::sync::Arc::new(postcms_build::images::Pipeline::new(ic, &root, &dist, &cfg.base_url, offline, transport))
+    });
+    postcms_build::images::register(&mut tera, cfg.images.clone(), &cfg.base_url);
     let posts_dir = root.join("content/posts");
     let posts = if posts_dir.is_dir() { load_posts(&posts_dir)? } else { Vec::new() };
     if posts.is_empty() && cfg.builtin_pages {
@@ -740,7 +757,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let images_saved = optimize_images(&dist)?;
+    if let Some(p) = &cfg.images {
+        finish_images(p)?;
+    }
+    let skip_dir = cfg.images.as_ref().map(|p| dist.join(&p.cfg().output_dir));
+    let images_saved = optimize_images(&dist, skip_dir.as_deref())?;
     if images_saved > 0 {
         println!("optimized images: {} bytes saved", images_saved);
     }
@@ -773,7 +794,8 @@ fn main() -> Result<()> {
             }
             let root_prefix = format!("/preview/{name}");
             let out = preview_dir.join(name);
-            let ttera = load_tera(&root, &tdir, &templates_dir)?;
+            let mut ttera = load_tera(&root, &tdir, &templates_dir)?;
+            postcms_build::images::register(&mut ttera, cfg.images.clone(), &cfg.base_url);
             let tcss = compile_theme_css(&root, &tdir, name)?;
             let tcss_hash = sha256_hex(tcss.as_bytes());
             let tstyle = Styling {
@@ -801,6 +823,9 @@ fn main() -> Result<()> {
         idx.push_str("</ul><p><a href=\"/\">Back to the live site</a></p></body></html>");
         fs::create_dir_all(&preview_dir)?;
         fs::write(preview_dir.join("index.html"), idx)?;
+        if let Some(p) = &cfg.images {
+            finish_images(p)?;
+        }
         eprintln!(
             "theme previews built: {} -> /preview/<theme>/",
             built.join(", ")
@@ -818,6 +843,28 @@ fn main() -> Result<()> {
         if cfg.builtin_pages { "home, blog, contact, " } else { "" },
         if posts.is_empty() { "" } else { "rss.xml, " },
     );
+    Ok(())
+}
+
+/// Run the image pipeline over everything rendered so far and print totals.
+fn finish_images(p: &postcms_build::images::Pipeline) -> Result<()> {
+    let t = std::time::Instant::now();
+    let jobs = std::env::var("IMAGES_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let s = p.finish(jobs).map_err(|e| anyhow::anyhow!(e))?;
+    println!(
+        "images: {} sources, {} files written ({} bytes), {} kept their original URL, {:.1}s",
+        s.sources,
+        s.files,
+        s.bytes,
+        s.kept.len(),
+        t.elapsed().as_secs_f64()
+    );
+    for (url, why) in &s.kept {
+        println!("  kept original URL: {url} ({why})");
+    }
     Ok(())
 }
 
@@ -2690,7 +2737,7 @@ fn site_base_url(root: &Path) -> String {
 /// downscales any raster image larger than MAX_DIM on its long edge, and
 /// re-encodes JPEG/PNG in place when the re-encode is actually smaller.
 /// Returns total bytes saved. Only ever overwrites when it wins bytes.
-fn optimize_images(dist: &Path) -> Result<u64> {
+fn optimize_images(dist: &Path, skip: Option<&Path>) -> Result<u64> {
     use image::ImageReader;
     use std::io::Cursor;
 
@@ -2698,6 +2745,11 @@ fn optimize_images(dist: &Path) -> Result<u64> {
     const JPEG_QUALITY: u8 = 80;
     let mut saved: u64 = 0;
     for entry in walk_files(dist) {
+        // The image pipeline's outputs are already sized and encoded, and
+        // their width descriptors must stay true.
+        if skip.is_some_and(|s| entry.starts_with(s)) {
+            continue;
+        }
         let ext = entry
             .extension()
             .and_then(|e| e.to_str())
@@ -3757,5 +3809,21 @@ mod tests {
             let err = format!("{:#}", validate_base_url(bad).unwrap_err());
             assert!(err.contains("base_url") && err.contains("http(s)://host[:port]"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn optimize_images_leaves_pipeline_outputs_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1700, 10).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+        for d in ["assets/img", "other"] {
+            fs::create_dir_all(dist.join(d)).unwrap();
+            fs::write(dist.join(d).join("a.png"), &png).unwrap();
+        }
+        optimize_images(dist, Some(&dist.join("assets/img"))).unwrap();
+        assert_eq!(fs::read(dist.join("assets/img/a.png")).unwrap(), png);
+        assert_eq!(image::image_dimensions(dist.join("other/a.png")).unwrap(), (1600, 9));
     }
 }
