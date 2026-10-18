@@ -113,6 +113,11 @@ pub struct ImagesCfg {
     /// Animated GIFs: `webp` (resize, animated WebP) or `copy` (as they are).
     #[serde(default = "default_animated_gifs")]
     pub animated_gifs: AnimatedGifs,
+    /// Widest animation variant written or offered in a srcset (at any
+    /// DPR, browsers cannot pick a larger one). Animations are heavy and
+    /// rarely gain from extra pixels.
+    #[serde(default = "default_animation_max_width")]
+    pub animation_max_width: u32,
     /// Most frames an animated GIF may have, counted before decoding.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
@@ -164,6 +169,9 @@ fn default_timeout() -> u64 {
 fn default_animated_gifs() -> AnimatedGifs {
     AnimatedGifs::Webp
 }
+fn default_animation_max_width() -> u32 {
+    640
+}
 fn default_max_frames() -> u32 {
     1000
 }
@@ -213,10 +221,11 @@ impl ImagesCfg {
             || self.max_pixels == 0
             || self.timeout_secs == 0
             || self.max_frames == 0
+            || self.animation_max_width == 0
             || self.max_animation_pixels == 0
         {
             return Err(
-                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames and max_animation_pixels must be positive"
+                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames, animation_max_width and max_animation_pixels must be positive"
                     .into(),
             );
         }
@@ -761,6 +770,12 @@ fn widths_for(cfg: &ImagesCfg, w: u32) -> Vec<u32> {
     v
 }
 
+/// Widths for an animation `w` px wide: as for stills, capped at
+/// `animation_max_width`.
+fn animation_widths(cfg: &ImagesCfg, w: u32) -> Vec<u32> {
+    widths_for(cfg, w.min(cfg.animation_max_width))
+}
+
 fn scaled_height(w: u32, h: u32, to: u32) -> u32 {
     ((h as f64 * to as f64 / w as f64).round() as u32).max(1)
 }
@@ -799,8 +814,7 @@ fn check_animation(scan: &GifScan, cfg: &ImagesCfg) -> Result<(), String> {
             scan.frames, cfg.max_animation_pixels
         ));
     }
-    let mut widths = widths_for(cfg, w);
-    widths.push(widths.last().copied().unwrap().min(cfg.fallback_width));
+    let widths = animation_widths(cfg, w);
     let top = *widths.iter().max().unwrap();
     if top > WEBP_MAX_SIDE || scaled_height(w, h, top) > WEBP_MAX_SIDE {
         return Err(format!("too large for WebP (over {WEBP_MAX_SIDE} px)"));
@@ -1522,8 +1536,14 @@ impl Pipeline {
                     Kind::Raster { fallback } => fallback,
                     _ => Enc::Webp,
                 };
-                let top = *self.widths_for(src.width).last().unwrap();
-                let w = width.map_or(top, |w| w.clamp(1, src.width));
+                let (top, max) = match src.kind {
+                    Kind::Animated { .. } => (
+                        *animation_widths(&self.cfg, src.width).last().unwrap(),
+                        src.width.min(self.cfg.animation_max_width),
+                    ),
+                    _ => (*self.widths_for(src.width).last().unwrap(), src.width),
+                };
+                let w = width.map_or(top, |w| w.clamp(1, max));
                 let o = Out { width: w, enc };
                 need(o);
                 let url = self.url_path(&self.out_name(&src, o));
@@ -1532,7 +1552,7 @@ impl Pipeline {
             (Request::Img(a), Kind::Animated { .. }) => {
                 // Animated WebP only: every browser the site supports decodes
                 // it, so there is no GIF fallback to ship or download.
-                let widths = self.widths_for(src.width);
+                let widths = animation_widths(&self.cfg, src.width);
                 let top = *widths.last().unwrap();
                 let set: Vec<String> = widths
                     .iter()
@@ -1542,8 +1562,8 @@ impl Pipeline {
                         format!("{} {w}w", self.url_path(&self.out_name(&src, o)))
                     })
                     .collect();
-                let fb = Out { width: top.min(self.cfg.fallback_width), enc: Enc::Webp };
-                need(fb);
+                // src is the largest (capped) width, already in the srcset
+                let fb = Out { width: top, enc: Enc::Webp };
                 format!(
                     "<img src=\"{}\" srcset=\"{}\" sizes=\"{}\"{}",
                     self.url_path(&self.out_name(&src, fb)),

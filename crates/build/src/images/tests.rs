@@ -744,7 +744,7 @@ fn animated_gif_becomes_resized_animated_webp_with_frames_and_timing() {
     let f = Fixture::new();
     let url = format!("https://{HOST}/anim.gif");
     let gif = anim_gif(200, 100, &[(RED, 70), (GREEN, 130), (BLUE, 250)], Some(image::codecs::gif::Repeat::Infinite));
-    let p = f.pipeline(cfg_yaml("  widths: [50, 100, 400]\n  fallback_width: 100\n"), false, vec![(&url, ok(gif))]);
+    let p = f.pipeline(cfg_yaml("  widths: [50, 100, 400]\n"), false, vec![(&url, ok(gif))]);
     let html = f.render(&p, &p.request_img(img(&url)));
     // srcset of animated WebP at each width up to the source (never upscaled), no GIF
     let files = f.out_files();
@@ -753,7 +753,7 @@ fn animated_gif_becomes_resized_animated_webp_with_frames_and_timing() {
     let name = |w: u32| files.iter().find(|n| n.ends_with(&format!("-{w}.webp"))).unwrap().clone();
     let want = format!(
         "<img src=\"/assets/img/{}\" srcset=\"/assets/img/{} 50w, /assets/img/{} 100w, /assets/img/{} 200w\" sizes=\"auto, 100vw\" alt=\"A\" width=\"200\" height=\"100\" loading=\"lazy\" decoding=\"async\">",
-        name(100),
+        name(200),
         name(50),
         name(100),
         name(200)
@@ -771,6 +771,38 @@ fn animated_gif_becomes_resized_animated_webp_with_frames_and_timing() {
         }
         assert_eq!(webp_loop_count(&bytes), 0);
     }
+}
+
+#[test]
+fn animation_max_width_caps_every_variant_and_the_src() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/wide.gif");
+    let gif = anim_gif(400, 100, &[(RED, 50), (GREEN, 50)], None);
+    let cfg = cfg_yaml("  widths: [100, 200, 300, 800]\n  animation_max_width: 250\n");
+    assert_eq!(cfg.animation_max_width, 250);
+    assert_eq!(cfg_yaml("").animation_max_width, 640, "default");
+    let p = f.pipeline(cfg, false, vec![(&url, ok(gif))]);
+    let a = p.request_img(img(&url));
+    let u = p.request_url(&url, Some(5000), false);
+    let html = f.render(&p, &format!("{a}\n{u}"));
+    let files = f.out_files();
+    let name = |w: u32| files.iter().find(|n| n.ends_with(&format!("-{w}.webp"))).unwrap().clone();
+    assert_eq!(files.len(), 3, "100, 200 and the cap 250: {files:?}");
+    let want = format!(
+        "<img src=\"/assets/img/{}\" srcset=\"/assets/img/{} 100w, /assets/img/{} 200w, /assets/img/{} 250w\" sizes=\"auto, 100vw\" alt=\"A\" width=\"250\" height=\"63\" loading=\"lazy\" decoding=\"async\">\n/assets/img/{}",
+        name(250),
+        name(100),
+        name(200),
+        name(250),
+        name(250)
+    );
+    assert_eq!(html, want);
+    assert_eq!(webp_frames(&std::fs::read(f.dist.join("assets/img").join(name(250))).unwrap())[0].0, 250);
+    // stills are not capped
+    let still = format!("https://{HOST}/still.png");
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml("  widths: [800]\n  animation_max_width: 250\n"), false, vec![(&still, ok(png(900, 100)))]);
+    assert!(f.render(&p, &p.request_img(img(&still))).contains("-800.webp 800w"));
 }
 
 #[test]
