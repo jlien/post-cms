@@ -23,8 +23,11 @@
 //! Raster images (JPEG, PNG, static WebP) are resized to the configured
 //! widths (never upscaled), encoded as AVIF and/or WebP plus one fallback
 //! (a progressive JPEG, or PNG when a pixel is transparent), with metadata
-//! dropped (EXIF orientation is applied first). GIF and animated PNG/WebP
-//! are copied as they are. SVG is copied only from site paths (files the
+//! dropped (EXIF orientation is applied first). Animated GIFs are resized
+//! to the same widths frame by frame and encoded as animated WebP (timing
+//! and loop count kept); their frame count, total pixels and decode memory
+//! are checked from the block structure before any frame is decoded. A
+//! single-frame GIF is a still. Animated PNG/WebP are copied as they are. SVG is copied only from site paths (files the
 //! site already serves); a remote SVG keeps its original URL with a warning,
 //! because SVG is a document format and no blocklist reliably makes untrusted
 //! markup safe to serve from the site. A source whose data fails to decode
@@ -52,6 +55,16 @@ const WEBP_MAX_SIDE: u32 = 16383;
 /// Upper bound for any configured width.
 const MAX_WIDTH: u32 = 8192;
 const ACCEPT: &str = "image/webp,image/png,image/jpeg,image/gif,image/svg+xml;q=0.9,*/*;q=0.1";
+
+/// What happens to an animated GIF (`images.animated_gifs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnimatedGifs {
+    /// Resized and encoded as animated WebP (the default).
+    Webp,
+    /// Copied byte for byte under a hashed name.
+    Copy,
+}
 
 /// A modern format generated next to the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
@@ -97,6 +110,20 @@ pub struct ImagesCfg {
     pub max_pixels: u64,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Animated GIFs: `webp` (resize, animated WebP) or `copy` (as they are).
+    #[serde(default = "default_animated_gifs")]
+    pub animated_gifs: AnimatedGifs,
+    /// Widest animation variant written or offered in a srcset (at any
+    /// DPR, browsers cannot pick a larger one). Animations are heavy and
+    /// rarely gain from extra pixels.
+    #[serde(default = "default_animation_max_width")]
+    pub animation_max_width: u32,
+    /// Most frames an animated GIF may have, counted before decoding.
+    #[serde(default = "default_max_frames")]
+    pub max_frames: u32,
+    /// Largest animation accepted: width x height x frames, checked before decoding.
+    #[serde(default = "default_max_animation_pixels")]
+    pub max_animation_pixels: u64,
     /// Cache directory, relative to the site root unless absolute
     /// (`IMAGES_CACHE_DIR` overrides it).
     #[serde(default = "default_cache_dir")]
@@ -139,6 +166,18 @@ fn default_max_pixels() -> u64 {
 fn default_timeout() -> u64 {
     30
 }
+fn default_animated_gifs() -> AnimatedGifs {
+    AnimatedGifs::Webp
+}
+fn default_animation_max_width() -> u32 {
+    640
+}
+fn default_max_frames() -> u32 {
+    1000
+}
+fn default_max_animation_pixels() -> u64 {
+    1_000_000_000
+}
 fn default_cache_dir() -> String {
     ".cache/images".into()
 }
@@ -174,11 +213,23 @@ impl ImagesCfg {
                 return Err(format!("{name} must be 1 to 100"));
             }
         }
+        if !(1..=WEBP_MAX_SIDE).contains(&self.animation_max_width) {
+            return Err(format!("animation_max_width must be 1 to {WEBP_MAX_SIDE}"));
+        }
         if !(1..=10).contains(&self.avif_speed) {
             return Err("avif_speed must be 1 to 10".into());
         }
-        if self.fallback_width == 0 || self.max_bytes == 0 || self.max_pixels == 0 || self.timeout_secs == 0 {
-            return Err("fallback_width, max_bytes, max_pixels and timeout_secs must be positive".into());
+        if self.fallback_width == 0
+            || self.max_bytes == 0
+            || self.max_pixels == 0
+            || self.timeout_secs == 0
+            || self.max_frames == 0
+            || self.max_animation_pixels == 0
+        {
+            return Err(
+                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames and max_animation_pixels must be positive"
+                    .into(),
+            );
         }
         let out_ok = !self.output_dir.is_empty()
             && self.output_dir.split('/').all(|s| {
@@ -445,7 +496,10 @@ impl Enc {
 enum Kind {
     /// Resized and re-encoded; `fallback` is JPEG, or PNG for real transparency.
     Raster { fallback: Enc },
-    /// Copied byte for byte (SVG, GIF, animated PNG/WebP).
+    /// An animated GIF, resized frame by frame into animated WebP only.
+    /// `loop_count` is WebP's (0 = forever).
+    Animated { loop_count: u32 },
+    /// Copied byte for byte (SVG, animated PNG/WebP, GIF with `animated_gifs: copy`).
     Passthrough { ext: &'static str },
 }
 
@@ -571,7 +625,16 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind),
         return Ok((w, h, Kind::Passthrough { ext: "svg" }));
     }
     let fmt = image::guess_format(bytes).map_err(|_| "unknown image format".to_string())?;
+    if fmt == ImageFormat::Gif && cfg.animated_gifs == AnimatedGifs::Webp {
+        let scan = gif_scan(bytes, cfg)?;
+        if scan.frames > 1 {
+            check_animation(&scan, cfg)?;
+            return Ok((scan.width, scan.height, Kind::Animated { loop_count: scan.loop_count }));
+        }
+    }
     let kind = match fmt {
+        // a single-frame GIF is a still (alpha decides its fallback below)
+        ImageFormat::Gif if cfg.animated_gifs == AnimatedGifs::Webp => Kind::Raster { fallback: Enc::Png },
         ImageFormat::Gif => Kind::Passthrough { ext: "gif" },
         ImageFormat::Png if is_apng(bytes) => Kind::Passthrough { ext: "png" },
         ImageFormat::WebP if is_animated_webp(bytes) => Kind::Passthrough { ext: "webp" },
@@ -611,6 +674,382 @@ fn decode(bytes: &[u8], cfg: &ImagesCfg) -> Result<DynamicImage, String> {
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
     img.apply_orientation(o);
     Ok(img)
+}
+
+// ---- animated GIF ----------------------------------------------------------
+
+/// What a GIF's block structure says, read without decompressing a pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GifScan {
+    width: u32,
+    height: u32,
+    frames: u32,
+    /// Sum of every frame's own width x height: what the decoder fills.
+    frame_pixels: u64,
+    /// WebP loop count: 0 plays forever. A GIF without a NETSCAPE2.0 loop
+    /// extension plays once in browsers; a GIF loop count of n repeats n
+    /// times after the first play.
+    loop_count: u32,
+}
+
+/// Walk a GIF's blocks: count frames, read the loop count, and check every
+/// frame's rectangle, without running the LZW decoder. Stops as soon as the
+/// frame count passes `max_frames`, so a frame bomb costs one pass over its
+/// bytes. Truncated or malformed structure is an error.
+fn gif_scan(b: &[u8], cfg: &ImagesCfg) -> Result<GifScan, String> {
+    const TRUNC: &str = "truncated GIF";
+    if b.len() < 13 || !(b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) {
+        return Err("not a GIF".into());
+    }
+    let width = u16::from_le_bytes([b[6], b[7]]) as u32;
+    let height = u16::from_le_bytes([b[8], b[9]]) as u32;
+    if width == 0 || height == 0 {
+        return Err("zero size".into());
+    }
+    let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
+    let skip_sub_blocks = |mut i: usize| -> Result<usize, String> {
+        loop {
+            let n = *b.get(i).ok_or(TRUNC)? as usize;
+            i += 1 + n;
+            if n == 0 {
+                return Ok(i);
+            }
+            if i > b.len() {
+                return Err(TRUNC.into());
+            }
+        }
+    };
+    let mut i = 13 + table(b[10]);
+    let mut frames = 0u32;
+    let mut frame_pixels = 0u64;
+    let mut repeat: Option<u16> = None;
+    loop {
+        match b.get(i) {
+            // tolerate a missing trailer after complete frames, as browsers do
+            None if frames > 0 => break,
+            None => return Err(TRUNC.into()),
+            Some(0x3B) => break,
+            Some(0x21) => {
+                let label = *b.get(i + 1).ok_or(TRUNC)?;
+                i += 2;
+                if label == 0xFF && b.get(i) == Some(&11) && b.get(i + 1..i + 12) == Some(b"NETSCAPE2.0".as_slice()) {
+                    if let Some([3, 1, lo, hi]) = b.get(i + 12..i + 16) {
+                        repeat = Some(u16::from_le_bytes([*lo, *hi]));
+                    }
+                }
+                i = skip_sub_blocks(i)?;
+            }
+            Some(0x2C) => {
+                let d = b.get(i + 1..i + 10).ok_or(TRUNC)?;
+                let (left, top) = (u16::from_le_bytes([d[0], d[1]]) as u64, u16::from_le_bytes([d[2], d[3]]) as u64);
+                let (fw, fh) = (u16::from_le_bytes([d[4], d[5]]) as u64, u16::from_le_bytes([d[6], d[7]]) as u64);
+                // The decoder allocates and decodes a frame at its own size,
+                // even where it falls outside the screen (which browsers
+                // clip), so a frame must fit the screen.
+                if left + fw > width as u64 || top + fh > height as u64 {
+                    return Err(format!(
+                        "a {fw}x{fh} frame at {left},{top} falls outside the {width}x{height} screen"
+                    ));
+                }
+                if fw * fh > cfg.max_pixels {
+                    return Err(format!("a {fw}x{fh} frame is over max_pixels ({})", cfg.max_pixels));
+                }
+                frames += 1;
+                if frames > cfg.max_frames {
+                    return Err(format!("over max_frames ({})", cfg.max_frames));
+                }
+                frame_pixels += fw * fh;
+                if frame_pixels > cfg.max_animation_pixels {
+                    return Err(format!("frames total over max_animation_pixels ({})", cfg.max_animation_pixels));
+                }
+                // descriptor, local color table, LZW minimum code size, data
+                i = skip_sub_blocks(i + 10 + table(d[8]) + 1)?;
+            }
+            Some(x) => return Err(format!("malformed GIF (block 0x{x:02x})")),
+        }
+    }
+    if frames == 0 {
+        return Err("GIF has no frames".into());
+    }
+    let loop_count = match repeat {
+        None => 1,
+        Some(0) => 0,
+        Some(n) => n as u32 + 1,
+    };
+    Ok(GifScan { width, height, frames, frame_pixels, loop_count })
+}
+
+/// Widths for a source `w` px wide: the configured ones below it, plus
+/// `min(w, largest)`. Never larger than the source.
+fn widths_for(cfg: &ImagesCfg, w: u32) -> Vec<u32> {
+    let top = w.min(*cfg.widths.last().unwrap());
+    let mut v: Vec<u32> = cfg.widths.iter().copied().filter(|x| *x < top).collect();
+    v.push(top);
+    v
+}
+
+/// Widths for an animation `w` px wide: as for stills, capped at
+/// `animation_max_width`.
+fn animation_widths(cfg: &ImagesCfg, w: u32) -> Vec<u32> {
+    widths_for(cfg, w.min(cfg.animation_max_width))
+}
+
+fn scaled_height(w: u32, h: u32, to: u32) -> u32 {
+    ((h as f64 * to as f64 / w as f64).round() as u32).max(1)
+}
+
+/// Peak memory, in bytes, to decode a `w` x `h` animation and encode it at
+/// `widths` in one pass: the decoder's canvases and frame buffers (16 B/px
+/// of the source), and per width the resize pass (16 B/px, f32) plus the
+/// resized frame and the WebP encoder's canvases (32 B/px).
+fn animation_memory(w: u32, h: u32, widths: &[u32]) -> u64 {
+    let mut ws: Vec<u32> = widths.to_vec();
+    ws.sort_unstable_by(|a, b| b.cmp(a));
+    let mut total = w as u64 * h as u64 * 16;
+    let mut prev_h = h as u64;
+    for tw in ws {
+        let th = scaled_height(w, h, tw) as u64;
+        total += tw as u64 * prev_h * 16 + tw as u64 * th * 32;
+        prev_h = th;
+    }
+    total
+}
+
+/// The per-decode memory budget: what one still may take (`max_pixels` x 8
+/// bytes), so `IMAGES_DECODES` bounds animations the same way.
+fn decode_budget(cfg: &ImagesCfg) -> u64 {
+    cfg.max_pixels.saturating_mul(8)
+}
+
+/// Refuse an animation over the frame, total-pixel, memory or WebP size
+/// limits, from the header scan alone.
+fn check_animation(scan: &GifScan, cfg: &ImagesCfg) -> Result<(), String> {
+    let (w, h) = (scan.width, scan.height);
+    let total = w as u64 * h as u64 * scan.frames as u64;
+    if total > cfg.max_animation_pixels {
+        return Err(format!(
+            "{w}x{h} x {} frames is over max_animation_pixels ({})",
+            scan.frames, cfg.max_animation_pixels
+        ));
+    }
+    let widths = animation_widths(cfg, w);
+    let top = *widths.iter().max().unwrap();
+    if top > WEBP_MAX_SIDE || scaled_height(w, h, top) > WEBP_MAX_SIDE {
+        return Err(format!("too large for WebP (over {WEBP_MAX_SIDE} px)"));
+    }
+    check_animation_memory(w, h, &widths, cfg)
+}
+
+fn check_animation_memory(w: u32, h: u32, widths: &[u32], cfg: &ImagesCfg) -> Result<(), String> {
+    let need = animation_memory(w, h, widths);
+    if need > decode_budget(cfg) {
+        return Err(format!(
+            "decoding needs about {} MB, over the {} MB per-image budget (max_pixels x 8)",
+            need >> 20,
+            decode_budget(cfg) >> 20
+        ));
+    }
+    Ok(())
+}
+
+/// One animated WebP being written frame by frame (libwebp's
+/// `WebPAnimEncoder`), so only the current frame is held in memory.
+struct AnimWriter {
+    enc: std::ptr::NonNull<libwebp_sys::WebPAnimEncoder>,
+    config: libwebp_sys::WebPConfig,
+    width: u32,
+    height: u32,
+}
+
+impl AnimWriter {
+    fn new(width: u32, height: u32, loop_count: u32, quality: u8) -> Result<AnimWriter, String> {
+        use libwebp_sys::*;
+        let abi = WebPGetMuxABIVersion();
+        // SAFETY: each init function fills the struct it is given; results are checked.
+        unsafe {
+            let mut opts = std::mem::MaybeUninit::<WebPAnimEncoderOptions>::uninit();
+            if WebPAnimEncoderOptionsInitInternal(opts.as_mut_ptr(), abi) == 0 {
+                return Err("webp: animation options (library version mismatch)".into());
+            }
+            let mut opts = opts.assume_init();
+            opts.anim_params.loop_count = loop_count.min(65535) as std::os::raw::c_int;
+            // per frame, lossy at `quality` or lossless, whichever is smaller
+            opts.allow_mixed = 1;
+            let mut config = std::mem::MaybeUninit::<WebPConfig>::uninit();
+            if WebPConfigInitInternal(
+                config.as_mut_ptr(),
+                WebPPreset::WEBP_PRESET_DEFAULT,
+                quality as f32,
+                WEBP_ENCODER_ABI_VERSION as std::os::raw::c_int,
+            ) == 0
+            {
+                return Err("webp: config (library version mismatch)".into());
+            }
+            let config = config.assume_init();
+            if WebPValidateConfig(&config) == 0 {
+                return Err("webp: invalid config".into());
+            }
+            let enc = WebPAnimEncoderNewInternal(width as _, height as _, &opts, abi);
+            let enc = std::ptr::NonNull::new(enc).ok_or("webp: cannot create the animation encoder")?;
+            Ok(AnimWriter { enc, config, width, height })
+        }
+    }
+
+    fn error(&self) -> String {
+        // SAFETY: the encoder is live; the message is a C string it owns.
+        let p = unsafe { libwebp_sys::WebPAnimEncoderGetError(self.enc.as_ptr()) };
+        if p.is_null() {
+            return "webp: animation encoding failed".into();
+        }
+        format!("webp: {}", unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy())
+    }
+
+    /// Add one full frame (8-bit RGBA, `width` x `height`) shown from `ms`.
+    fn add(&mut self, rgba: &[u8], ms: i32) -> Result<(), String> {
+        use libwebp_sys::*;
+        if rgba.len() != self.width as usize * self.height as usize * 4 {
+            return Err("webp: frame size mismatch".into());
+        }
+        // SAFETY: the picture is initialized, imported from a buffer of the
+        // checked size, handed to the encoder (which copies it), then freed.
+        unsafe {
+            let mut pic = std::mem::MaybeUninit::<WebPPicture>::uninit();
+            if WebPPictureInitInternal(pic.as_mut_ptr(), WEBP_ENCODER_ABI_VERSION as _) == 0 {
+                return Err("webp: picture (library version mismatch)".into());
+            }
+            let mut pic = pic.assume_init();
+            pic.use_argb = 1;
+            pic.width = self.width as _;
+            pic.height = self.height as _;
+            if WebPPictureImportRGBA(&mut pic, rgba.as_ptr(), (self.width * 4) as _) == 0 {
+                WebPPictureFree(&mut pic);
+                return Err("webp: out of memory importing a frame".into());
+            }
+            let ok = WebPAnimEncoderAdd(self.enc.as_ptr(), &mut pic, ms, &self.config);
+            WebPPictureFree(&mut pic);
+            if ok == 0 {
+                return Err(self.error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the animation at `end_ms` (the last frame's end) and return the file.
+    fn finish(self, end_ms: i32) -> Result<Vec<u8>, String> {
+        use libwebp_sys::*;
+        // SAFETY: a null frame flushes the encoder; the assembled data is
+        // copied out and released with libwebp's own free.
+        unsafe {
+            if WebPAnimEncoderAdd(self.enc.as_ptr(), std::ptr::null_mut(), end_ms, std::ptr::null()) == 0 {
+                return Err(self.error());
+            }
+            let mut data = WebPData { bytes: std::ptr::null(), size: 0 };
+            if WebPAnimEncoderAssemble(self.enc.as_ptr(), &mut data) == 0 {
+                return Err(self.error());
+            }
+            let out = std::slice::from_raw_parts(data.bytes, data.size).to_vec();
+            WebPDataClear(&mut data);
+            Ok(out)
+        }
+    }
+}
+
+impl Drop for AnimWriter {
+    fn drop(&mut self) {
+        // SAFETY: created by WebPAnimEncoderNewInternal, deleted once.
+        unsafe { libwebp_sys::WebPAnimEncoderDelete(self.enc.as_ptr()) }
+    }
+}
+
+/// Scale color by alpha, so resizing blends no color from transparent pixels.
+fn premultiply(img: &mut image::RgbaImage) {
+    for p in img.pixels_mut() {
+        let a = p.0[3] as u32;
+        if a < 255 {
+            for c in &mut p.0[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// A resized, premultiplied frame back to straight alpha, with GIF's 1-bit
+/// transparency (alpha 0 or 255): soft edges from resizing would otherwise
+/// cost far more in WebP's lossless alpha plane than the GIF they came from.
+fn gif_alpha(img: &image::RgbaImage) -> image::RgbaImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        let a = p.0[3] as u32;
+        if a >= 128 {
+            for c in &mut p.0[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+            p.0[3] = 255;
+        } else {
+            p.0 = [0, 0, 0, 0];
+        }
+    }
+    out
+}
+
+/// Decode an animated GIF once, frame by frame, and encode it as animated
+/// WebP at each of `widths` (the returned files are in the same order).
+/// Frame timing is kept; delays of 10 ms or less play at 100 ms, as browsers
+/// show them. Decoder allocations are capped at the per-image budget.
+fn encode_animation(bytes: &[u8], widths: &[u32], loop_count: u32, cfg: &ImagesCfg) -> Result<Vec<Vec<u8>>, String> {
+    use image::AnimationDecoder;
+    let mut dec = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).map_err(|e| format!("decode: {e}"))?;
+    let (w, h) = dec.dimensions();
+    check_animation_memory(w, h, widths, cfg)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(decode_budget(cfg));
+    dec.set_limits(limits).map_err(|e| format!("decode: {e}"))?;
+    // largest first, each frame resized from the previous step
+    let mut order: Vec<usize> = (0..widths.len()).collect();
+    order.sort_by(|a, b| widths[*b].cmp(&widths[*a]));
+    let mut writers = order
+        .iter()
+        .map(|&i| AnimWriter::new(widths[i], scaled_height(w, h, widths[i]), loop_count, cfg.webp_quality))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut t: i64 = 0;
+    let mut n: u32 = 0;
+    for frame in dec.into_frames() {
+        let frame = frame.map_err(|e| format!("decode frame {n}: {e}"))?;
+        n += 1;
+        if n > cfg.max_frames {
+            return Err(format!("over max_frames ({})", cfg.max_frames));
+        }
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = num as i64 / den.max(1) as i64;
+        let ms = if ms <= 10 { 100 } else { ms };
+        let mut cur = frame.into_buffer();
+        let opaque = cur.pixels().all(|p| p.0[3] == 255);
+        if !opaque {
+            premultiply(&mut cur);
+        }
+        for wr in writers.iter_mut() {
+            if cur.width() != wr.width || cur.height() != wr.height {
+                cur = image::imageops::resize(&cur, wr.width, wr.height, image::imageops::FilterType::Lanczos3);
+            }
+            if opaque {
+                wr.add(cur.as_raw(), t as i32)?;
+            } else {
+                wr.add(gif_alpha(&cur).as_raw(), t as i32)?;
+            }
+        }
+        t += ms;
+        if t > i32::MAX as i64 {
+            return Err("animation too long".into());
+        }
+    }
+    if n == 0 {
+        return Err("decode: no frames".into());
+    }
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; widths.len()];
+    for (wr, i) in writers.into_iter().zip(order) {
+        out[i] = Some(wr.finish(t as i32)?);
+    }
+    Ok(out.into_iter().map(Option::unwrap).collect())
 }
 
 /// True when some pixel is not fully opaque. No copy for 8-bit RGBA.
@@ -1022,7 +1461,9 @@ impl Pipeline {
                 write_atomic(&f, &bytes).map_err(|e| Some(format!("cache: {e}")))?;
             }
         }
-        let id = sha_hex(format!("{content}|{}", self.cfg.settings()).as_bytes())[..16].to_string();
+        // animations get their own suffix, so stills keep their names
+        let anim = if matches!(kind, Kind::Animated { .. }) { "|anim1" } else { "" };
+        let id = sha_hex(format!("{content}|{}{anim}", self.cfg.settings()).as_bytes())[..16].to_string();
         Ok(Arc::new(Source { content, id, width, height, kind }))
     }
 
@@ -1066,10 +1507,7 @@ impl Pipeline {
     /// Widths for a source `w` px wide: the configured ones below it, plus
     /// `min(w, largest)`. Never larger than the source.
     fn widths_for(&self, w: u32) -> Vec<u32> {
-        let top = w.min(*self.cfg.widths.last().unwrap());
-        let mut v: Vec<u32> = self.cfg.widths.iter().copied().filter(|x| *x < top).collect();
-        v.push(top);
-        v
+        widths_for(&self.cfg, w)
     }
 
     fn height_for(s: &Source, w: u32) -> u32 {
@@ -1110,13 +1548,47 @@ impl Pipeline {
                 let url = self.url_path(&format!("{}.{ext}", src.id));
                 esc(&if *absolute { format!("{}{url}", self.base_url) } else { url })
             }
-            (Request::Url { width, absolute, .. }, Kind::Raster { fallback }) => {
-                let top = *self.widths_for(src.width).last().unwrap();
-                let w = width.map_or(top, |w| w.clamp(1, src.width));
-                let o = Out { width: w, enc: fallback };
+            (Request::Url { width, absolute, .. }, Kind::Raster { .. } | Kind::Animated { .. }) => {
+                // animations: animated WebP, the only animated output
+                let enc = match src.kind {
+                    Kind::Raster { fallback } => fallback,
+                    _ => Enc::Webp,
+                };
+                let (top, max) = match src.kind {
+                    Kind::Animated { .. } => (
+                        *animation_widths(&self.cfg, src.width).last().unwrap(),
+                        src.width.min(self.cfg.animation_max_width),
+                    ),
+                    _ => (*self.widths_for(src.width).last().unwrap(), src.width),
+                };
+                let w = width.map_or(top, |w| w.clamp(1, max));
+                let o = Out { width: w, enc };
                 need(o);
                 let url = self.url_path(&self.out_name(&src, o));
                 esc(&if *absolute { format!("{}{url}", self.base_url) } else { url })
+            }
+            (Request::Img(a), Kind::Animated { .. }) => {
+                // Animated WebP only: every browser the site supports decodes
+                // it, so there is no GIF fallback to ship or download.
+                let widths = animation_widths(&self.cfg, src.width);
+                let top = *widths.last().unwrap();
+                let set: Vec<String> = widths
+                    .iter()
+                    .map(|w| {
+                        let o = Out { width: *w, enc: Enc::Webp };
+                        need(o);
+                        format!("{} {w}w", self.url_path(&self.out_name(&src, o)))
+                    })
+                    .collect();
+                // src is the largest (capped) width, already in the srcset
+                let fb = Out { width: top, enc: Enc::Webp };
+                format!(
+                    "<img src=\"{}\" srcset=\"{}\" sizes=\"{}\"{}",
+                    self.url_path(&self.out_name(&src, fb)),
+                    set.join(", "),
+                    sizes(a),
+                    img_tail(a, Some(top), Some(Self::height_for(&src, top)))
+                )
             }
             (Request::Img(a), Kind::Raster { fallback }) => {
                 let widths = self.widths_for(src.width);
@@ -1233,7 +1705,7 @@ impl Pipeline {
                         .copied()
                         .filter(|o| match s.kind {
                             Kind::Passthrough { .. } => !st.passthrough_written.contains(&s.id),
-                            Kind::Raster { .. } => !st.written.contains(&(s.id.clone(), *o)),
+                            Kind::Raster { .. } | Kind::Animated { .. } => !st.written.contains(&(s.id.clone(), *o)),
                         })
                         .collect();
                     (s.clone(), new)
@@ -1309,7 +1781,7 @@ impl Pipeline {
                     Kind::Passthrough { .. } => {
                         st.passthrough_written.insert(s.id.clone());
                     }
-                    Kind::Raster { .. } => {
+                    Kind::Raster { .. } | Kind::Animated { .. } => {
                         for o in outs {
                             st.written.insert((s.id.clone(), *o));
                         }
@@ -1335,7 +1807,15 @@ impl Pipeline {
         }
         let cached = |o: &Out| self.cache.join("out").join(self.out_name(s, *o));
         let missing: Vec<Out> = outs.iter().copied().filter(|o| !cached(o).is_file()).collect();
-        if !missing.is_empty() {
+        if let (Kind::Animated { loop_count }, false) = (s.kind, missing.is_empty()) {
+            let _slot = self.decodes.acquire();
+            let raw = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
+            let widths: Vec<u32> = missing.iter().map(|o| o.width).collect();
+            let files = encode_animation(&raw, &widths, loop_count, &self.cfg)?;
+            for (o, bytes) in missing.iter().zip(files) {
+                write_atomic(&cached(o), &bytes).map_err(ctx)?;
+            }
+        } else if !missing.is_empty() {
             let _slot = self.decodes.acquire();
             let raw = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
             let img = normalize(decode(&raw, &self.cfg).map_err(|e| format!("decode: {e}"))?);

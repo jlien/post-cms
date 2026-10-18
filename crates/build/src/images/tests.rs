@@ -447,13 +447,13 @@ fn a_decode_failure_after_the_header_check_does_not_fail_the_build() {
 }
 
 #[test]
-fn gif_and_animated_images_pass_through() {
+fn gif_with_copy_and_animated_images_pass_through() {
     let f = Fixture::new();
     let url = format!("https://{HOST}/a.gif");
     let mut gif = Cursor::new(Vec::new());
     DynamicImage::new_rgba8(30, 10).write_to(&mut gif, ImageFormat::Gif).unwrap();
     let gif = gif.into_inner();
-    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(gif.clone()))]);
+    let p = f.pipeline(cfg_yaml("  animated_gifs: copy\n"), false, vec![(&url, ok(gif.clone()))]);
     let html = f.render(&p, &p.request_img(img(&url)));
     let files = f.out_files();
     assert_eq!(files.len(), 1);
@@ -667,4 +667,341 @@ fn failed_sources_are_listed_in_the_stats() {
     let stats = p.finish(2).unwrap();
     // the foreign host is not ours, so it is not a failure
     assert_eq!(stats.kept, vec![(gone.clone(), "HTTP 403".to_string())]);
+}
+
+// ---- animated GIF ----
+
+/// An animated GIF: one solid-color frame per `(rgb, delay in ms)`.
+fn anim_gif(w: u32, h: u32, frames: &[([u8; 3], u32)], repeat: Option<image::codecs::gif::Repeat>) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        if let Some(r) = repeat {
+            enc.set_repeat(r).unwrap();
+        }
+        for (rgb, ms) in frames {
+            let buf = image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            let d = image::Delay::from_numer_denom_ms(*ms, 1);
+            enc.encode_frame(image::Frame::from_parts(buf, 0, 0, d)).unwrap();
+        }
+    }
+    out
+}
+
+/// A GIF whose `w` x `h` canvas holds `n` one-pixel frames: a few hundred
+/// bytes on the wire, `w * h * n` pixels once composited (a frame bomb).
+fn frame_bomb(w: u16, h: u16, n: usize) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend(w.to_le_bytes());
+    b.extend(h.to_le_bytes());
+    b.extend([0x80, 0, 0]); // global table of 2 colors
+    b.extend([0, 0, 0, 255, 255, 255]);
+    b.extend([0x21, 0xFF, 11]);
+    b.extend(b"NETSCAPE2.0");
+    b.extend([3, 1, 0, 0, 0]);
+    for _ in 0..n {
+        b.extend([0x21, 0xF9, 4, 0, 1, 0, 0, 0]); // 10 ms
+        b.extend([0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]); // 1x1 at 0,0
+        b.extend([2, 2, 0x44, 0x01, 0]); // LZW: clear, 0, end
+    }
+    b.push(0x3B);
+    b
+}
+
+/// Frames of an animated WebP: (width, height, delay ms, first pixel).
+fn webp_frames(bytes: &[u8]) -> Vec<(u32, u32, u32, [u8; 4])> {
+    use image::AnimationDecoder;
+    let dec = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).unwrap();
+    dec.into_frames()
+        .map(|f| {
+            let f = f.unwrap();
+            let (n, d) = f.delay().numer_denom_ms();
+            let buf = f.into_buffer();
+            (buf.width(), buf.height(), n / d, buf.get_pixel(buf.width() / 2, buf.height() / 2).0)
+        })
+        .collect()
+}
+
+/// The WebP's loop count: 0 plays forever.
+fn webp_loop_count(bytes: &[u8]) -> u32 {
+    use image::AnimationDecoder;
+    match image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).unwrap().loop_count() {
+        image::metadata::LoopCount::Infinite => 0,
+        image::metadata::LoopCount::Finite(n) => n.get(),
+    }
+}
+
+fn close(a: [u8; 4], b: [u8; 3]) -> bool {
+    a[3] == 255 && (0..3).all(|i| (a[i] as i32 - b[i] as i32).abs() <= 12)
+}
+
+const RED: [u8; 3] = [220, 30, 30];
+const GREEN: [u8; 3] = [30, 200, 60];
+const BLUE: [u8; 3] = [30, 60, 220];
+
+#[test]
+fn animated_gif_becomes_resized_animated_webp_with_frames_and_timing() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/anim.gif");
+    let gif = anim_gif(200, 100, &[(RED, 70), (GREEN, 130), (BLUE, 250)], Some(image::codecs::gif::Repeat::Infinite));
+    let p = f.pipeline(cfg_yaml("  widths: [50, 100, 400]\n"), false, vec![(&url, ok(gif))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    // srcset of animated WebP at each width up to the source (never upscaled), no GIF
+    let files = f.out_files();
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(files.iter().all(|n| n.ends_with(".webp")), "{files:?}");
+    let name = |w: u32| files.iter().find(|n| n.ends_with(&format!("-{w}.webp"))).unwrap().clone();
+    let want = format!(
+        "<img src=\"/assets/img/{}\" srcset=\"/assets/img/{} 50w, /assets/img/{} 100w, /assets/img/{} 200w\" sizes=\"auto, 100vw\" alt=\"A\" width=\"200\" height=\"100\" loading=\"lazy\" decoding=\"async\">",
+        name(200),
+        name(50),
+        name(100),
+        name(200)
+    );
+    assert_eq!(html, want);
+    for (w, h) in [(50, 25), (100, 50), (200, 100)] {
+        let bytes = std::fs::read(f.dist.join("assets/img").join(name(w))).unwrap();
+        assert!(is_animated_webp(&bytes), "{w}w is not animated");
+        let frames = webp_frames(&bytes);
+        assert_eq!(frames.len(), 3, "{w}w frame count");
+        for ((fw, fh, ms, px), (rgb, want_ms)) in frames.iter().zip([(RED, 70), (GREEN, 130), (BLUE, 250)]) {
+            assert_eq!((*fw, *fh), (w, h));
+            assert_eq!(*ms, want_ms, "{w}w timing");
+            assert!(close(*px, rgb), "{w}w color {px:?} vs {rgb:?}");
+        }
+        assert_eq!(webp_loop_count(&bytes), 0);
+    }
+}
+
+#[test]
+fn animation_max_width_caps_every_variant_and_the_src() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/wide.gif");
+    let gif = anim_gif(400, 100, &[(RED, 50), (GREEN, 50)], None);
+    let cfg = cfg_yaml("  widths: [100, 200, 300, 800]\n  animation_max_width: 250\n");
+    assert_eq!(cfg.animation_max_width, 250);
+    assert_eq!(cfg_yaml("").animation_max_width, 640, "default");
+    let p = f.pipeline(cfg, false, vec![(&url, ok(gif))]);
+    let a = p.request_img(img(&url));
+    let u = p.request_url(&url, Some(5000), false);
+    let html = f.render(&p, &format!("{a}\n{u}"));
+    let files = f.out_files();
+    let name = |w: u32| files.iter().find(|n| n.ends_with(&format!("-{w}.webp"))).unwrap().clone();
+    assert_eq!(files.len(), 3, "100, 200 and the cap 250: {files:?}");
+    let want = format!(
+        "<img src=\"/assets/img/{}\" srcset=\"/assets/img/{} 100w, /assets/img/{} 200w, /assets/img/{} 250w\" sizes=\"auto, 100vw\" alt=\"A\" width=\"250\" height=\"63\" loading=\"lazy\" decoding=\"async\">\n/assets/img/{}",
+        name(250),
+        name(100),
+        name(200),
+        name(250),
+        name(250)
+    );
+    assert_eq!(html, want);
+    assert_eq!(webp_frames(&std::fs::read(f.dist.join("assets/img").join(name(250))).unwrap())[0].0, 250);
+    // stills are not capped
+    let still = format!("https://{HOST}/still.png");
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml("  widths: [800]\n  animation_max_width: 250\n"), false, vec![(&still, ok(png(900, 100)))]);
+    assert!(f.render(&p, &p.request_img(img(&still))).contains("-800.webp 800w"));
+}
+
+#[test]
+fn animation_loop_count_and_tiny_delays_match_browsers() {
+    let cfg = cfg_yaml("  widths: [40]\n");
+    let frames = [(RED, 0), (GREEN, 10), (BLUE, 20)];
+    // no loop extension: browsers play it once
+    let once = anim_gif(40, 20, &frames, None);
+    let s = gif_scan(&once, &cfg).unwrap();
+    assert_eq!((s.width, s.height, s.frames, s.loop_count), (40, 20, 3, 1));
+    let out = encode_animation(&once, &[40], s.loop_count, &cfg).unwrap();
+    assert_eq!(webp_loop_count(&out[0]), 1);
+    // delays of 10 ms or less play at 100 ms, as in browsers; 20 ms stays
+    let ms: Vec<u32> = webp_frames(&out[0]).iter().map(|f| f.2).collect();
+    assert_eq!(ms, vec![100, 100, 20]);
+    // a GIF loop count of n repeats n times after the first play
+    let twice = anim_gif(40, 20, &frames, Some(image::codecs::gif::Repeat::Finite(2)));
+    assert_eq!(gif_scan(&twice, &cfg).unwrap().loop_count, 3);
+}
+
+#[test]
+fn animation_limits_refuse_a_frame_bomb_before_decoding() {
+    let url = format!("https://{HOST}/bomb.gif");
+    let bomb = frame_bomb(4000, 4000, 5000);
+    assert!(bomb.len() < 200_000, "the bomb is small on the wire: {} bytes", bomb.len());
+    for (extra, why) in [
+        ("", "over max_frames (1000)"),
+        ("  max_frames: 10000\n", "over max_animation_pixels"),
+        ("  max_frames: 10000\n  max_animation_pixels: 100000000000\n  max_pixels: 20000000\n", "per-image budget"),
+    ] {
+        let f = Fixture::new();
+        let p = f.pipeline(cfg_yaml(extra), false, vec![(&url, ok(bomb.clone()))]);
+        std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+        let stats = p.finish(2).unwrap();
+        let page = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+        assert_eq!(page, format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">"), "{why}");
+        assert_eq!(stats.kept.len(), 1);
+        assert!(stats.kept[0].1.contains(why), "{:?} lacks {why}", stats.kept[0].1);
+        assert!(f.out_files().is_empty());
+        assert_eq!(cache_entries(&f, "src"), 0, "refused bytes are not kept");
+    }
+    // a frame larger than the screen is refused from its descriptor
+    let mut big = frame_bomb(10, 10, 2);
+    let at = big.windows(2).position(|w| w == [0x2C, 0]).unwrap();
+    big[at + 5..at + 9].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert!(gif_scan(&big, &cfg_yaml("")).unwrap_err().contains("outside the 10x10 screen"));
+}
+
+/// `n` frames of `fw` x `fh` on a `w` x `h` screen, each a single LZW clear
+/// and end code (the decoder still allocates and fills the whole frame).
+fn oversized_frames(w: u16, h: u16, fw: u16, fh: u16, n: usize) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend(w.to_le_bytes());
+    b.extend(h.to_le_bytes());
+    b.extend([0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+    for _ in 0..n {
+        b.extend([0x2C, 0, 0, 0, 0]);
+        b.extend(fw.to_le_bytes());
+        b.extend(fh.to_le_bytes());
+        b.extend([0, 2, 2, 0x44, 0x01, 0]);
+    }
+    b.push(0x3B);
+    b
+}
+
+#[test]
+fn frames_larger_than_the_screen_are_refused_before_decoding() {
+    // 2x2 screen, 780 frames of 7000x7000: tiny screen x frames, ~38 Gpx of frames
+    let bomb = oversized_frames(2, 2, 7000, 7000, 780);
+    let url = format!("https://{HOST}/big-frames.gif");
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(bomb.clone()))]);
+    let t = std::time::Instant::now();
+    std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+    let stats = p.finish(2).unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "refused without decoding: {:?}", t.elapsed());
+    assert_eq!(
+        std::fs::read_to_string(f.dist.join("page.html")).unwrap(),
+        format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">")
+    );
+    assert!(stats.kept[0].1.contains("outside the 2x2 screen"), "{:?}", stats.kept);
+    assert!(f.out_files().is_empty());
+    // frames inside the screen still count at their own size against the total
+    let cfg = cfg_yaml("  max_animation_pixels: 1000000\n");
+    let many = oversized_frames(500, 500, 500, 500, 5);
+    assert!(gif_scan(&many, &cfg).unwrap_err().contains("frames total over max_animation_pixels"));
+    assert_eq!(gif_scan(&oversized_frames(500, 500, 500, 500, 4), &cfg).unwrap().frame_pixels, 1_000_000);
+    // and each frame against max_pixels
+    let cfg = cfg_yaml("  max_pixels: 100000\n");
+    assert!(gif_scan(&oversized_frames(1000, 1000, 400, 400, 2), &cfg).unwrap_err().contains("over max_pixels"));
+}
+
+#[test]
+fn animation_max_width_is_validated() {
+    for bad in ["0", "16384"] {
+        let y = format!("images:\n  animation_max_width: {bad}\n");
+        assert!(ImagesCfg::from_site_yaml(&y).unwrap_err().contains("animation_max_width must be 1 to 16383"), "{bad}");
+    }
+    assert_eq!(cfg_yaml("  animation_max_width: 16383\n").animation_max_width, 16383);
+}
+
+#[test]
+fn malformed_animations_keep_their_url() {
+    let good = anim_gif(60, 30, &[(RED, 50), (GREEN, 50), (BLUE, 50)], None);
+    // truncated mid-frame: refused by the block scan
+    let truncated = good[..good.len() - 20].to_vec();
+    assert!(gif_scan(&truncated, &cfg_yaml("")).unwrap_err().contains("truncated"));
+    // intact structure, corrupt LZW data: the scan passes, the decode fails
+    let mut corrupt = frame_bomb(60, 30, 3);
+    let end = corrupt.len() - 1; // the last frame's data is [2, 0x44, 0x01, 0] before the trailer
+    corrupt[end - 3..end - 1].copy_from_slice(&[0xFF, 0xFF]);
+    assert!(gif_scan(&corrupt, &cfg_yaml("")).is_ok());
+    // garbage after the header
+    let mut junk = good[..13 + 6].to_vec();
+    junk.extend([0x99, 1, 2, 3]);
+    for (name, bytes) in [("cut.gif", truncated), ("lzw.gif", corrupt), ("junk.gif", junk)] {
+        let f = Fixture::new();
+        let url = format!("https://{HOST}/{name}");
+        let ok_url = format!("https://{HOST}/ok.gif");
+        let p = f.pipeline(cfg_yaml("  widths: [30]\n"), false, vec![(&url, ok(bytes)), (&ok_url, ok(good.clone()))]);
+        std::fs::write(f.dist.join("page.html"), format!("{}\n{}", p.request_img(img(&url)), p.request_img(img(&ok_url))))
+            .unwrap();
+        let stats = p.finish(2).unwrap();
+        let page = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+        let mut lines = page.lines();
+        assert_eq!(lines.next().unwrap(), format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">"), "{name}");
+        assert!(lines.next().unwrap().contains(".webp 30w"), "{name}: the good animation still converts");
+        assert_eq!(stats.kept.len(), 1, "{name}: {:?}", stats.kept);
+        assert_eq!(f.out_files().len(), 1, "{name}: only the good animation's file");
+    }
+}
+
+#[test]
+fn animated_gif_image_url_copy_mode_and_single_frame_gif() {
+    let gif = anim_gif(200, 100, &[(RED, 70), (GREEN, 70)], None);
+    let url = format!("https://{HOST}/a.gif");
+    // image_url: the animated WebP at the requested width, clamped to the source
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml("  widths: [100]\n"), false, vec![(&url, ok(gif.clone()))]);
+    let a = p.request_url(&url, None, false);
+    let b = p.request_url(&url, Some(5000), true);
+    let html = f.render(&p, &format!("{a} {b}"));
+    let files = f.out_files();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_eq!(html, format!("/assets/img/{} https://example.com/assets/img/{}", files[0], files[1]), "{files:?}");
+    assert!(files[0].ends_with("-100.webp") && files[1].ends_with("-200.webp"), "{files:?}");
+    assert_eq!(webp_frames(&std::fs::read(f.dist.join("assets/img").join(&files[1])).unwrap()).len(), 2);
+    // animated_gifs: copy keeps the GIF byte for byte
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml("  animated_gifs: copy\n"), false, vec![(&url, ok(gif.clone()))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert!(html.contains(".gif\" alt=\"A\" width=\"200\" height=\"100\""), "{html}");
+    assert_eq!(std::fs::read(f.dist.join("assets/img").join(&f.out_files()[0])).unwrap(), gif);
+    // a single-frame GIF is a still: srcset and a fallback like any image
+    let mut still = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image::RgbImage::from_pixel(120, 60, image::Rgb(RED))).write_to(&mut still, ImageFormat::Gif).unwrap();
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml("  widths: [60]\n"), false, vec![(&url, ok(still.into_inner()))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert!(html.starts_with("<picture><source type=\"image/webp\""), "{html}");
+    assert!(f.out_files().iter().any(|n| n.ends_with(".jpg")), "{:?}", f.out_files());
+}
+
+#[test]
+fn animation_memory_estimate_tracks_size_and_widths() {
+    let one = animation_memory(1000, 500, &[1000]);
+    assert_eq!(one, 1000 * 500 * 16 + 1000 * 500 * 16 + 1000 * 500 * 32);
+    assert!(animation_memory(1000, 500, &[1000, 500, 250]) > one);
+    let cfg = cfg_yaml("");
+    let s = GifScan { width: 1600, height: 1080, frames: 300, frame_pixels: 1600 * 1080 * 300, loop_count: 0 };
+    assert!(check_animation(&s, &cfg).is_ok(), "a large real-world animation fits the default budget");
+}
+
+#[test]
+fn transparent_animation_keeps_one_bit_alpha_without_dark_edges() {
+    // left half transparent, right half a color that changes per frame
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        for rgb in [RED, GREEN] {
+            let buf = image::RgbaImage::from_fn(90, 40, |x, _| if x < 45 { image::Rgba([0, 0, 0, 0]) } else { image::Rgba([rgb[0], rgb[1], rgb[2], 255]) });
+            enc.encode_frame(image::Frame::from_parts(buf, 0, 0, image::Delay::from_numer_denom_ms(100, 1))).unwrap();
+        }
+    }
+    let cfg = cfg_yaml("");
+    let s = gif_scan(&out, &cfg).unwrap();
+    let files = encode_animation(&out, &[60], s.loop_count, &cfg).unwrap();
+    // libwebp's own animation decoder: the canvas starts transparent, as in browsers
+    let anim = webp::AnimDecoder::new(&files[0]).decode().unwrap();
+    let frames: Vec<image::RgbaImage> = (0..anim.len())
+        .map(|i| image::RgbaImage::from_raw(60, 27, anim.get_frame(i).unwrap().get_image().to_vec()).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 2);
+    for (f, rgb) in frames.iter().zip([RED, GREEN]) {
+        assert_eq!(f.dimensions(), (60, 27));
+        assert!(f.pixels().all(|p| p.0[3] == 0 || p.0[3] == 255), "alpha is on or off");
+        // the first opaque pixel on a row keeps the color (no black blended in)
+        let edge = (0..60).map(|x| f.get_pixel(x, 13)).find(|p| p.0[3] == 255).unwrap();
+        assert!(close(edge.0, rgb), "edge {:?} vs {rgb:?}", edge.0);
+        assert_eq!(f.get_pixel(5, 13).0[3], 0);
+    }
 }

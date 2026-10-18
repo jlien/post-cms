@@ -283,6 +283,7 @@ dependencies = [
  "flate2",
  "image",
  "jpeg-encoder",
+ "libwebp-sys",
  "pulldown-cmark",
  "serde",
  "serde_json",
