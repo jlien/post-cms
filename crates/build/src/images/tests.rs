@@ -844,11 +844,64 @@ fn animation_limits_refuse_a_frame_bomb_before_decoding() {
         assert!(f.out_files().is_empty());
         assert_eq!(cache_entries(&f, "src"), 0, "refused bytes are not kept");
     }
-    // a frame larger than max_pixels is refused from its descriptor
+    // a frame larger than the screen is refused from its descriptor
     let mut big = frame_bomb(10, 10, 2);
     let at = big.windows(2).position(|w| w == [0x2C, 0]).unwrap();
     big[at + 5..at + 9].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-    assert!(gif_scan(&big, &cfg_yaml("  max_pixels: 1000000\n")).unwrap_err().contains("over max_pixels"));
+    assert!(gif_scan(&big, &cfg_yaml("")).unwrap_err().contains("outside the 10x10 screen"));
+}
+
+/// `n` frames of `fw` x `fh` on a `w` x `h` screen, each a single LZW clear
+/// and end code (the decoder still allocates and fills the whole frame).
+fn oversized_frames(w: u16, h: u16, fw: u16, fh: u16, n: usize) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend(w.to_le_bytes());
+    b.extend(h.to_le_bytes());
+    b.extend([0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+    for _ in 0..n {
+        b.extend([0x2C, 0, 0, 0, 0]);
+        b.extend(fw.to_le_bytes());
+        b.extend(fh.to_le_bytes());
+        b.extend([0, 2, 2, 0x44, 0x01, 0]);
+    }
+    b.push(0x3B);
+    b
+}
+
+#[test]
+fn frames_larger_than_the_screen_are_refused_before_decoding() {
+    // 2x2 screen, 780 frames of 7000x7000: tiny screen x frames, ~38 Gpx of frames
+    let bomb = oversized_frames(2, 2, 7000, 7000, 780);
+    let url = format!("https://{HOST}/big-frames.gif");
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(bomb.clone()))]);
+    let t = std::time::Instant::now();
+    std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+    let stats = p.finish(2).unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "refused without decoding: {:?}", t.elapsed());
+    assert_eq!(
+        std::fs::read_to_string(f.dist.join("page.html")).unwrap(),
+        format!("<img src=\"{url}\" alt=\"A\" loading=\"lazy\" decoding=\"async\">")
+    );
+    assert!(stats.kept[0].1.contains("outside the 2x2 screen"), "{:?}", stats.kept);
+    assert!(f.out_files().is_empty());
+    // frames inside the screen still count at their own size against the total
+    let cfg = cfg_yaml("  max_animation_pixels: 1000000\n");
+    let many = oversized_frames(500, 500, 500, 500, 5);
+    assert!(gif_scan(&many, &cfg).unwrap_err().contains("frames total over max_animation_pixels"));
+    assert_eq!(gif_scan(&oversized_frames(500, 500, 500, 500, 4), &cfg).unwrap().frame_pixels, 1_000_000);
+    // and each frame against max_pixels
+    let cfg = cfg_yaml("  max_pixels: 100000\n");
+    assert!(gif_scan(&oversized_frames(1000, 1000, 400, 400, 2), &cfg).unwrap_err().contains("over max_pixels"));
+}
+
+#[test]
+fn animation_max_width_is_validated() {
+    for bad in ["0", "16384"] {
+        let y = format!("images:\n  animation_max_width: {bad}\n");
+        assert!(ImagesCfg::from_site_yaml(&y).unwrap_err().contains("animation_max_width must be 1 to 16383"), "{bad}");
+    }
+    assert_eq!(cfg_yaml("  animation_max_width: 16383\n").animation_max_width, 16383);
 }
 
 #[test]
@@ -919,7 +972,7 @@ fn animation_memory_estimate_tracks_size_and_widths() {
     assert_eq!(one, 1000 * 500 * 16 + 1000 * 500 * 16 + 1000 * 500 * 32);
     assert!(animation_memory(1000, 500, &[1000, 500, 250]) > one);
     let cfg = cfg_yaml("");
-    let s = GifScan { width: 1600, height: 1080, frames: 300, loop_count: 0 };
+    let s = GifScan { width: 1600, height: 1080, frames: 300, frame_pixels: 1600 * 1080 * 300, loop_count: 0 };
     assert!(check_animation(&s, &cfg).is_ok(), "a large real-world animation fits the default budget");
 }
 

@@ -213,6 +213,9 @@ impl ImagesCfg {
                 return Err(format!("{name} must be 1 to 100"));
             }
         }
+        if !(1..=WEBP_MAX_SIDE).contains(&self.animation_max_width) {
+            return Err(format!("animation_max_width must be 1 to {WEBP_MAX_SIDE}"));
+        }
         if !(1..=10).contains(&self.avif_speed) {
             return Err("avif_speed must be 1 to 10".into());
         }
@@ -221,11 +224,10 @@ impl ImagesCfg {
             || self.max_pixels == 0
             || self.timeout_secs == 0
             || self.max_frames == 0
-            || self.animation_max_width == 0
             || self.max_animation_pixels == 0
         {
             return Err(
-                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames, animation_max_width and max_animation_pixels must be positive"
+                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames and max_animation_pixels must be positive"
                     .into(),
             );
         }
@@ -682,6 +684,8 @@ struct GifScan {
     width: u32,
     height: u32,
     frames: u32,
+    /// Sum of every frame's own width x height: what the decoder fills.
+    frame_pixels: u64,
     /// WebP loop count: 0 plays forever. A GIF without a NETSCAPE2.0 loop
     /// extension plays once in browsers; a GIF loop count of n repeats n
     /// times after the first play.
@@ -717,6 +721,7 @@ fn gif_scan(b: &[u8], cfg: &ImagesCfg) -> Result<GifScan, String> {
     };
     let mut i = 13 + table(b[10]);
     let mut frames = 0u32;
+    let mut frame_pixels = 0u64;
     let mut repeat: Option<u16> = None;
     loop {
         match b.get(i) {
@@ -736,13 +741,26 @@ fn gif_scan(b: &[u8], cfg: &ImagesCfg) -> Result<GifScan, String> {
             }
             Some(0x2C) => {
                 let d = b.get(i + 1..i + 10).ok_or(TRUNC)?;
+                let (left, top) = (u16::from_le_bytes([d[0], d[1]]) as u64, u16::from_le_bytes([d[2], d[3]]) as u64);
                 let (fw, fh) = (u16::from_le_bytes([d[4], d[5]]) as u64, u16::from_le_bytes([d[6], d[7]]) as u64);
+                // The decoder allocates and decodes a frame at its own size,
+                // even where it falls outside the screen (which browsers
+                // clip), so a frame must fit the screen.
+                if left + fw > width as u64 || top + fh > height as u64 {
+                    return Err(format!(
+                        "a {fw}x{fh} frame at {left},{top} falls outside the {width}x{height} screen"
+                    ));
+                }
                 if fw * fh > cfg.max_pixels {
                     return Err(format!("a {fw}x{fh} frame is over max_pixels ({})", cfg.max_pixels));
                 }
                 frames += 1;
                 if frames > cfg.max_frames {
                     return Err(format!("over max_frames ({})", cfg.max_frames));
+                }
+                frame_pixels += fw * fh;
+                if frame_pixels > cfg.max_animation_pixels {
+                    return Err(format!("frames total over max_animation_pixels ({})", cfg.max_animation_pixels));
                 }
                 // descriptor, local color table, LZW minimum code size, data
                 i = skip_sub_blocks(i + 10 + table(d[8]) + 1)?;
@@ -758,7 +776,7 @@ fn gif_scan(b: &[u8], cfg: &ImagesCfg) -> Result<GifScan, String> {
         Some(0) => 0,
         Some(n) => n as u32 + 1,
     };
-    Ok(GifScan { width, height, frames, loop_count })
+    Ok(GifScan { width, height, frames, frame_pixels, loop_count })
 }
 
 /// Widths for a source `w` px wide: the configured ones below it, plus
