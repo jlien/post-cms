@@ -17,10 +17,14 @@
 //! are capped at `max_bytes`, images at `max_pixels` before any pixel is
 //! decoded. Fetched bytes go to a content-addressed cache (`cache_dir`)
 //! reused across builds; `IMAGES_OFFLINE=1` builds from the cache alone.
+//! Cached sources are checked against their hash and cached variants against
+//! a recorded hash of their bytes; mismatches are evicted and rebuilt.
+//! Timeouts, dropped connections, 429 and 5xx are retried with backoff.
 //! Output names are `<hash>-<width>.<ext>` built from hex digests and numbers
 //! only, so no source name reaches the file system.
 //!
-//! Raster images (JPEG, PNG, static WebP) are resized to the configured
+//! Raster images (JPEG, PNG, static WebP, AVIF via the pure-Rust `avif`
+//! module) are resized to the configured
 //! widths (never upscaled), encoded as AVIF and/or WebP plus one fallback
 //! (a progressive JPEG, or PNG when a pixel is transparent), with metadata
 //! dropped (EXIF orientation is applied first). Animated GIFs are resized
@@ -46,6 +50,8 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+mod avif;
 
 /// Widths generated when `images.widths` is not set.
 pub const DEFAULT_WIDTHS: [u32; 8] = [320, 480, 640, 768, 1024, 1280, 1600, 1920];
@@ -110,6 +116,13 @@ pub struct ImagesCfg {
     pub max_pixels: u64,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Extra attempts after a timeout, a dropped connection, HTTP 429 or a
+    /// 5xx response, with exponential backoff (0 turns retries off).
+    #[serde(default = "default_retries")]
+    pub retries: u32,
+    /// Most time one source may take across all attempts, in seconds.
+    #[serde(default = "default_retry_total")]
+    pub retry_total_secs: u64,
     /// Animated GIFs: `webp` (resize, animated WebP) or `copy` (as they are).
     #[serde(default = "default_animated_gifs")]
     pub animated_gifs: AnimatedGifs,
@@ -166,6 +179,12 @@ fn default_max_pixels() -> u64 {
 fn default_timeout() -> u64 {
     30
 }
+fn default_retries() -> u32 {
+    3
+}
+fn default_retry_total() -> u64 {
+    120
+}
 fn default_animated_gifs() -> AnimatedGifs {
     AnimatedGifs::Webp
 }
@@ -215,6 +234,9 @@ impl ImagesCfg {
         }
         if !(1..=WEBP_MAX_SIDE).contains(&self.animation_max_width) {
             return Err(format!("animation_max_width must be 1 to {WEBP_MAX_SIDE}"));
+        }
+        if self.retries > 10 {
+            return Err("retries must be 0 to 10".into());
         }
         if !(1..=10).contains(&self.avif_speed) {
             return Err("avif_speed must be 1 to 10".into());
@@ -278,8 +300,37 @@ pub struct RawResponse {
     pub body: Vec<u8>,
 }
 
+/// Why a request failed. `transient` errors (a timeout, a dropped or refused
+/// connection, a cut-off body) are retried; others are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchError {
+    pub message: String,
+    pub transient: bool,
+}
+
+impl FetchError {
+    pub fn transient(message: impl Into<String>) -> FetchError {
+        FetchError { message: message.into(), transient: true }
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> FetchError {
+        FetchError { message, transient: false }
+    }
+}
+
+impl From<&str> for FetchError {
+    fn from(message: &str) -> FetchError {
+        FetchError::from(message.to_string())
+    }
+}
+
 /// One HTTP GET: `(url, max_bytes, timeout_secs)`. Must not follow redirects.
-pub type Transport = dyn Fn(&str, u64, u64) -> Result<RawResponse, String> + Send + Sync;
+pub type Transport = dyn Fn(&str, u64, u64) -> Result<RawResponse, FetchError> + Send + Sync;
+
+/// First retry delay; each later one doubles.
+const RETRY_BASE_MS: u64 = 500;
 
 /// Why a URL is not fetched. `Foreign` sources are not the pipeline's
 /// (plain http, another host) and render untouched without a warning.
@@ -327,15 +378,58 @@ fn join_location(base: &str, loc: &str) -> Result<String, String> {
     Ok(format!("{origin}{dir}{loc}"))
 }
 
+/// Delay before retry `n` (0-based): `RETRY_BASE_MS` doubling, plus up to a
+/// quarter of it as jitter derived from the URL, so parallel workers that
+/// failed together do not retry in lockstep.
+fn retry_delay(url: &str, n: u32) -> std::time::Duration {
+    let base = RETRY_BASE_MS.saturating_mul(1 << n.min(16));
+    let h = Sha256::digest(format!("{url}|{n}").as_bytes());
+    let jitter = u16::from_le_bytes([h[0], h[1]]) as u64 * (base / 4) / u16::MAX as u64;
+    std::time::Duration::from_millis(base + jitter)
+}
+
+/// One request with retries: a transient transport error, HTTP 429 or a
+/// 5xx is retried up to `cfg.retries` times with backoff, while the whole
+/// source stays within `retry_total_secs` (each attempt's timeout is cut to
+/// what is left). The last failure is returned.
+fn request_with_retries(
+    url: &str,
+    cfg: &ImagesCfg,
+    transport: &Transport,
+    deadline: std::time::Instant,
+) -> Result<RawResponse, String> {
+    let mut attempt = 0u32;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_secs().max(1);
+        let res = transport(url, cfg.max_bytes, cfg.timeout_secs.min(left));
+        let why = match &res {
+            Ok(r) if r.status == 429 || (500..600).contains(&r.status) => format!("HTTP {}", r.status),
+            Err(e) if e.transient => e.message.clone(),
+            _ => return res.map_err(|e| e.message),
+        };
+        let delay = retry_delay(url, attempt);
+        if attempt >= cfg.retries || std::time::Instant::now() + delay >= deadline {
+            return match res {
+                _ if attempt > 0 => Err(format!("{why} (after {} attempts)", attempt + 1)),
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.message),
+            };
+        }
+        std::thread::sleep(delay);
+        attempt += 1;
+    }
+}
+
 /// GET `url`, following at most [`MAX_REDIRECTS`] redirects, each target
 /// checked against https and the allowlist before it is requested.
 fn fetch_checked(url: &str, cfg: &ImagesCfg, transport: &Transport) -> Result<Vec<u8>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cfg.retry_total_secs.max(cfg.timeout_secs));
     let mut cur = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         check_url(&cur, cfg).map_err(|e| match e {
             UrlCheck::Foreign(m) | UrlCheck::Bad(m) => format!("refused {cur}: {m}"),
         })?;
-        let r = transport(&cur, cfg.max_bytes, cfg.timeout_secs)?;
+        let r = request_with_retries(&cur, cfg, transport, deadline)?;
         match r.status {
             200 => {
                 if r.body.len() as u64 > cfg.max_bytes {
@@ -446,20 +540,59 @@ pub fn ureq_transport(timeout_secs: u64) -> Box<Transport> {
         ureq::unversioned::transport::DefaultConnector::default(),
         PublicResolver,
     );
-    Box::new(move |url: &str, max_bytes: u64, _timeout: u64| {
-        let mut resp = agent.get(url).header("Accept", ACCEPT).call().map_err(|e| e.to_string())?;
+    agent_transport(agent)
+}
+
+/// Whether a ureq error is worth retrying: timeouts and dropped, reset or
+/// refused connections. A refused address (non-public), a bad URL, TLS
+/// failures and an oversized body are not.
+fn transient(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match e {
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            TimedOut | ConnectionReset | ConnectionAborted | ConnectionRefused | BrokenPipe | UnexpectedEof | Interrupted
+        ),
+        _ => false,
+    }
+}
+
+fn fetch_error(prefix: &str, e: ureq::Error) -> FetchError {
+    FetchError { transient: transient(&e), message: format!("{prefix}{e}") }
+}
+
+/// A transport over `agent`; each request's timeout is the one passed in.
+fn agent_transport(agent: ureq::Agent) -> Box<Transport> {
+    Box::new(move |url: &str, max_bytes: u64, timeout: u64| {
+        let mut resp = agent
+            .get(url)
+            .header("Accept", ACCEPT)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(timeout.max(1))))
+            .build()
+            .call()
+            .map_err(|e| fetch_error("", e))?;
         let status = resp.status().as_u16();
         let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string);
         let body = if status == 200 {
-            resp.body_mut()
-                .with_config()
-                .limit(max_bytes)
-                .read_to_vec()
-                .map_err(|e| format!("body: {e}"))?
+            resp.body_mut().with_config().limit(max_bytes).read_to_vec().map_err(|e| fetch_error("body: ", e))?
         } else {
             Vec::new()
         };
         Ok(RawResponse { status, location, body })
+    })
+}
+
+/// A plain-http transport to loopback for tests: `https://<host>/<path>`
+/// goes to `http://127.0.0.1:<port>/<path>`, with the real error handling.
+#[cfg(test)]
+fn loopback_transport(port: u16) -> Box<Transport> {
+    let config = ureq::Agent::config_builder().max_redirects(0).http_status_as_error(false).proxy(None).build();
+    let inner = agent_transport(ureq::Agent::new_with_config(config));
+    Box::new(move |url: &str, max_bytes: u64, timeout: u64| {
+        let path = url.splitn(4, '/').nth(3).unwrap_or("");
+        inner(&format!("http://127.0.0.1:{port}/{path}"), max_bytes, timeout)
     })
 }
 
@@ -625,6 +758,12 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind),
         return Ok((w, h, Kind::Passthrough { ext: "svg" }));
     }
     let fmt = image::guess_format(bytes).map_err(|_| "unknown image format".to_string())?;
+    if fmt == ImageFormat::Avif {
+        // size from the AV1 sequence header, checked before decoding; a
+        // declared alpha item is confirmed transparent in resolve_one
+        let (w, h, alpha) = avif::probe(bytes, cfg.max_pixels)?;
+        return Ok((w, h, Kind::Raster { fallback: if alpha { Enc::Png } else { Enc::Jpeg } }));
+    }
     if fmt == ImageFormat::Gif && cfg.animated_gifs == AnimatedGifs::Webp {
         let scan = gif_scan(bytes, cfg)?;
         if scan.frames > 1 {
@@ -669,6 +808,9 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind),
 /// Decode (applying EXIF orientation) under the same limits as [`probe`].
 fn decode(bytes: &[u8], cfg: &ImagesCfg) -> Result<DynamicImage, String> {
     let fmt = image::guess_format(bytes).map_err(|e| e.to_string())?;
+    if fmt == ImageFormat::Avif {
+        return avif::decode(bytes, cfg.max_pixels);
+    }
     let mut dec = reader(bytes, fmt, cfg.max_pixels).into_decoder().map_err(|e| e.to_string())?;
     let o = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
@@ -1414,11 +1556,20 @@ impl Pipeline {
         let idx = self.url_index(src);
         if let Ok(content) = std::fs::read_to_string(&idx) {
             let content = content.trim();
-            if content.len() == 64 && content.bytes().all(|c| c.is_ascii_hexdigit()) {
-                if let Ok(b) = std::fs::read(self.src_file(content)) {
-                    if sha_hex(&b) == content {
-                        return Ok(b);
-                    }
+            let valid = content.len() == 64 && content.bytes().all(|c| c.is_ascii_hexdigit());
+            match valid.then(|| std::fs::read(self.src_file(content))) {
+                Some(Ok(b)) if sha_hex(&b) == content => return Ok(b),
+                // bytes that do not hash to their name: drop them and the
+                // URL entry, then fetch again (or report the miss offline)
+                Some(Ok(_)) => {
+                    eprintln!("warning: image cache: {src}: cached bytes do not match their hash; evicted");
+                    let _ = std::fs::remove_file(self.src_file(content));
+                    let _ = std::fs::remove_file(&idx);
+                }
+                Some(Err(_)) => {}
+                None => {
+                    eprintln!("warning: image cache: {src}: malformed URL entry; evicted");
+                    let _ = std::fs::remove_file(&idx);
                 }
             }
         }
@@ -1457,7 +1608,7 @@ impl Pipeline {
         if src.starts_with('/') {
             // local files go through the same cache, so finish() reads one place
             let f = self.src_file(&content);
-            if !f.exists() {
+            if std::fs::read(&f).map_or(true, |b| sha_hex(&b) != content) {
                 write_atomic(&f, &bytes).map_err(|e| Some(format!("cache: {e}")))?;
             }
         }
@@ -1796,28 +1947,79 @@ impl Pipeline {
         Ok(stats)
     }
 
-    /// Write one source's outputs to dist, from the cache when present.
+    /// The cached source bytes, checked against their content hash.
+    fn source_bytes(&self, s: &Source) -> Result<Vec<u8>, String> {
+        let raw = std::fs::read(self.src_file(&s.content)).map_err(|e| format!("image {}: {e}", s.id))?;
+        if sha_hex(&raw) != s.content {
+            return Err("cached source does not match its hash".into());
+        }
+        Ok(raw)
+    }
+
+    /// A cached variant, only if its bytes hash to the value recorded when it
+    /// was written (`<name>.sha256`); anything else is removed so it is
+    /// encoded again.
+    fn cached_variant(&self, name: &str) -> Option<Vec<u8>> {
+        let file = self.cache.join("out").join(name);
+        let sum = self.cache.join("out").join(format!("{name}.sha256"));
+        let bytes = std::fs::read(&file).ok()?;
+        match std::fs::read_to_string(&sum) {
+            Ok(rec) if rec.trim() == sha_hex(&bytes) => Some(bytes),
+            // written before hashes were recorded: unverifiable, so redo it
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&file);
+                None
+            }
+            _ => {
+                eprintln!("warning: image cache: {name} does not match its recorded hash; encoding it again");
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(&sum);
+                None
+            }
+        }
+    }
+
+    /// Store a variant and the hash of its bytes (the hash last, so a
+    /// variant without one is never trusted).
+    fn store_variant(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let dir = self.cache.join("out");
+        let ctx = |e: std::io::Error| format!("cache {name}: {e}");
+        write_atomic(&dir.join(name), bytes).map_err(ctx)?;
+        write_atomic(&dir.join(format!("{name}.sha256")), sha_hex(bytes).as_bytes()).map_err(ctx)
+    }
+
+    /// Write one source's outputs to dist, from the cache when present and
+    /// intact.
     fn write_outputs(&self, s: &Source, outs: &[Out], out_dir: &Path) -> Result<(usize, u64), String> {
         let ctx = |e: std::io::Error| format!("image {}: {e}", s.id);
         if let Kind::Passthrough { ext } = s.kind {
             let name = format!("{}.{ext}", s.id);
-            let bytes = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
+            let bytes = self.source_bytes(s)?;
             std::fs::write(out_dir.join(&name), &bytes).map_err(ctx)?;
             return Ok((1, bytes.len() as u64));
         }
-        let cached = |o: &Out| self.cache.join("out").join(self.out_name(s, *o));
-        let missing: Vec<Out> = outs.iter().copied().filter(|o| !cached(o).is_file()).collect();
+        let mut have: BTreeMap<Out, Vec<u8>> = BTreeMap::new();
+        let mut missing: Vec<Out> = Vec::new();
+        for o in outs {
+            match self.cached_variant(&self.out_name(s, *o)) {
+                Some(b) => {
+                    have.insert(*o, b);
+                }
+                None => missing.push(*o),
+            }
+        }
         if let (Kind::Animated { loop_count }, false) = (s.kind, missing.is_empty()) {
             let _slot = self.decodes.acquire();
-            let raw = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
+            let raw = self.source_bytes(s)?;
             let widths: Vec<u32> = missing.iter().map(|o| o.width).collect();
             let files = encode_animation(&raw, &widths, loop_count, &self.cfg)?;
             for (o, bytes) in missing.iter().zip(files) {
-                write_atomic(&cached(o), &bytes).map_err(ctx)?;
+                self.store_variant(&self.out_name(s, *o), &bytes)?;
+                have.insert(*o, bytes);
             }
         } else if !missing.is_empty() {
             let _slot = self.decodes.acquire();
-            let raw = std::fs::read(self.src_file(&s.content)).map_err(ctx)?;
+            let raw = self.source_bytes(s)?;
             let img = normalize(decode(&raw, &self.cfg).map_err(|e| format!("decode: {e}"))?);
             drop(raw);
             // largest first, each resize from the previous step (fewer pixels to filter)
@@ -1832,14 +2034,18 @@ impl Pipeline {
                     cur = cur.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
                 }
                 for enc in encs {
+                    let o = Out { width: w, enc };
                     let bytes = encode(&cur, enc, &self.cfg).map_err(|e| format!("encode {w}w: {e}"))?;
-                    write_atomic(&cached(&Out { width: w, enc }), &bytes).map_err(ctx)?;
+                    self.store_variant(&self.out_name(s, o), &bytes)?;
+                    have.insert(o, bytes);
                 }
             }
         }
         let mut total = 0;
         for o in outs {
-            total += std::fs::copy(cached(o), out_dir.join(self.out_name(s, *o))).map_err(ctx)?;
+            let bytes = &have[o];
+            std::fs::write(out_dir.join(self.out_name(s, *o)), bytes).map_err(ctx)?;
+            total += bytes.len() as u64;
         }
         Ok((outs.len(), total))
     }
