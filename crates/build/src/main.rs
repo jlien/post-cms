@@ -142,9 +142,32 @@ fn page_collections(collections: &[Collection]) -> Result<serde_json::Map<String
     Ok(out)
 }
 
-/// meta.yaml `no_index: true` keeps a page or item out of sitemap.xml.
+/// meta.yaml `no_index: true` keeps a page or item out of every
+/// machine-readable index (see `Page::indexable`, `CollectionItem::indexable`).
 fn is_no_index(fields: &serde_json::Map<String, serde_json::Value>) -> bool {
     matches!(fields.get("no_index"), Some(serde_json::Value::Bool(true)))
+}
+
+impl Page {
+    /// The one rule for listing a page in sitemap.xml and llms.txt:
+    /// published and not `no_index: true`.
+    fn indexable(&self) -> bool {
+        self.meta.published && !is_no_index(&self.meta.fields)
+    }
+}
+
+impl CollectionItem {
+    /// The one rule for listing an item in sitemap.xml, llms.txt,
+    /// search-index.json, and embeddings.json: published and not
+    /// `no_index: true`.
+    fn indexable(&self) -> bool {
+        self.published && !is_no_index(&self.fields)
+    }
+}
+
+/// A collection's items that the machine-readable indexes list, in order.
+fn indexable_items(coll: &Collection) -> impl Iterator<Item = &CollectionItem> {
+    coll.items.iter().filter(|i| i.indexable())
 }
 
 /// Every meta.yaml key as template data (`fields.<key>` on collection items,
@@ -2047,7 +2070,8 @@ fn markdown_to_text(input: &str) -> String {
     out.chars().take(6_000).collect()
 }
 
-/// Emit search-index.json: one row per published post with title, description,
+/// Emit search-index.json: one row per published post and indexable
+/// collection item (published, not `no_index: true`) with title, description,
 /// url, date, tags and plain-text body — consumed lazily by the client search
 /// widget (Tier 1) and by /api/ask (Tier 2).
 fn render_search_index(
@@ -2076,7 +2100,7 @@ fn render_search_index(
     // Typed-collection items are searchable too — /api/ask must be able to
     // cite them like any other page.
     for coll in collections {
-        for item in coll.items.iter().filter(|i| i.published) {
+        for item in indexable_items(coll) {
             idx.push(serde_json::json!({
                 "title": item.title,
                 "description": item.description,
@@ -2093,6 +2117,7 @@ fn render_search_index(
 }
 
 /// Tier 3: embed per-post chunks at build time into dist/embeddings.json.
+/// Collection items follow `indexable_items`, so `no_index: true` items stay out.
 /// Uses fastembed (ONNX on CPU, weights cached in ~/.cache) — no API key.
 /// Skips gracefully when the model can't be fetched (offline), leaving
 /// /api/ask in Tier-2 inline mode.
@@ -2107,7 +2132,7 @@ fn render_embeddings(
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
     let live_items: Vec<(&Collection, &CollectionItem)> = collections
         .iter()
-        .flat_map(|c| c.items.iter().filter(|i| i.published).map(move |i| (c, i)))
+        .flat_map(|c| indexable_items(c).map(move |i| (c, i)))
         .collect();
     if published.is_empty() && live_items.is_empty() {
         return Ok(());
@@ -2147,7 +2172,7 @@ fn render_embeddings(
             ));
         }
     }
-    // Collection items get the same treatment (published only).
+    // Collection items get the same treatment (indexable only).
     for (coll, item) in &live_items {
         let text = item_text(item);
         let title = &item.title;
@@ -2487,10 +2512,7 @@ fn sitemap_xml(
     let listed = |path: &str| !redirect_sources.contains(path.trim_matches('/'));
     let loc = |path: &str| escape_xml(&format!("{site_base}{path}"));
     let published: Vec<&Post> = posts.iter().filter(|p| p.meta.published).collect();
-    let live_pages: Vec<&Page> = pages
-        .iter()
-        .filter(|p| p.meta.published && !is_no_index(&p.meta.fields))
-        .collect();
+    let live_pages: Vec<&Page> = pages.iter().filter(|p| p.indexable()).collect();
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
@@ -2520,17 +2542,15 @@ fn sitemap_xml(
     // Typed-collection items are first-class pages; they belong in the
     // sitemap too.
     for coll in collections {
-        let live_items: Vec<&CollectionItem> =
-            coll.items.iter().filter(|i| i.published).collect();
-        if live_items.is_empty() {
+        if !coll.items.iter().any(|i| i.published) {
             continue;
         }
         if coll.index && listed(&coll.url_prefix) {
             xml.push_str(&format!("<url><loc>{}</loc></url>\n", loc(&page_url(&coll.url_prefix))));
         }
-        for item in live_items {
+        for item in indexable_items(coll) {
             let path = coll.item_path(&item.slug);
-            if is_no_index(&item.fields) || !listed(&path) {
+            if !listed(&path) {
                 continue;
             }
             xml.push_str(&format!("<url><loc>{}</loc></url>\n", loc(&page_url(&path))));
@@ -2571,7 +2591,8 @@ fn llms_entry(title: &str, url: &str, desc: &str) -> String {
 
 /// llms.txt (https://llmstxt.org): a markdown index so LLM clients can
 /// discover the site's content without crawling HTML. Lists published
-/// posts, pages, and collection items; header text comes from site.yaml.
+/// posts, and pages and collection items by the sitemap's rule (published,
+/// not `no_index: true`); header text comes from site.yaml.
 fn llms_txt(
     cfg: &SiteConfig,
     site_base: &str,
@@ -2612,7 +2633,7 @@ fn llms_txt(
         page_lines.push_str(&llms_entry("Blog", &format!("{site_base}{}", page_url("/blog")), ""));
         page_lines.push_str(&llms_entry("Contact", &format!("{site_base}{}", page_url("/contact")), ""));
     }
-    for page in pages.iter().filter(|p| p.meta.published) {
+    for page in pages.iter().filter(|p| p.indexable()) {
         page_lines.push_str(&llms_entry(
             &page.meta.title,
             &format!("{site_base}{}", page_url(&page.meta.site_path())),
@@ -2627,8 +2648,7 @@ fn llms_txt(
     // Same rule as the sitemap: collections with no published items are
     // skipped; the index page is listed when the collection renders one.
     for coll in collections {
-        let live: Vec<&CollectionItem> = coll.items.iter().filter(|i| i.published).collect();
-        if live.is_empty() {
+        if !coll.items.iter().any(|i| i.published) {
             continue;
         }
         out.push_str(&format!("## {}\n\n", coll.title));
@@ -2639,7 +2659,7 @@ fn llms_txt(
                 "",
             ));
         }
-        for item in live {
+        for item in indexable_items(coll) {
             let desc = match item.date {
                 Some(d) if !item.description.trim().is_empty() => format!("{} ({d})", item.description),
                 Some(d) => format!("({d})"),
@@ -3724,6 +3744,96 @@ mod tests {
         pages[1].meta.fields.insert("no_index".into(), false.into());
         colls[0].items[0].fields.insert("no_index".into(), "true".into());
         assert_eq!(sitemap_xml("https://example.com", &[], &pages, &colls, true, &none), before);
+    }
+
+    #[test]
+    fn llms_skips_no_index_pages_and_items() {
+        let cfg = test_cfg("title: Example\nbuiltin_pages: false\n");
+        let (mut pages, mut colls) = sample_content();
+        pages[1].meta.fields.insert("no_index".into(), true.into());
+        colls[0].items[0].fields.insert("no_index".into(), true.into());
+        let out = llms_txt(&cfg, "https://example.com", &[], &pages, &colls);
+        assert!(!out.contains("/docs/ops/"), "{out}");
+        assert!(!out.contains("/events/speakers/acme/"), "{out}");
+        assert!(out.contains("- [Home](https://example.com/)\n"), "{out}");
+        // As in the sitemap, the index page stays while a published item exists.
+        assert!(out.contains("## Speakers\n\n- [Speakers](https://example.com/events/speakers/)\n"), "{out}");
+
+        // `no_index: false` and string values change nothing.
+        let before = llms_txt(&cfg, "https://example.com", &[], &sample_content().0, &sample_content().1);
+        pages[1].meta.fields.insert("no_index".into(), false.into());
+        colls[0].items[0].fields.insert("no_index".into(), "true".into());
+        assert_eq!(llms_txt(&cfg, "https://example.com", &[], &pages, &colls), before);
+    }
+
+    #[test]
+    fn llms_and_sitemap_list_the_same_pages_and_items() {
+        let cfg = test_cfg("title: Example\nbuiltin_pages: false\n");
+        let (mut pages, mut colls) = sample_content();
+        pages[0].meta.fields.insert("no_index".into(), true.into());
+        colls[0].items[0].fields.insert("no_index".into(), true.into());
+        colls[0].items.push(CollectionItem {
+            slug: "beta".into(),
+            title: "BETA".into(),
+            description: String::new(),
+            date: None,
+            published: true,
+            fields: Default::default(),
+            dir: PathBuf::new(),
+        });
+        let llms = llms_txt(&cfg, "https://example.com", &[], &pages, &colls);
+        let xml = sitemap_xml("https://example.com", &[], &pages, &colls, false, &Default::default());
+        let mut from_llms: Vec<&str> = llms
+            .lines()
+            .filter_map(|l| l.strip_prefix("- [")?.split_once("](")?.1.split_once(')').map(|(u, _)| u))
+            .filter(|u| !u.ends_with("/mcp"))
+            .collect();
+        let mut from_xml: Vec<&str> = xml
+            .lines()
+            .filter_map(|l| l.strip_prefix("<url><loc>")?.split_once("</loc>").map(|(u, _)| u))
+            .collect();
+        from_llms.sort();
+        from_xml.sort();
+        assert_eq!(
+            from_llms,
+            vec![
+                "https://example.com/docs/ops/",
+                "https://example.com/events/speakers/",
+                "https://example.com/events/speakers/beta/"
+            ]
+        );
+        assert_eq!(from_llms, from_xml);
+    }
+
+    #[test]
+    fn indexable_items_skip_drafts_and_no_index() {
+        let (_, mut colls) = sample_content();
+        let slugs = |c: &Collection| indexable_items(c).map(|i| i.slug.clone()).collect::<Vec<_>>();
+        assert_eq!(slugs(&colls[0]), vec!["acme"]);
+        colls[0].items[0].fields.insert("no_index".into(), "true".into());
+        assert_eq!(slugs(&colls[0]), vec!["acme"]);
+        colls[0].items[0].fields.insert("no_index".into(), true.into());
+        assert!(slugs(&colls[0]).is_empty());
+    }
+
+    #[test]
+    fn search_index_skips_no_index_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, mut colls) = sample_content();
+        colls[0].items.push(CollectionItem {
+            slug: "hidden".into(),
+            title: "HIDDEN".into(),
+            description: String::new(),
+            date: None,
+            published: true,
+            fields: [("no_index".to_string(), serde_json::Value::Bool(true))].into_iter().collect(),
+            dir: PathBuf::new(),
+        });
+        render_search_index(tmp.path(), tmp.path(), &[], &colls).unwrap();
+        let idx: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(tmp.path().join("search-index.json")).unwrap()).unwrap();
+        let titles: Vec<&str> = idx.iter().map(|r| r["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, vec!["ACME"]);
     }
 
     #[test]
