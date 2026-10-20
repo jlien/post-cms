@@ -1023,6 +1023,11 @@ fn avif(w: u32, h: u32, alpha: bool) -> Vec<u8> {
     b.into_inner()
 }
 
+/// `avif::decode` in the child process `cargo test` builds (build-site).
+fn decode_avif(bytes: &[u8], max_pixels: u64) -> Result<DynamicImage, String> {
+    avif::decode(bytes, max_pixels, &default_decoder_exe()?, std::time::Duration::from_secs(60))
+}
+
 #[test]
 fn avif_sources_are_decoded_and_re_encoded_like_other_stills() {
     let f = Fixture::new();
@@ -1069,7 +1074,7 @@ fn avif_pixel_limit_is_checked_before_decoding() {
     let err = probe(&src, &cfg, false).unwrap_err();
     assert!(err.contains("over max_pixels"), "{err}");
     // the decoder refuses too, from the header alone
-    assert!(avif::decode(&src, 1000).unwrap_err().contains("max_pixels"));
+    assert!(decode_avif(&src, 1000).unwrap_err().contains("max_pixels"));
     let p = f.pipeline(cfg, false, vec![(&url, ok(src))]);
     let html = f.render(&p, &p.request_img(img(&url)));
     assert!(html.starts_with(&format!("<img src=\"{url}\"")), "{html}");
@@ -1269,8 +1274,178 @@ fn ten_bit_avif_decodes() {
     let mut b = Cursor::new(Vec::new());
     let e = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut b, 10, 90);
     DynamicImage::ImageRgb16(img).write_with_encoder(e).unwrap();
-    let out = avif::decode(&b.into_inner(), 1_000_000).unwrap().to_rgb8();
+    let out = decode_avif(&b.into_inner(), 1_000_000).unwrap().to_rgb8();
     let c = out.get_pixel(8, 8).0;
     let want = [233u8, 117, 19];
     assert!(c.iter().zip(want).all(|(g, w)| (*g as i32 - w as i32).abs() <= 12), "{c:?}");
+}
+
+// ---- AVIF decoder isolation ----
+
+/// A fuzzed AVIF (1 to 8 bytes changed from a valid file) on which rav1d
+/// panics inside `dav1d_send_data`, which aborts the process it runs in.
+const RAV1D_ABORT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/avif-rav1d-abort.avif"));
+/// 2.4 KB: 7000x7000, 12-bit 4:4:4 with an alpha item.
+const AVIF_7000_12BIT: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/avif-7000-12bit-444-alpha.avif"));
+
+#[test]
+fn avif_that_crashes_the_decoder_fails_only_that_image() {
+    let f = Fixture::new();
+    let bad = format!("https://{HOST}/crash.avif");
+    let good = format!("https://{HOST}/fine.avif");
+    let photo = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(
+        cfg_yaml("  widths: [32]\n"),
+        false,
+        vec![(&bad, ok(RAV1D_ABORT.to_vec())), (&good, ok(avif(64, 32, false))), (&photo, ok(png(64, 32)))],
+    );
+    let body = [&bad, &good, &photo].iter().map(|u| p.request_img(img(u))).collect::<Vec<_>>().join("\n");
+    std::fs::write(f.dist.join("page.html"), body).unwrap();
+    let stats = p.finish(4).unwrap();
+    assert_eq!(stats.kept.len(), 1, "{stats:?}");
+    assert_eq!(stats.kept[0].0, bad);
+    assert!(stats.kept[0].1.contains("decoder crashed"), "{stats:?}");
+    let html = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+    assert!(html.contains(&format!("<img src=\"{bad}\"")), "{html}");
+    // the other two sources are written: a WebP and a JPEG each
+    assert_eq!(stats.sources, 2, "{stats:?}");
+    assert_eq!(f.out_files().len(), 4, "{:?}", f.out_files());
+}
+
+/// A few hundred small mutants of valid AVIFs (with and without alpha):
+/// every decode returns, as an image or an error, and this process lives.
+#[test]
+fn mutated_avifs_never_take_the_build_down() {
+    let seeds = [avif(48, 24, false), avif(32, 32, true)];
+    // a mutated header may claim a large frame: keep decodes small
+    let cfg = cfg_yaml("  max_pixels: 1000000\n");
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut cases = vec![RAV1D_ABORT.to_vec()];
+    for i in 0..300 {
+        let mut m = seeds[i % 2].clone();
+        // mutate past the ftyp box, mostly in the AV1 data where rav1d reads
+        for _ in 0..1 + next() % 8 {
+            let at = 32 + (next() as usize) % (m.len() - 32);
+            m[at] = next() as u8;
+        }
+        cases.push(m);
+    }
+    let results: Vec<Result<DynamicImage, String>> = std::thread::scope(|s| {
+        let chunks: Vec<_> = cases.chunks(cases.len().div_ceil(8)).collect();
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|c| s.spawn(|| c.iter().map(|b| decode(b, &cfg)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(results.len(), 301);
+    let crashed = results.iter().filter(|r| matches!(r, Err(e) if e.contains("crashed"))).count();
+    let decoded = results.iter().filter(|r| r.is_ok()).count();
+    eprintln!("{} mutants: {decoded} decoded, {crashed} decoder crashes, the rest refused", results.len());
+    assert!(results[0].as_ref().is_err_and(|e| e.contains("crashed")), "{:?}", results[0].as_ref().err());
+    // decoded images are the probed size
+    for (b, r) in cases.iter().zip(&results) {
+        if let Ok(img) = r {
+            let p = avif::probe(b, cfg.max_pixels).unwrap();
+            assert_eq!((img.width(), img.height()), (p.width, p.height));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn avif_decoder_hangs_crashes_and_bad_output_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = avif(16, 8, false);
+    let run = |body: &str, timeout: u64| {
+        let exe = script(dir.path(), &format!("d{}", sha_hex(body.as_bytes())), body);
+        let mut cfg = cfg_yaml(&format!("  decode_timeout_secs: {timeout}\n"));
+        cfg.decoder_exe = Some(exe);
+        decode(&src, &cfg).map(|_| ()).unwrap_err()
+    };
+    let t = std::time::Instant::now();
+    let e = run("cat >/dev/null; sleep 30", 1);
+    assert!(e.contains("timed out after 1s"), "{e}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+    let e = run("cat >/dev/null; kill -SEGV $$", 5);
+    assert!(e.contains("decoder crashed (signal 11)"), "{e}");
+    let e = run("cat >/dev/null; echo 'avif: nope' >&2; exit 2", 5);
+    assert_eq!(e, "avif: nope");
+    // exit 0 with the wrong size, a short body, or junk: refused
+    let e = run("cat >/dev/null; printf 'PAV1\\001\\000\\000\\000\\001\\000\\000\\000\\003abc'", 5);
+    assert!(e.contains("bad decoder output: unexpected header"), "{e}");
+    let e = run("cat >/dev/null; printf 'PAV1\\020\\000\\000\\000\\010\\000\\000\\000\\003abc'", 5);
+    assert!(e.contains("bad decoder output") && e.contains("expected 384"), "{e}");
+    let e = run("cat >/dev/null; echo hello", 5);
+    assert!(e.contains("bad decoder output"), "{e}");
+    let mut cfg = cfg_yaml("");
+    cfg.decoder_exe = Some(dir.path().join("missing"));
+    assert!(decode(&src, &cfg).unwrap_err().contains("cannot start the decoder"));
+}
+
+#[test]
+fn avif_decode_memory_counts_bit_depth_chroma_and_alpha() {
+    let f = |bit_depth, subsampling, monochrome| avif::Format { bit_depth, subsampling, monochrome };
+    let mono12 = f(12, (true, true), true);
+    // bytes per pixel: rav1d's working set (2x the picture) plus the output
+    for (color, alpha, want) in [
+        (f(8, (true, true), false), None, 6),               // 8-bit 4:2:0: 3 + RGB 3
+        (f(10, (true, true), false), None, 9),              // 6 + 3
+        (f(8, (false, false), false), Some(mono12), 11),    // alpha 1 + 6 + RGBA 4
+        (f(12, (false, false), false), Some(mono12), 17),   // alpha 1 + 12 + RGBA 4
+        (f(12, (true, false), true), Some(mono12), 9),      // monochrome: alpha 1 + 4 + 4
+    ] {
+        assert_eq!(avif::decode_memory(1_000_000, color, alpha), 1_000_000 * want, "{color:?}");
+    }
+    // a 2.4 KB file declaring 7000x7000 12-bit 4:4:4 with alpha: under
+    // max_pixels, but its decode (about 800 MB) is over the 400 MB budget,
+    // so it is refused from the header, before any pixel is decoded
+    let p = avif::probe(AVIF_7000_12BIT, 50_000_000).unwrap();
+    assert_eq!((p.width, p.height, p.alpha), (7000, 7000, true));
+    assert_eq!(p.memory, 49_000_000 * 17);
+    let cfg = cfg_yaml("");
+    let e = probe(AVIF_7000_12BIT, &cfg, false).unwrap_err();
+    assert!(e.contains("over the 381 MB per-image budget"), "{e}");
+    let e = decode(AVIF_7000_12BIT, &cfg).unwrap_err();
+    assert!(e.contains("per-image budget"), "{e}");
+    // the same budget lets an 8-bit 4:2:0 image of max_pixels through
+    assert!(avif::decode_memory(50_000_000, f(8, (true, true), false), None) <= 400_000_000);
+}
+
+#[test]
+fn fetch_deadline_is_capped_and_long_settings_are_refused() {
+    let now = std::time::Instant::now();
+    let mut cfg = cfg_yaml("");
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(120));
+    // a config built in code skips validation: still no overflow panic
+    cfg.retry_total_secs = u64::MAX;
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(MAX_SECS));
+    cfg.retry_total_secs = 1;
+    cfg.timeout_secs = u64::MAX;
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(MAX_SECS));
+    for key in ["retry_total_secs", "timeout_secs", "decode_timeout_secs"] {
+        for bad in ["0", "601", "18446744073709551615"] {
+            let y = format!("images:\n  allowed_hosts: [{HOST}]\n  {key}: {bad}\n");
+            let e = ImagesCfg::from_site_yaml(&y).unwrap_err();
+            assert!(e.contains(&format!("{key} must be 1 to 600")), "{key}={bad}: {e}");
+        }
+        let y = format!("images:\n  allowed_hosts: [{HOST}]\n  {key}: 600\n");
+        assert!(ImagesCfg::from_site_yaml(&y).is_ok());
+    }
 }

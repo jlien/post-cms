@@ -77,3 +77,47 @@ fn build_renders_image_helper_and_reuses_cache() {
     build(root, true);
     assert_eq!(fs::read_to_string(root.join("dist/about/index.html")).unwrap(), html);
 }
+
+/// An AVIF that aborts the AV1 decoder (a fuzzed file) fails that one image:
+/// the build exits 0, the file keeps its URL, and the other image is built.
+#[test]
+fn build_survives_an_avif_that_crashes_the_decoder() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    copy_dir(&repo.join("templates"), &root.join("templates"));
+    copy_dir(&repo.join("themes/astra"), &root.join("themes/astra"));
+    fs::create_dir_all(root.join("content/pages/about")).unwrap();
+    fs::write(root.join("content/pages/about/meta.yaml"), "title: About\nslug: about\npublished: true\n").unwrap();
+    fs::write(root.join("content/pages/about/index.mdx"), "Hello.\n").unwrap();
+    fs::write(
+        root.join("site.yaml"),
+        "theme: astra\nbuiltin_pages: false\nbase_url: https://www.example.com\nimages:\n  widths: [32, 64]\n",
+    )
+    .unwrap();
+    let images = root.join("themes/astra/assets/images");
+    fs::copy(repo.join("crates/build/tests/fixtures/avif-rav1d-abort.avif"), images.join("crash.avif")).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(100, 50).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    fs::write(images.join("hero.png"), png.into_inner()).unwrap();
+    let page = fs::read_to_string(root.join("templates/page.html")).unwrap().replace(
+        "{{ body | safe }}",
+        "{{ body | safe }}{{ image(src=\"/assets/astra/images/crash.avif\", alt=\"Bad\") }}{{ image(src=\"/assets/astra/images/hero.png\", alt=\"Hero\") }}",
+    );
+    fs::write(root.join("templates/page.html"), page).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_build-site"))
+        .env("SITE_ROOT", root)
+        .env("IMAGES_OFFLINE", "0")
+        .env_remove("SITE_PREVIEW_THEMES")
+        .env_remove("DRAFTS")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("images: 1 sources, 3 files written"), "{stdout}");
+    assert!(format!("{stdout}{stderr}").contains("decoder crashed"), "{stdout}\n{stderr}");
+    let html = fs::read_to_string(root.join("dist/about/index.html")).unwrap();
+    assert!(html.contains("<img src=\"/assets/astra/images/crash.avif\""), "{html}");
+    assert!(html.contains("<picture><source type=\"image/webp\""), "{html}");
+}

@@ -641,6 +641,10 @@ impl Post {
 }
 
 fn main() -> Result<()> {
+    // AVIF decodes run in a copy of this binary (see images::decoder_child)
+    if let Some(code) = postcms_build::images::decoder_child() {
+        std::process::exit(code);
+    }
     let root = repo_root()?;
     let dist = root.join("dist");
     if dist.exists() {

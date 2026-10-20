@@ -53,9 +53,42 @@ use sha2::{Digest, Sha256};
 
 mod avif;
 
+/// Decode-only mode for AVIF: binaries that run the pipeline call this
+/// first in `main` and exit with the code it returns. `Some` only when the
+/// process was started as the pipeline's AVIF decoder (AV1 data is decoded
+/// in a child process, so a decoder crash fails one image, not the build).
+pub fn decoder_child() -> Option<i32> {
+    avif::child_main()
+}
+
+/// The program to run AVIF decodes in: `decoder_exe`, else this executable.
+fn decoder_exe(cfg: &ImagesCfg) -> Result<PathBuf, String> {
+    if let Some(p) = &cfg.decoder_exe {
+        return Ok(p.clone());
+    }
+    default_decoder_exe()
+}
+
+#[cfg(not(test))]
+fn default_decoder_exe() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("avif: cannot find the decoder executable: {e}"))
+}
+
+/// Unit tests run in the test harness, which has no decode-only mode: use
+/// the `build-site` binary cargo builds next to it (`cargo test` builds it
+/// for the package's integration tests).
+#[cfg(test)]
+fn default_decoder_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bin = exe.parent().and_then(Path::parent).map(|d| d.join(format!("build-site{}", std::env::consts::EXE_SUFFIX)));
+    bin.filter(|b| b.is_file()).ok_or_else(|| "avif: build-site binary not built (run cargo test --workspace)".into())
+}
+
 /// Widths generated when `images.widths` is not set.
 pub const DEFAULT_WIDTHS: [u32; 8] = [320, 480, 640, 768, 1024, 1280, 1600, 1920];
 const MAX_REDIRECTS: usize = 3;
+/// Upper bound for every `*_secs` setting.
+const MAX_SECS: u64 = 600;
 /// WebP's format limit on either side.
 const WEBP_MAX_SIDE: u32 = 16383;
 /// Upper bound for any configured width.
@@ -123,6 +156,10 @@ pub struct ImagesCfg {
     /// Most time one source may take across all attempts, in seconds.
     #[serde(default = "default_retry_total")]
     pub retry_total_secs: u64,
+    /// Most time one AVIF decode may take (it runs in a child process,
+    /// killed after this), in seconds.
+    #[serde(default = "default_decode_timeout")]
+    pub decode_timeout_secs: u64,
     /// Animated GIFs: `webp` (resize, animated WebP) or `copy` (as they are).
     #[serde(default = "default_animated_gifs")]
     pub animated_gifs: AnimatedGifs,
@@ -144,6 +181,10 @@ pub struct ImagesCfg {
     /// Output directory under dist/ (letters, digits, `-`, `_`, `/`).
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// The program AVIF decodes run in: a binary whose `main` calls
+    /// [`decoder_child`] first. `None` is the running executable.
+    #[serde(skip)]
+    pub decoder_exe: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -184,6 +225,9 @@ fn default_retries() -> u32 {
 }
 fn default_retry_total() -> u64 {
     120
+}
+fn default_decode_timeout() -> u64 {
+    60
 }
 fn default_animated_gifs() -> AnimatedGifs {
     AnimatedGifs::Webp
@@ -238,19 +282,26 @@ impl ImagesCfg {
         if self.retries > 10 {
             return Err("retries must be 0 to 10".into());
         }
+        for (name, v) in [
+            ("timeout_secs", self.timeout_secs),
+            ("retry_total_secs", self.retry_total_secs),
+            ("decode_timeout_secs", self.decode_timeout_secs),
+        ] {
+            if !(1..=MAX_SECS).contains(&v) {
+                return Err(format!("{name} must be 1 to {MAX_SECS}"));
+            }
+        }
         if !(1..=10).contains(&self.avif_speed) {
             return Err("avif_speed must be 1 to 10".into());
         }
         if self.fallback_width == 0
             || self.max_bytes == 0
             || self.max_pixels == 0
-            || self.timeout_secs == 0
             || self.max_frames == 0
             || self.max_animation_pixels == 0
         {
             return Err(
-                "fallback_width, max_bytes, max_pixels, timeout_secs, max_frames and max_animation_pixels must be positive"
-                    .into(),
+                "fallback_width, max_bytes, max_pixels, max_frames and max_animation_pixels must be positive".into(),
             );
         }
         let out_ok = !self.output_dir.is_empty()
@@ -420,10 +471,18 @@ fn request_with_retries(
     }
 }
 
+/// When fetching one source must end: `retry_total_secs` (at least one
+/// `timeout_secs`) from `now`, capped at [`MAX_SECS`] whatever the config
+/// says, so the sum never overflows.
+fn fetch_deadline(now: std::time::Instant, cfg: &ImagesCfg) -> std::time::Instant {
+    let secs = cfg.retry_total_secs.max(cfg.timeout_secs).min(MAX_SECS);
+    now.checked_add(std::time::Duration::from_secs(secs)).unwrap_or(now)
+}
+
 /// GET `url`, following at most [`MAX_REDIRECTS`] redirects, each target
 /// checked against https and the allowlist before it is requested.
 fn fetch_checked(url: &str, cfg: &ImagesCfg, transport: &Transport) -> Result<Vec<u8>, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cfg.retry_total_secs.max(cfg.timeout_secs));
+    let deadline = fetch_deadline(std::time::Instant::now(), cfg);
     let mut cur = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         check_url(&cur, cfg).map_err(|e| match e {
@@ -761,8 +820,10 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind),
     if fmt == ImageFormat::Avif {
         // size from the AV1 sequence header, checked before decoding; a
         // declared alpha item is confirmed transparent in resolve_one
-        let (w, h, alpha) = avif::probe(bytes, cfg.max_pixels)?;
-        return Ok((w, h, Kind::Raster { fallback: if alpha { Enc::Png } else { Enc::Jpeg } }));
+        // and its decode memory against the per-image budget
+        let p = avif::probe(bytes, cfg.max_pixels)?;
+        check_memory(p.memory, cfg)?;
+        return Ok((p.width, p.height, Kind::Raster { fallback: if p.alpha { Enc::Png } else { Enc::Jpeg } }));
     }
     if fmt == ImageFormat::Gif && cfg.animated_gifs == AnimatedGifs::Webp {
         let scan = gif_scan(bytes, cfg)?;
@@ -809,7 +870,9 @@ fn probe(bytes: &[u8], cfg: &ImagesCfg, local: bool) -> Result<(u32, u32, Kind),
 fn decode(bytes: &[u8], cfg: &ImagesCfg) -> Result<DynamicImage, String> {
     let fmt = image::guess_format(bytes).map_err(|e| e.to_string())?;
     if fmt == ImageFormat::Avif {
-        return avif::decode(bytes, cfg.max_pixels);
+        check_memory(avif::probe(bytes, cfg.max_pixels)?.memory, cfg)?;
+        let exe = decoder_exe(cfg)?;
+        return avif::decode(bytes, cfg.max_pixels, &exe, std::time::Duration::from_secs(cfg.decode_timeout_secs));
     }
     let mut dec = reader(bytes, fmt, cfg.max_pixels).into_decoder().map_err(|e| e.to_string())?;
     let o = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
@@ -983,7 +1046,11 @@ fn check_animation(scan: &GifScan, cfg: &ImagesCfg) -> Result<(), String> {
 }
 
 fn check_animation_memory(w: u32, h: u32, widths: &[u32], cfg: &ImagesCfg) -> Result<(), String> {
-    let need = animation_memory(w, h, widths);
+    check_memory(animation_memory(w, h, widths), cfg)
+}
+
+/// Refuse a decode estimated to need more than the per-image budget.
+fn check_memory(need: u64, cfg: &ImagesCfg) -> Result<(), String> {
     if need > decode_budget(cfg) {
         return Err(format!(
             "decoding needs about {} MB, over the {} MB per-image budget (max_pixels x 8)",
