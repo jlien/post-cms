@@ -66,7 +66,7 @@ impl Fixture {
         let calls = self.calls.clone();
         let t: Box<Transport> = Box::new(move |url, _, _| {
             calls.fetch_add(1, Ordering::SeqCst);
-            map.get(url).cloned().ok_or_else(|| format!("no fixture for {url}"))
+            map.get(url).cloned().ok_or_else(|| format!("no fixture for {url}").into())
         });
         Pipeline::new(cfg, &self.root, &self.dist, "https://example.com", offline, t)
     }
@@ -166,7 +166,7 @@ fn redirects_are_rechecked_every_hop() {
         let map: HashMap<String, RawResponse> = resps.into_iter().collect();
         move |u: &str, _: u64, _: u64| {
             calls.fetch_add(1, Ordering::SeqCst);
-            map.get(u).cloned().ok_or_else(|| format!("unexpected {u}"))
+            map.get(u).cloned().ok_or_else(|| format!("unexpected {u}").into())
         }
     };
     // to another host: refused before it is requested
@@ -1003,5 +1003,449 @@ fn transparent_animation_keeps_one_bit_alpha_without_dark_edges() {
         let edge = (0..60).map(|x| f.get_pixel(x, 13)).find(|p| p.0[3] == 255).unwrap();
         assert!(close(edge.0, rgb), "edge {:?} vs {rgb:?}", edge.0);
         assert_eq!(f.get_pixel(5, 13).0[3], 0);
+    }
+}
+
+// ---- AVIF sources ----
+
+/// An AVIF encoded by the image crate (rav1e): a gradient, with alpha when
+/// `alpha` is set (left half opaque, right half transparent).
+fn avif(w: u32, h: u32, alpha: bool) -> Vec<u8> {
+    let mut b = Cursor::new(Vec::new());
+    let e = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut b, 10, 90);
+    if alpha {
+        let img = image::RgbaImage::from_fn(w, h, |x, _| image::Rgba([200, 40, 40, if x < w / 2 { 255 } else { 0 }]));
+        DynamicImage::ImageRgba8(img).write_with_encoder(e).unwrap();
+    } else {
+        let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x * 255 / w) as u8, (y * 255 / h) as u8, 90]));
+        DynamicImage::ImageRgb8(img).write_with_encoder(e).unwrap();
+    }
+    b.into_inner()
+}
+
+/// `avif::decode` in the child process `cargo test` builds (build-site).
+fn decode_avif(bytes: &[u8], max_pixels: u64) -> Result<DynamicImage, String> {
+    avif::decode(bytes, max_pixels, &default_decoder_exe()?, std::time::Duration::from_secs(60))
+}
+
+#[test]
+fn avif_sources_are_decoded_and_re_encoded_like_other_stills() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/photo.avif");
+    let src = avif(96, 48, false);
+    assert_eq!(&src[4..12], b"ftypavif");
+    let p = f.pipeline(cfg_yaml("  widths: [48, 128]\n"), false, vec![(&url, ok(src.clone()))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert!(html.contains("width=\"96\" height=\"48\""), "{html}");
+    let files = f.out_files();
+    // 48 and 96 in WebP plus a JPEG fallback (no alpha item)
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(files.iter().any(|n| n.ends_with("-96.jpg")), "{files:?}");
+    let jpg = files.iter().find(|n| n.ends_with(".jpg")).unwrap();
+    let out = image::open(f.dist.join("assets/img").join(jpg)).unwrap().to_rgb8();
+    assert_eq!(out.dimensions(), (96, 48));
+    // colors survive the YUV round trip (the gradient's corners)
+    for (x, y, want) in [(2, 2, [5u8, 10, 90]), (93, 45, [250, 240, 90])] {
+        let got = out.get_pixel(x, y).0;
+        assert!(got.iter().zip(want).all(|(g, w)| (*g as i32 - w as i32).abs() <= 16), "({x},{y}) {got:?} vs {want:?}");
+    }
+}
+
+#[test]
+fn avif_with_alpha_gets_a_png_fallback_with_its_transparency() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/logo.avif");
+    let p = f.pipeline(cfg_yaml("  widths: [64]\n"), false, vec![(&url, ok(avif(64, 32, true)))]);
+    f.render(&p, &p.request_img(img(&url)));
+    let files = f.out_files();
+    let png = files.iter().find(|n| n.ends_with(".png")).unwrap_or_else(|| panic!("{files:?}"));
+    let out = image::open(f.dist.join("assets/img").join(png)).unwrap().to_rgba8();
+    assert!(out.get_pixel(4, 16).0[3] > 240 && out.get_pixel(60, 16).0[3] < 15);
+    let c = out.get_pixel(4, 16).0;
+    assert!((c[0] as i32 - 200).abs() < 20 && c[1] < 70 && c[2] < 70, "{c:?}");
+}
+
+#[test]
+fn avif_pixel_limit_is_checked_before_decoding() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/huge.avif");
+    let cfg = cfg_yaml("  max_pixels: 1000\n");
+    let src = avif(64, 32, false);
+    let err = probe(&src, &cfg, false).unwrap_err();
+    assert!(err.contains("over max_pixels"), "{err}");
+    // the decoder refuses too, from the header alone
+    assert!(decode_avif(&src, 1000).unwrap_err().contains("max_pixels"));
+    let p = f.pipeline(cfg, false, vec![(&url, ok(src))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert!(html.starts_with(&format!("<img src=\"{url}\"")), "{html}");
+    assert!(f.out_files().is_empty());
+}
+
+#[test]
+fn corrupt_avif_keeps_its_url() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/bad.avif");
+    let mut src = avif(64, 32, false);
+    // keep the container, overwrite the AV1 data (the mdat payload)
+    let at = src.windows(4).position(|w| w == b"mdat").unwrap() + 4;
+    for b in &mut src[at..] {
+        *b = 0xff;
+    }
+    let p = f.pipeline(cfg_yaml("  widths: [32]\n"), false, vec![(&url, ok(src))]);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert!(html.starts_with(&format!("<img src=\"{url}\"")), "{html}");
+    assert!(f.out_files().is_empty());
+}
+
+// ---- retries ----
+
+/// What the loopback server does with each request, in order; the last
+/// entry repeats.
+#[derive(Clone)]
+enum Reply {
+    /// Wait this long before answering 200 (past the client's timeout).
+    Slow(u64),
+    Status(u16),
+    Ok,
+}
+
+/// A plain-http server on a free loopback port serving `body` per `script`.
+/// Returns the port and the request counter.
+fn script_server(body: Vec<u8>, script: Vec<Reply>) -> (u16, Arc<AtomicUsize>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let count = n.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let i = count.fetch_add(1, Ordering::SeqCst);
+            let reply = script[i.min(script.len() - 1)].clone();
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => req.extend_from_slice(&buf[..k]),
+                    }
+                }
+                let (status, body) = match reply {
+                    Reply::Slow(ms) => {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        (200, body)
+                    }
+                    Reply::Status(s) => (s, Vec::new()),
+                    Reply::Ok => (200, body),
+                };
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = c.write_all(head.as_bytes());
+                let _ = c.write_all(&body);
+            });
+        }
+    });
+    (port, n)
+}
+
+fn loopback_pipeline(f: &Fixture, cfg: ImagesCfg, port: u16) -> Pipeline {
+    Pipeline::new(cfg, &f.root, &f.dist, "https://example.com", false, loopback_transport(port))
+}
+
+#[test]
+fn flaky_5xx_is_retried_until_it_succeeds() {
+    let f = Fixture::new();
+    let (port, hits) = script_server(png(40, 20), vec![Reply::Status(503), Reply::Status(502), Reply::Ok]);
+    let url = format!("https://{HOST}/flaky.png");
+    let p = loopback_pipeline(&f, cfg_yaml("  widths: [20]\n  timeout_secs: 5\n"), port);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert!(html.contains("/assets/img/"), "{html}");
+}
+
+#[test]
+fn a_timed_out_fetch_is_retried() {
+    let f = Fixture::new();
+    let (port, hits) = script_server(png(40, 20), vec![Reply::Slow(2500), Reply::Ok]);
+    let url = format!("https://{HOST}/slow.png");
+    let p = loopback_pipeline(&f, cfg_yaml("  widths: [20]\n  timeout_secs: 1\n"), port);
+    let html = f.render(&p, &p.request_img(img(&url)));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(html.contains("/assets/img/"), "{html}");
+}
+
+#[test]
+fn retries_are_bounded_by_attempts_and_total_time_then_the_url_is_kept() {
+    // attempts: 1 + 2 retries
+    let f = Fixture::new();
+    let (port, hits) = script_server(png(40, 20), vec![Reply::Status(503)]);
+    let url = format!("https://{HOST}/down.png");
+    let p = loopback_pipeline(&f, cfg_yaml("  retries: 2\n  timeout_secs: 1\n"), port);
+    std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+    let stats = p.finish(1).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(stats.kept, vec![(url.clone(), "HTTP 503 (after 3 attempts)".to_string())]);
+    let html = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+    assert!(html.starts_with(&format!("<img src=\"{url}\"")), "{html}");
+    // total time: many retries allowed, but the source gives up within its budget
+    let f = Fixture::new();
+    let (port, _) = script_server(png(40, 20), vec![Reply::Slow(5000)]);
+    let p = loopback_pipeline(&f, cfg_yaml("  retries: 10\n  timeout_secs: 1\n  retry_total_secs: 2\n"), port);
+    std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+    let t = std::time::Instant::now();
+    let stats = p.finish(1).unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(4), "{:?}", t.elapsed());
+    assert_eq!(stats.kept.len(), 1, "{stats:?}");
+}
+
+#[test]
+fn client_errors_are_not_retried() {
+    let f = Fixture::new();
+    let (port, hits) = script_server(Vec::new(), vec![Reply::Status(404)]);
+    let url = format!("https://{HOST}/missing.png");
+    let p = loopback_pipeline(&f, cfg_yaml(""), port);
+    std::fs::write(f.dist.join("page.html"), p.request_img(img(&url))).unwrap();
+    let stats = p.finish(1).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.kept, vec![(url, "HTTP 404".to_string())]);
+}
+
+#[test]
+fn retry_config_is_validated() {
+    let y = format!("images:\n  allowed_hosts: [{HOST}]\n  retries: 11\n");
+    assert!(ImagesCfg::from_site_yaml(&y).unwrap_err().contains("retries"));
+    let c = cfg_yaml("");
+    assert_eq!((c.retries, c.retry_total_secs), (3, 120));
+}
+
+// ---- cache verification ----
+
+#[test]
+fn tampered_cache_entries_are_evicted_and_rebuilt() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/t.png");
+    let cfg = || cfg_yaml("  widths: [50]\n");
+    let p = f.pipeline(cfg(), false, vec![(&url, ok(png(100, 50)))]);
+    let first = f.render(&p, &p.request_img(img(&url)));
+    let names = f.out_files();
+    let originals: Vec<Vec<u8>> = names.iter().map(|n| std::fs::read(f.dist.join("assets/img").join(n)).unwrap()).collect();
+    let out = f.root.join(".cache/images/out");
+    // every cached variant has a recorded hash of its bytes
+    for n in &names {
+        let rec = std::fs::read_to_string(out.join(format!("{n}.sha256"))).unwrap();
+        assert_eq!(rec, sha_hex(&std::fs::read(out.join(n)).unwrap()));
+    }
+    // tamper one variant (a valid image, different bytes) and drop another's record
+    std::fs::write(out.join(&names[0]), png(1, 1)).unwrap();
+    std::fs::remove_file(out.join(format!("{}.sha256", names[1]))).unwrap();
+    let rebuild = || {
+        std::fs::remove_dir_all(&f.dist).unwrap();
+        std::fs::create_dir_all(&f.dist).unwrap();
+        let p = f.pipeline(cfg(), true, vec![]);
+        f.render(&p, &p.request_img(img(&url)))
+    };
+    let second = rebuild();
+    assert_eq!(first, second);
+    for (n, want) in names.iter().zip(&originals) {
+        assert_eq!(&std::fs::read(f.dist.join("assets/img").join(n)).unwrap(), want, "{n} not rebuilt");
+        assert_eq!(&std::fs::read(out.join(n)).unwrap(), want, "{n} cache not repaired");
+    }
+    // a tampered source: evicted, fetched again online, same output
+    let p = f.pipeline(cfg(), false, vec![]);
+    let idx = std::fs::read_to_string(p.url_index(&url)).unwrap();
+    std::fs::write(p.src_file(idx.trim()), png(3, 3)).unwrap();
+    let calls = f.calls.load(Ordering::SeqCst);
+    std::fs::remove_dir_all(&f.dist).unwrap();
+    std::fs::create_dir_all(&f.dist).unwrap();
+    let p = f.pipeline(cfg(), false, vec![(&url, ok(png(100, 50)))]);
+    assert_eq!(f.render(&p, &p.request_img(img(&url))), first);
+    assert_eq!(f.calls.load(Ordering::SeqCst), calls + 1, "tampered source was not refetched");
+    assert_eq!(sha_hex(&std::fs::read(p.src_file(idx.trim())).unwrap()), idx.trim());
+    // a source that changes between resolve and encode is refused, not used
+    let s = Source { content: idx.trim().to_string(), id: "0".repeat(16), width: 100, height: 50, kind: Kind::Raster { fallback: Enc::Jpeg } };
+    std::fs::write(p.src_file(&s.content), b"swapped").unwrap();
+    assert!(p.source_bytes(&s).unwrap_err().contains("does not match"));
+}
+
+#[test]
+fn ten_bit_avif_decodes() {
+    let img = image::ImageBuffer::<image::Rgb<u16>, _>::from_fn(32, 16, |_, _| image::Rgb([60000u16, 30000, 5000]));
+    let mut b = Cursor::new(Vec::new());
+    let e = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut b, 10, 90);
+    DynamicImage::ImageRgb16(img).write_with_encoder(e).unwrap();
+    let out = decode_avif(&b.into_inner(), 1_000_000).unwrap().to_rgb8();
+    let c = out.get_pixel(8, 8).0;
+    let want = [233u8, 117, 19];
+    assert!(c.iter().zip(want).all(|(g, w)| (*g as i32 - w as i32).abs() <= 12), "{c:?}");
+}
+
+// ---- AVIF decoder isolation ----
+
+/// A fuzzed AVIF (1 to 8 bytes changed from a valid file) on which rav1d
+/// panics inside `dav1d_send_data`, which aborts the process it runs in.
+const RAV1D_ABORT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/avif-rav1d-abort.avif"));
+/// 2.4 KB: 7000x7000, 12-bit 4:4:4 with an alpha item.
+const AVIF_7000_12BIT: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/avif-7000-12bit-444-alpha.avif"));
+
+#[test]
+fn avif_that_crashes_the_decoder_fails_only_that_image() {
+    let f = Fixture::new();
+    let bad = format!("https://{HOST}/crash.avif");
+    let good = format!("https://{HOST}/fine.avif");
+    let photo = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(
+        cfg_yaml("  widths: [32]\n"),
+        false,
+        vec![(&bad, ok(RAV1D_ABORT.to_vec())), (&good, ok(avif(64, 32, false))), (&photo, ok(png(64, 32)))],
+    );
+    let body = [&bad, &good, &photo].iter().map(|u| p.request_img(img(u))).collect::<Vec<_>>().join("\n");
+    std::fs::write(f.dist.join("page.html"), body).unwrap();
+    let stats = p.finish(4).unwrap();
+    assert_eq!(stats.kept.len(), 1, "{stats:?}");
+    assert_eq!(stats.kept[0].0, bad);
+    assert!(stats.kept[0].1.contains("decoder crashed"), "{stats:?}");
+    let html = std::fs::read_to_string(f.dist.join("page.html")).unwrap();
+    assert!(html.contains(&format!("<img src=\"{bad}\"")), "{html}");
+    // the other two sources are written: a WebP and a JPEG each
+    assert_eq!(stats.sources, 2, "{stats:?}");
+    assert_eq!(f.out_files().len(), 4, "{:?}", f.out_files());
+}
+
+/// A few hundred small mutants of valid AVIFs (with and without alpha):
+/// every decode returns, as an image or an error, and this process lives.
+#[test]
+fn mutated_avifs_never_take_the_build_down() {
+    let seeds = [avif(48, 24, false), avif(32, 32, true)];
+    // a mutated header may claim a large frame: keep decodes small
+    let cfg = cfg_yaml("  max_pixels: 1000000\n");
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut cases = vec![RAV1D_ABORT.to_vec()];
+    for i in 0..300 {
+        let mut m = seeds[i % 2].clone();
+        // mutate past the ftyp box, mostly in the AV1 data where rav1d reads
+        for _ in 0..1 + next() % 8 {
+            let at = 32 + (next() as usize) % (m.len() - 32);
+            m[at] = next() as u8;
+        }
+        cases.push(m);
+    }
+    let results: Vec<Result<DynamicImage, String>> = std::thread::scope(|s| {
+        let chunks: Vec<_> = cases.chunks(cases.len().div_ceil(8)).collect();
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|c| s.spawn(|| c.iter().map(|b| decode(b, &cfg)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(results.len(), 301);
+    let crashed = results.iter().filter(|r| matches!(r, Err(e) if e.contains("crashed"))).count();
+    let decoded = results.iter().filter(|r| r.is_ok()).count();
+    eprintln!("{} mutants: {decoded} decoded, {crashed} decoder crashes, the rest refused", results.len());
+    assert!(results[0].as_ref().is_err_and(|e| e.contains("crashed")), "{:?}", results[0].as_ref().err());
+    // decoded images are the probed size
+    for (b, r) in cases.iter().zip(&results) {
+        if let Ok(img) = r {
+            let p = avif::probe(b, cfg.max_pixels).unwrap();
+            assert_eq!((img.width(), img.height()), (p.width, p.height));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn avif_decoder_hangs_crashes_and_bad_output_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = avif(16, 8, false);
+    let run = |body: &str, timeout: u64| {
+        let exe = script(dir.path(), &format!("d{}", sha_hex(body.as_bytes())), body);
+        let mut cfg = cfg_yaml(&format!("  decode_timeout_secs: {timeout}\n"));
+        cfg.decoder_exe = Some(exe);
+        decode(&src, &cfg).map(|_| ()).unwrap_err()
+    };
+    let t = std::time::Instant::now();
+    let e = run("cat >/dev/null; sleep 30", 1);
+    assert!(e.contains("timed out after 1s"), "{e}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+    let e = run("cat >/dev/null; kill -SEGV $$", 5);
+    assert!(e.contains("decoder crashed (signal 11)"), "{e}");
+    let e = run("cat >/dev/null; echo 'avif: nope' >&2; exit 2", 5);
+    assert_eq!(e, "avif: nope");
+    // exit 0 with the wrong size, a short body, or junk: refused
+    let e = run("cat >/dev/null; printf 'PAV1\\001\\000\\000\\000\\001\\000\\000\\000\\003abc'", 5);
+    assert!(e.contains("bad decoder output: unexpected header"), "{e}");
+    let e = run("cat >/dev/null; printf 'PAV1\\020\\000\\000\\000\\010\\000\\000\\000\\003abc'", 5);
+    assert!(e.contains("bad decoder output") && e.contains("expected 384"), "{e}");
+    let e = run("cat >/dev/null; echo hello", 5);
+    assert!(e.contains("bad decoder output"), "{e}");
+    let mut cfg = cfg_yaml("");
+    cfg.decoder_exe = Some(dir.path().join("missing"));
+    assert!(decode(&src, &cfg).unwrap_err().contains("cannot start the decoder"));
+}
+
+#[test]
+fn avif_decode_memory_counts_bit_depth_chroma_and_alpha() {
+    let f = |bit_depth, subsampling, monochrome| avif::Format { bit_depth, subsampling, monochrome };
+    let mono12 = f(12, (true, true), true);
+    // bytes per pixel: rav1d's working set (2x the picture) plus the output
+    for (color, alpha, want) in [
+        (f(8, (true, true), false), None, 6),               // 8-bit 4:2:0: 3 + RGB 3
+        (f(10, (true, true), false), None, 9),              // 6 + 3
+        (f(8, (false, false), false), Some(mono12), 11),    // alpha 1 + 6 + RGBA 4
+        (f(12, (false, false), false), Some(mono12), 17),   // alpha 1 + 12 + RGBA 4
+        (f(12, (true, false), true), Some(mono12), 9),      // monochrome: alpha 1 + 4 + 4
+    ] {
+        assert_eq!(avif::decode_memory(1_000_000, color, alpha), 1_000_000 * want, "{color:?}");
+    }
+    // a 2.4 KB file declaring 7000x7000 12-bit 4:4:4 with alpha: under
+    // max_pixels, but its decode (about 800 MB) is over the 400 MB budget,
+    // so it is refused from the header, before any pixel is decoded
+    let p = avif::probe(AVIF_7000_12BIT, 50_000_000).unwrap();
+    assert_eq!((p.width, p.height, p.alpha), (7000, 7000, true));
+    assert_eq!(p.memory, 49_000_000 * 17);
+    let cfg = cfg_yaml("");
+    let e = probe(AVIF_7000_12BIT, &cfg, false).unwrap_err();
+    assert!(e.contains("over the 381 MB per-image budget"), "{e}");
+    let e = decode(AVIF_7000_12BIT, &cfg).unwrap_err();
+    assert!(e.contains("per-image budget"), "{e}");
+    // the same budget lets an 8-bit 4:2:0 image of max_pixels through
+    assert!(avif::decode_memory(50_000_000, f(8, (true, true), false), None) <= 400_000_000);
+}
+
+#[test]
+fn fetch_deadline_is_capped_and_long_settings_are_refused() {
+    let now = std::time::Instant::now();
+    let mut cfg = cfg_yaml("");
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(120));
+    // a config built in code skips validation: still no overflow panic
+    cfg.retry_total_secs = u64::MAX;
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(MAX_SECS));
+    cfg.retry_total_secs = 1;
+    cfg.timeout_secs = u64::MAX;
+    assert_eq!(fetch_deadline(now, &cfg), now + std::time::Duration::from_secs(MAX_SECS));
+    for key in ["retry_total_secs", "timeout_secs", "decode_timeout_secs"] {
+        for bad in ["0", "601", "18446744073709551615"] {
+            let y = format!("images:\n  allowed_hosts: [{HOST}]\n  {key}: {bad}\n");
+            let e = ImagesCfg::from_site_yaml(&y).unwrap_err();
+            assert!(e.contains(&format!("{key} must be 1 to 600")), "{key}={bad}: {e}");
+        }
+        let y = format!("images:\n  allowed_hosts: [{HOST}]\n  {key}: 600\n");
+        assert!(ImagesCfg::from_site_yaml(&y).is_ok());
     }
 }
