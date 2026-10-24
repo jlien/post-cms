@@ -58,7 +58,45 @@ fn content_type_for(path: &StdPath) -> (&'static str, &'static str) {
     }
 }
 
+const USAGE: &str = "\
+Usage: server
+
+Serves the dist/ of the site at SITE_ROOT (else the current directory) on
+PORT (default 8787). Configuration comes from the environment only.
+
+Options:
+  -h, --help  Print this help.
+";
+
+/// Build marker the engine writes in dist/ (see build-site). Never served.
+const DIST_MARKER: &str = ".post-cms-build";
+
+/// `Ok(true)` for help; any other argument is an error, so a flag this
+/// binary does not know never starts a server.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<bool, String> {
+    let mut help = false;
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => help = true,
+            _ if a.starts_with('-') => return Err(format!("unknown option {a:?}")),
+            _ => return Err(format!("unexpected argument {a:?} (set SITE_ROOT to choose the site)")),
+        }
+    }
+    Ok(help)
+}
+
 fn main() -> anyhow::Result<()> {
+    match parse_args(env::args().skip(1)) {
+        Ok(true) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprint!("server: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
     let root = repo_root()?;
     let dist = root.join("dist");
     if !dist.is_dir() {
@@ -328,32 +366,15 @@ fn rate_limit(ip: IpAddr) -> (bool, u32, u64) {
     }
 }
 
-/// Site root, resolved the same way as the build: SITE_ROOT, then the git
-/// toplevel of the current directory (so a separate site repo serves its own
-/// dist/), then the compile-time manifest dir.
+/// Site root, resolved the same way as the build: SITE_ROOT when set, else
+/// the current directory.
 fn repo_root() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = env::var("SITE_ROOT") {
         if !dir.is_empty() {
             return Ok(PathBuf::from(dir));
         }
     }
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Ok(PathBuf::from(s));
-            }
-        }
-    }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    StdPath::new(manifest)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| anyhow::anyhow!("cannot locate repo root"))
+    env::current_dir().context("cannot read the current directory")
 }
 
 /// site.yaml `trailing_slash` (default true). When false, `/x/` 301s to `/x`.
@@ -522,8 +543,8 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     if let Some(r) = redirect_for(&rel) {
         return redirect_response(r);
     }
-    // Reject traversal and empty segments.
-    if rel.split('/').any(|seg| {
+    // Reject traversal and empty segments, and the build marker.
+    if rel == DIST_MARKER || rel.split('/').any(|seg| {
         seg.is_empty() || seg == "." || seg == ".." || seg.contains('\0')
     }) {
         return not_found(root.clone());
@@ -1365,5 +1386,26 @@ headers:
         assert!(format!("{err:#}").contains("set by the server"), "{err:#}");
         std::fs::write(dir.join("site.yaml"), "title: x\n").unwrap();
         assert!(load_site_headers(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_marker_is_never_served() {
+        let dist = temp_dist("marker");
+        std::fs::write(dist.join(DIST_MARKER), "marker").unwrap();
+        for p in ["/.post-cms-build", ".post-cms-build", "/.post-cms-build/"] {
+            assert_eq!(serve(&dist, p, false).status(), StatusCode::NOT_FOUND, "{p}");
+        }
+        assert_eq!(serve(&dist, "/app.js", false).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn unknown_arguments_are_usage_errors() {
+        let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        assert_eq!(args(&[]), Ok(false));
+        assert_eq!(args(&["--help"]), Ok(true));
+        assert_eq!(args(&["-h"]), Ok(true));
+        assert!(args(&["--version"]).unwrap_err().contains("unknown option \"--version\""));
+        assert!(args(&["--port", "9000"]).is_err());
+        assert!(args(&["site"]).unwrap_err().contains("unexpected argument"));
     }
 }
