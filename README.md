@@ -49,7 +49,17 @@ an AI agent do all content operations.
 
 ```bash
 cargo run -p build      # renders dist/
+SITE_ROOT=/path/to/site build-site
 ```
+
+The site root is `SITE_ROOT`, else the current directory. Guards against building the wrong directory:
+
+- The site root must contain `site.yaml`. Anything else (an unrelated repo, a home directory) exits non-zero before `dist/` is touched.
+- Every build writes `dist/.post-cms-build`. An existing `dist/` is deleted and recreated only when it has that marker. A `dist/` without it is refused with an error naming the directory, and a `dist` that is a symlink or a file is always refused. A missing or empty `dist/` is used as is.
+- A `dist/` from a build-site older than the marker is refused once: check it is build output, then run `build-site --force-clean` (or `cargo run -p build -- --force-clean`). Later builds find the marker. The engine does not guess from contents such as `sitemap.xml`, since other generators write those too.
+- Unknown flags and arguments (`--version`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage. The server takes no arguments either, and the AVIF decode-only mode takes exactly its three numbers.
+
+The origin server never serves the marker file.
 
 ## Template data
 
@@ -179,6 +189,8 @@ How it works: rendering records each call and prints a placeholder. After every 
 ```bash
 cargo run -p server     # serves dist/ on http://localhost:8787
 ```
+
+The server reads `SITE_ROOT`, else the current directory, the same way as the build.
 
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.

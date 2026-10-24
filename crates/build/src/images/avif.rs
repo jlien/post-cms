@@ -249,14 +249,15 @@ fn describe(status: &std::process::ExitStatus) -> String {
 /// Decode-only mode: when the first argument is [`CHILD_FLAG`], read an
 /// AVIF from stdin, write the header and 8-bit pixels to stdout, and return
 /// the exit code; `None` for any other command line. Arguments after the
-/// flag: max pixels, memory limit in bytes, CPU seconds.
+/// flag: max pixels, memory limit in bytes, CPU seconds, and nothing else
+/// (a missing, malformed or extra argument is a usage error).
 pub fn child_main() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some(CHILD_FLAG) {
         return None;
     }
     let num = |i: usize| args.get(i).and_then(|v| v.parse::<u64>().ok());
-    let (Some(max_pixels), Some(mem), Some(cpu)) = (num(1), num(2), num(3)) else {
+    let (4, Some(max_pixels), Some(mem), Some(cpu)) = (args.len(), num(1), num(2), num(3)) else {
         eprintln!("avif: usage: {CHILD_FLAG} <max_pixels> <memory_bytes> <cpu_secs>");
         return Some(CHILD_ERR);
     };

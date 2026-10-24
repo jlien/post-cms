@@ -645,13 +645,20 @@ fn main() -> Result<()> {
     if let Some(code) = postcms_build::images::decoder_child() {
         std::process::exit(code);
     }
+    let opts = match parse_args(std::env::args().skip(1)) {
+        Ok(Args::Help) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Ok(Args::Build(o)) => o,
+        Err(e) => {
+            eprint!("build-site: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let root = repo_root()?;
-    let dist = root.join("dist");
-    if dist.exists() {
-        fs::remove_dir_all(&dist)
-            .with_context(|| format!("failed to clear {}", dist.display()))?;
-    }
-    fs::create_dir_all(&dist).with_context(|| format!("mkdir {}", dist.display()))?;
+    require_site_config(&root)?;
+    let dist = prepare_dist(&root, opts.force_clean)?;
 
     // ---- theme plugin system -------------------------------------------
     // Priority: SITE_THEME env > site.yaml `theme:` > "default".
@@ -1380,34 +1387,109 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<Strin
     }
 }
 
+const USAGE: &str = "\
+Usage: build-site [--force-clean]
+
+Renders the site at SITE_ROOT (else the current directory) into its dist/.
+The site root must contain site.yaml.
+
+Options:
+  --force-clean  Replace an existing dist/ that has no build marker
+                 (dist/.post-cms-build), such as one written by an older
+                 build-site. Use it once; later builds find the marker.
+  -h, --help     Print this help.
+";
+
+/// File every build writes in dist/. An existing dist/ is cleared only when
+/// it carries this marker, so the build never deletes a directory it did
+/// not create.
+const DIST_MARKER: &str = ".post-cms-build";
+const DIST_MARKER_BODY: &str = "Written by post-cms build-site. This directory is build output: the next build deletes and recreates it.\n";
+
+#[derive(Debug, Default, PartialEq)]
+struct BuildOpts {
+    force_clean: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum Args {
+    Build(BuildOpts),
+    Help,
+}
+
+/// Command line after the program name. Anything not listed in [`USAGE`]
+/// is an error, so a flag this binary does not know never starts a build.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Args, String> {
+    let mut opts = BuildOpts::default();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => return Ok(Args::Help),
+            "--force-clean" => opts.force_clean = true,
+            _ if a.starts_with('-') => return Err(format!("unknown option {a:?}")),
+            _ => return Err(format!("unexpected argument {a:?} (set SITE_ROOT to choose the site)")),
+        }
+    }
+    Ok(Args::Build(opts))
+}
+
+/// The site root: SITE_ROOT when set, else the current directory.
 fn repo_root() -> Result<PathBuf> {
-    // SITE_ROOT wins (containers and CI without a .git). Otherwise the
-    // runtime repo root (git toplevel of the current directory), so builds in
-    // tenant worktrees, or a separate site repo, use that repo's content.
-    // Falls back to the compile-time manifest dir only outside a git repo.
     if let Ok(dir) = std::env::var("SITE_ROOT") {
         if !dir.is_empty() {
             return Ok(PathBuf::from(dir));
         }
     }
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Ok(PathBuf::from(s));
+    std::env::current_dir().context("cannot read the current directory")
+}
+
+/// A directory is only a site when it has site.yaml: anything else (an
+/// unrelated repo, a home directory) is refused before dist/ is touched.
+fn require_site_config(root: &Path) -> Result<()> {
+    if root.join("site.yaml").is_file() {
+        return Ok(());
+    }
+    bail!(
+        "{} is not a post-cms site (no site.yaml); set SITE_ROOT to the site directory. Nothing was built or deleted.",
+        root.display()
+    )
+}
+
+/// Make `<root>/dist` ready for a fresh build and write the build marker.
+/// A missing or empty dist/ is used as is. An existing one is deleted only
+/// when it carries [`DIST_MARKER`] (or with `force_clean`); a symlink or a
+/// file named dist is always refused.
+fn prepare_dist(root: &Path, force_clean: bool) -> Result<PathBuf> {
+    let dist = root.join("dist");
+    match fs::symlink_metadata(&dist) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("stat {}", dist.display())),
+        Ok(m) if !m.is_dir() => bail!(
+            "{} is not a directory (a symlink or file); refusing to replace it. Remove it and build again.",
+            dist.display()
+        ),
+        Ok(_) => {
+            let marked = fs::symlink_metadata(dist.join(DIST_MARKER)).is_ok_and(|m| m.is_file());
+            let empty = fs::read_dir(&dist)
+                .with_context(|| format!("read_dir {}", dist.display()))?
+                .next()
+                .is_none();
+            if !marked && !empty && !force_clean {
+                bail!(
+                    "{} exists but has no {DIST_MARKER} marker, so build-site did not create it; refusing to delete it. \
+                     If it is output of an older build-site, run once with --force-clean.",
+                    dist.display()
+                );
+            }
+            if !empty {
+                fs::remove_dir_all(&dist)
+                    .with_context(|| format!("failed to clear {}", dist.display()))?;
             }
         }
     }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    // crates/build → repo root
-    let root = Path::new(manifest)
-        .parent()
-        .and_then(|p| p.parent())
-        .context("cannot locate repo root from CARGO_MANIFEST_DIR")?;
-    Ok(root.to_path_buf())
+    fs::create_dir_all(&dist).with_context(|| format!("mkdir {}", dist.display()))?;
+    fs::write(dist.join(DIST_MARKER), DIST_MARKER_BODY)
+        .with_context(|| format!("write {}", dist.join(DIST_MARKER).display()))?;
+    Ok(dist)
 }
 
 fn load_posts(dir: &Path) -> Result<Vec<Post>> {
@@ -3939,5 +4021,44 @@ mod tests {
         optimize_images(dist, Some(&dist.join("assets/img"))).unwrap();
         assert_eq!(fs::read(dist.join("assets/img/a.png")).unwrap(), png);
         assert_eq!(image::image_dimensions(dist.join("other/a.png")).unwrap(), (1600, 9));
+    }
+
+    #[test]
+    fn args_accept_only_known_flags() {
+        let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        assert_eq!(args(&[]), Ok(Args::Build(BuildOpts { force_clean: false })));
+        assert_eq!(args(&["--force-clean"]), Ok(Args::Build(BuildOpts { force_clean: true })));
+        assert_eq!(args(&["-h"]), Ok(Args::Help));
+        assert_eq!(args(&["--force-clean", "--help"]), Ok(Args::Help));
+        assert!(args(&["--version"]).unwrap_err().contains("unknown option"));
+        assert!(args(&["--force-clean=1"]).is_err());
+        assert!(args(&["."]).unwrap_err().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn prepare_dist_clears_only_marked_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // missing: created with the marker
+        let dist = prepare_dist(root, false).unwrap();
+        assert_eq!(fs::read_to_string(dist.join(DIST_MARKER)).unwrap(), DIST_MARKER_BODY);
+        // marked: cleared
+        fs::write(dist.join("old.html"), "x").unwrap();
+        prepare_dist(root, false).unwrap();
+        assert!(!dist.join("old.html").exists());
+        // unmarked: refused, untouched
+        fs::remove_file(dist.join(DIST_MARKER)).unwrap();
+        fs::write(dist.join("mine.txt"), "x").unwrap();
+        let err = format!("{:#}", prepare_dist(root, false).unwrap_err());
+        assert!(err.contains(&dist.display().to_string()), "{err}");
+        assert!(dist.join("mine.txt").exists());
+        // a directory named like the marker is not a marker
+        fs::create_dir(dist.join(DIST_MARKER)).unwrap();
+        assert!(prepare_dist(root, false).is_err());
+        assert!(dist.join("mine.txt").exists());
+        // force: cleared
+        prepare_dist(root, true).unwrap();
+        assert!(!dist.join("mine.txt").exists());
+        assert!(dist.join(DIST_MARKER).is_file());
     }
 }
