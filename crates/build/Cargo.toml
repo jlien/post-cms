@@ -20,7 +20,6 @@ chrono.workspace = true
 serde_json.workspace = true
 fastembed.workspace = true
 image.workspace = true
-webp.workspace = true
 libwebp-sys.workspace = true
 sha2.workspace = true
 jpeg-encoder.workspace = true

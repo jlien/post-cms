@@ -645,6 +645,10 @@ fn main() -> Result<()> {
     if let Some(code) = postcms_build::images::decoder_child() {
         std::process::exit(code);
     }
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("build-site {} (libwebp {})", env!("CARGO_PKG_VERSION"), postcms_build::images::webp::libwebp_version());
+        return Ok(());
+    }
     let root = repo_root()?;
     let dist = root.join("dist");
     if dist.exists() {

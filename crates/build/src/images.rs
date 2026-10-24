@@ -52,6 +52,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod avif;
+pub mod webp;
 
 /// Decode-only mode for AVIF: binaries that run the pipeline call this
 /// first in `main` and exit with the code it returns. `Some` only when the
@@ -1156,9 +1157,9 @@ impl AnimWriter {
             if WebPAnimEncoderAssemble(self.enc.as_ptr(), &mut data) == 0 {
                 return Err(self.error());
             }
-            let out = std::slice::from_raw_parts(data.bytes, data.size).to_vec();
+            let out = (!data.bytes.is_null() && data.size > 0).then(|| std::slice::from_raw_parts(data.bytes, data.size).to_vec());
             WebPDataClear(&mut data);
-            Ok(out)
+            out.ok_or_else(|| "webp: animation encoder returned no data".into())
         }
     }
 }
@@ -1289,13 +1290,12 @@ fn encode(img: &DynamicImage, enc: Enc, cfg: &ImagesCfg) -> Result<Vec<u8>, Stri
     let mut buf = Cursor::new(Vec::new());
     match enc {
         Enc::Webp => {
-            let e = match img {
-                DynamicImage::ImageRgba8(b) => webp::Encoder::from_rgba(b.as_raw(), w, h),
-                DynamicImage::ImageRgb8(b) => webp::Encoder::from_rgb(b.as_raw(), w, h),
+            let (pixels, layout) = match img {
+                DynamicImage::ImageRgba8(b) => (b.as_raw(), webp::Layout::Rgba),
+                DynamicImage::ImageRgb8(b) => (b.as_raw(), webp::Layout::Rgb),
                 _ => return Err("webp: image not normalized".into()),
             };
-            let mem = e.encode_simple(false, cfg.webp_quality as f32).map_err(|e| format!("webp: {e:?}"))?;
-            return Ok(mem.to_vec());
+            return webp::encode(pixels, layout, w, h, cfg.webp_quality as f32);
         }
         Enc::Avif => {
             let e = image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut buf, cfg.avif_speed, cfg.avif_quality)
