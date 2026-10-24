@@ -976,6 +976,39 @@ fn animation_memory_estimate_tracks_size_and_widths() {
     assert!(check_animation(&s, &cfg).is_ok(), "a large real-world animation fits the default budget");
 }
 
+/// Every composited RGBA frame of an animated WebP, from libwebp's own
+/// `WebPAnimDecoder` (test-only FFI: the pipeline never decodes with libwebp).
+fn libwebp_anim_frames(data: &[u8]) -> Vec<image::RgbaImage> {
+    use libwebp_sys::*;
+    // SAFETY: options and info are filled by libwebp and checked; the
+    // decoder reads `data` (alive for the whole block) and is deleted once;
+    // each frame buffer is owned by the decoder and copied before the next
+    // call, with its length from the canvas size libwebp reported.
+    unsafe {
+        let mut opts = std::mem::MaybeUninit::<WebPAnimDecoderOptions>::uninit();
+        assert_ne!(WebPAnimDecoderOptionsInitInternal(opts.as_mut_ptr(), WebPGetDemuxABIVersion()), 0);
+        let mut opts = opts.assume_init();
+        opts.color_mode = WEBP_CSP_MODE::MODE_RGBA;
+        let wd = WebPData { bytes: data.as_ptr(), size: data.len() };
+        let dec = WebPAnimDecoderNewInternal(&wd, &opts, WebPGetDemuxABIVersion());
+        assert!(!dec.is_null(), "not an animated WebP libwebp accepts");
+        let mut info = std::mem::MaybeUninit::<WebPAnimInfo>::zeroed();
+        assert_ne!(WebPAnimDecoderGetInfo(dec, info.as_mut_ptr()), 0);
+        let info = info.assume_init();
+        let len = info.canvas_width as usize * info.canvas_height as usize * 4;
+        let mut frames = Vec::new();
+        while WebPAnimDecoderHasMoreFrames(dec) != 0 {
+            let (mut buf, mut ts) = (std::ptr::null_mut(), 0);
+            assert_ne!(WebPAnimDecoderGetNext(dec, &mut buf, &mut ts), 0);
+            assert!(!buf.is_null());
+            let px = std::slice::from_raw_parts(buf, len).to_vec();
+            frames.push(image::RgbaImage::from_raw(info.canvas_width, info.canvas_height, px).unwrap());
+        }
+        WebPAnimDecoderDelete(dec);
+        frames
+    }
+}
+
 #[test]
 fn transparent_animation_keeps_one_bit_alpha_without_dark_edges() {
     // left half transparent, right half a color that changes per frame
@@ -991,10 +1024,7 @@ fn transparent_animation_keeps_one_bit_alpha_without_dark_edges() {
     let s = gif_scan(&out, &cfg).unwrap();
     let files = encode_animation(&out, &[60], s.loop_count, &cfg).unwrap();
     // libwebp's own animation decoder: the canvas starts transparent, as in browsers
-    let anim = webp::AnimDecoder::new(&files[0]).decode().unwrap();
-    let frames: Vec<image::RgbaImage> = (0..anim.len())
-        .map(|i| image::RgbaImage::from_raw(60, 27, anim.get_frame(i).unwrap().get_image().to_vec()).unwrap())
-        .collect();
+    let frames = libwebp_anim_frames(&files[0]);
     assert_eq!(frames.len(), 2);
     for (f, rgb) in frames.iter().zip([RED, GREEN]) {
         assert_eq!(f.dimensions(), (60, 27));
