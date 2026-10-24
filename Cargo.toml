@@ -17,8 +17,8 @@ flate2 = "1"
 fastembed = "5"
 ureq = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "avif"] }
-webp = { version = "0.3", default-features = false }
-libwebp-sys = "0.9"
+# WebP encoding (still and animated) calls libwebp directly; 0.14.4 vendors libwebp 1.6.0
+libwebp-sys = "0.14.4"
 sha2 = "0.10"
 jpeg-encoder = "0.7"
 # AVIF sources: pure Rust container parser and AV1 decoder (no asm, no system lib)

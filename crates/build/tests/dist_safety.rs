@@ -103,15 +103,25 @@ fn unknown_flags_and_arguments_are_usage_errors() {
     fs::create_dir_all(&dist).unwrap();
     fs::write(dist.join(MARKER), "x").unwrap();
     fs::write(dist.join("keep.txt"), "still here").unwrap();
-    for args in [&["--version"][..], &["-v"], &["--force-clean", "--verbose"], &["build"], &["--help-me"]] {
+    for args in [&["-V"][..], &["-v"], &["--force-clean", "--verbose"], &["build"], &["--help-me"]] {
         let out = run(tmp.path(), Some(tmp.path()), args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let err = stderr(&out);
         assert!(err.contains("Usage: build-site"), "{args:?}: {err}");
         assert_eq!(fs::read_to_string(dist.join("keep.txt")).unwrap(), "still here", "{args:?}");
     }
-    let err = stderr(&run(tmp.path(), Some(tmp.path()), &["--version"]));
-    assert!(err.contains("unknown option \"--version\""), "{err}");
+    let err = stderr(&run(tmp.path(), Some(tmp.path()), &["-V"]));
+    assert!(err.contains("unknown option \"-V\""), "{err}");
+}
+
+#[test]
+fn version_prints_and_touches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist = sentinel_dist(tmp.path()); // not a site, unmarked dist
+    let out = run(tmp.path(), None, &["--version"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("build-site "));
+    assert_sentinel(&dist);
 }
 
 #[test]

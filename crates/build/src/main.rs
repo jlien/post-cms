@@ -650,6 +650,10 @@ fn main() -> Result<()> {
             print!("{USAGE}");
             return Ok(());
         }
+        Ok(Args::Version) => {
+            println!("build-site {} (libwebp {})", env!("CARGO_PKG_VERSION"), postcms_build::images::webp::libwebp_version());
+            return Ok(());
+        }
         Ok(Args::Build(o)) => o,
         Err(e) => {
             eprint!("build-site: {e}\n\n{USAGE}");
@@ -1397,6 +1401,7 @@ Options:
   --force-clean  Replace an existing dist/ that has no build marker
                  (dist/.post-cms-build), such as one written by an older
                  build-site. Use it once; later builds find the marker.
+  --version      Print the engine and linked libwebp versions.
   -h, --help     Print this help.
 ";
 
@@ -1415,6 +1420,7 @@ struct BuildOpts {
 enum Args {
     Build(BuildOpts),
     Help,
+    Version,
 }
 
 /// Command line after the program name. Anything not listed in [`USAGE`]
@@ -1424,6 +1430,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Ar
     for a in args {
         match a.as_str() {
             "-h" | "--help" => return Ok(Args::Help),
+            "--version" => return Ok(Args::Version),
             "--force-clean" => opts.force_clean = true,
             _ if a.starts_with('-') => return Err(format!("unknown option {a:?}")),
             _ => return Err(format!("unexpected argument {a:?} (set SITE_ROOT to choose the site)")),
@@ -4030,7 +4037,8 @@ mod tests {
         assert_eq!(args(&["--force-clean"]), Ok(Args::Build(BuildOpts { force_clean: true })));
         assert_eq!(args(&["-h"]), Ok(Args::Help));
         assert_eq!(args(&["--force-clean", "--help"]), Ok(Args::Help));
-        assert!(args(&["--version"]).unwrap_err().contains("unknown option"));
+        assert_eq!(args(&["--version"]), Ok(Args::Version));
+        assert!(args(&["-V"]).unwrap_err().contains("unknown option"));
         assert!(args(&["--force-clean=1"]).is_err());
         assert!(args(&["."]).unwrap_err().contains("unexpected argument"));
     }
