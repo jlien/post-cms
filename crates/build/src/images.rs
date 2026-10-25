@@ -1562,6 +1562,11 @@ impl Pipeline {
         &self.cfg
     }
 
+    /// The source of every request so far, by request number.
+    fn sources(&self) -> Vec<String> {
+        self.state.lock().unwrap().requests.iter().map(|r| r.src().to_string()).collect()
+    }
+
     fn marker(&self, req: Request) -> String {
         let mut st = self.state.lock().unwrap();
         let n = match st.index.get(&req) {
@@ -1574,7 +1579,7 @@ impl Pipeline {
                 n
             }
         };
-        format!("__postcms_img_{}_{}__", self.nonce, n)
+        format!("{MARKER_PREFIX}{}_{}__", self.nonce, n)
     }
 
     /// Record an `image()` call; returns a marker that [`Pipeline::finish`]
@@ -2010,7 +2015,8 @@ impl Pipeline {
         stats.files = files.into_inner();
         stats.bytes = bytes.into_inner();
         // 4. swap markers in every HTML/XML file
-        replace_markers(&self.dist, &self.nonce, &replacements)?;
+        let srcs: Vec<String> = self.sources();
+        replace_markers(&self.dist, &self.nonce, &replacements, &srcs)?;
         Ok(stats)
     }
 
@@ -2147,47 +2153,174 @@ fn run_parallel(n: usize, jobs: usize, f: impl Fn(usize) -> Result<(), String> +
     }
 }
 
-/// Replace `__postcms_img_<nonce>_<n>__` in every .html/.xml file under
-/// `dist`. A marker with no replacement fails the build.
-fn replace_markers(dist: &Path, nonce: &str, repl: &HashMap<usize, String>) -> Result<(), String> {
-    let prefix = format!("__postcms_img_{nonce}_");
+/// Start of every placeholder `image()` and `image_url` print while a page
+/// renders: `__postcms_img_<nonce>_<n>__`, with a 12-hex-digit nonce per
+/// build and the request number.
+pub const MARKER_PREFIX: &str = "__postcms_img_";
+
+/// Files that can carry a placeholder: everything a template renders, plus
+/// the text formats a step after rendering may copy pages into.
+const MARKER_TEXT_EXTS: [&str; 9] = ["html", "htm", "xml", "json", "txt", "md", "js", "css", "svg"];
+
+/// One placeholder found in a file: `(nonce, n)`, or `None` for text that
+/// starts like one but is cut off or malformed.
+fn parse_marker(after_prefix: &str) -> (Option<(String, usize)>, usize) {
+    let hex = after_prefix.bytes().take_while(u8::is_ascii_hexdigit).count();
+    let rest = &after_prefix[hex..];
+    if hex == 0 || !rest.starts_with('_') {
+        return (None, hex);
+    }
+    let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+    let len = hex + 1 + digits;
+    match (rest[1..1 + digits].parse::<usize>(), rest[1 + digits..].starts_with("__")) {
+        (Ok(n), true) => (Some((after_prefix[..hex].to_string(), n)), len + 2),
+        _ => (None, len),
+    }
+}
+
+/// Every directory under `dist`, depth first. A directory that cannot be
+/// read is an error: a skipped directory would hide its placeholders.
+fn walk_files(dist: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
     let mut stack = vec![dist.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            let Ok(ft) = e.file_type() else { continue };
+        let rd = std::fs::read_dir(&d).map_err(|e| format!("read {}: {e}", d.display()))?;
+        for e in rd {
+            let e = e.map_err(|e| format!("read {}: {e}", d.display()))?;
+            let ft = e.file_type().map_err(|err| format!("stat {}: {err}", e.path().display()))?;
             if ft.is_dir() {
-                stack.push(p);
-                continue;
+                stack.push(e.path());
+            } else if ft.is_file() {
+                files.push(e.path());
             }
-            if !matches!(p.extension().and_then(|x| x.to_str()), Some("html" | "xml")) {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&p) else { continue };
-            if !text.contains(&prefix) {
-                continue;
-            }
-            let mut out = String::with_capacity(text.len());
-            let mut rest = text.as_str();
-            while let Some(at) = rest.find(&prefix) {
-                out.push_str(&rest[..at]);
-                let after = &rest[at + prefix.len()..];
-                let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-                let n: Option<usize> = after[..digits].parse().ok();
-                match (n, after[digits..].starts_with("__")) {
-                    (Some(n), true) if repl.contains_key(&n) => {
-                        out.push_str(&repl[&n]);
-                        rest = &after[digits + 2..];
-                    }
-                    _ => return Err(format!("{}: unresolved image marker", p.display())),
-                }
-            }
-            out.push_str(rest);
-            std::fs::write(&p, out).map_err(|e| format!("write {}: {e}", p.display()))?;
         }
     }
-    Ok(())
+    files.sort();
+    Ok(files)
+}
+
+fn rel(dist: &Path, p: &Path) -> String {
+    let name = dist.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dist".into());
+    format!("{name}/{}", p.strip_prefix(dist).unwrap_or(p).display())
+}
+
+/// Replace `__postcms_img_<nonce>_<n>__` in every .html/.xml file under
+/// `dist`. Any placeholder of this build with no replacement, and any file
+/// or directory that cannot be read, fails the build; the error names the
+/// page and the image source.
+fn replace_markers(dist: &Path, nonce: &str, repl: &HashMap<usize, String>, srcs: &[String]) -> Result<(), String> {
+    let prefix = format!("{MARKER_PREFIX}{nonce}_");
+    let mut errors = Vec::new();
+    for p in walk_files(dist)? {
+        if !matches!(p.extension().and_then(|x| x.to_str()), Some("html" | "xml")) {
+            continue;
+        }
+        let raw = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        if !raw.windows(prefix.len()).any(|w| w == prefix.as_bytes()) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(raw) else {
+            return Err(format!("{}: has image placeholders but is not UTF-8", rel(dist, &p)));
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(&prefix) {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + prefix.len()..];
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            let n: Option<usize> = after[..digits].parse().ok();
+            match (n, after[digits..].starts_with("__")) {
+                (Some(n), true) if repl.contains_key(&n) => {
+                    out.push_str(&repl[&n]);
+                    rest = &after[digits + 2..];
+                }
+                (n, _) => {
+                    let src = n.and_then(|n| srcs.get(n)).map_or("an unknown source", String::as_str);
+                    errors.push(format!("{}: image placeholder for {src} has no markup", rel(dist, &p)));
+                    out.push_str(&rest[at..at + prefix.len()]);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        if errors.is_empty() {
+            write_atomic(&p, out.as_bytes()).map_err(|e| format!("write {}: {e}", p.display()))?;
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(marker_report(errors)) }
+}
+
+fn marker_report(mut errors: Vec<String>) -> String {
+    errors.sort();
+    errors.dedup();
+    let total = errors.len();
+    let mut msg = format!("{total} unreplaced image placeholder(s) (__postcms_img_):");
+    for e in errors.iter().take(20) {
+        msg.push_str("\n  ");
+        msg.push_str(e);
+    }
+    if total > 20 {
+        msg.push_str(&format!("\n  ... and {} more", total - 20));
+    }
+    msg
+}
+
+/// Check the finished `dist` for any image placeholder left behind: in a
+/// page, any other text file, or a precompressed `.gz` copy. Returns an
+/// error naming each page and the image source (`pipeline` maps this
+/// build's placeholders back to their source; a placeholder from another
+/// build means another build-site process wrote the same dist).
+pub fn verify_dist(dist: &Path, pipeline: Option<&Pipeline>) -> Result<(), String> {
+    let (nonce, srcs) = match pipeline {
+        Some(p) => (Some(p.nonce.clone()), p.sources()),
+        None => (None, Vec::new()),
+    };
+    let mut errors = Vec::new();
+    for p in walk_files(dist)? {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let gz = name.ends_with(".gz");
+        let inner = if gz { &name[..name.len() - 3] } else { name };
+        let ext = inner.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+        if !MARKER_TEXT_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let raw = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        let bytes = if gz {
+            // capped, so a hostile .gz in the theme cannot exhaust memory
+            const MAX_GZ_TEXT: u64 = 256 << 20;
+            let mut out = Vec::new();
+            let mut r = std::io::Read::take(flate2::read::GzDecoder::new(&raw[..]), MAX_GZ_TEXT + 1);
+            // a .gz that does not decompress is not a page this check can read
+            if std::io::Read::read_to_end(&mut r, &mut out).is_err() {
+                continue;
+            }
+            if out.len() as u64 > MAX_GZ_TEXT {
+                return Err(format!("{}: over {MAX_GZ_TEXT} bytes uncompressed; too large to check", rel(dist, &p)));
+            }
+            out
+        } else {
+            raw
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut rest: &str = &text;
+        while let Some(at) = rest.find(MARKER_PREFIX) {
+            let after = &rest[at + MARKER_PREFIX.len()..];
+            let (m, len) = parse_marker(after);
+            let what = match &m {
+                Some((n, i)) if Some(n) == nonce.as_ref() => {
+                    format!("image placeholder for {}", srcs.get(*i).map_or("an unknown source", String::as_str))
+                }
+                Some((n, _)) => format!(
+                    "image placeholder from another build (nonce {n}): another build-site process wrote this dist at the same time"
+                ),
+                None => "a cut-off image placeholder".to_string(),
+            };
+            let copy = if gz { " (precompressed copy)" } else { "" };
+            errors.push(format!("{}{copy}: {what}", rel(dist, &p)));
+            rest = &after[len.min(after.len())..];
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(marker_report(errors)) }
 }
 
 // ---- Tera ------------------------------------------------------------------

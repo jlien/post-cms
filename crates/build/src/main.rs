@@ -662,6 +662,9 @@ fn main() -> Result<()> {
     };
     let root = repo_root()?;
     require_site_config(&root)?;
+    // Held until exit: one build-site at a time per site, so two builds
+    // never write (or clear) the same dist/.
+    let _site_lock = lock_site(&root)?;
     let dist = prepare_dist(&root, opts.force_clean)?;
 
     // ---- theme plugin system -------------------------------------------
@@ -796,7 +799,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(p) = &cfg.images {
-        finish_images(p)?;
+        finish_images(p).map_err(|e| discard_dist(&dist, e))?;
     }
     let skip_dir = cfg.images.as_ref().map(|p| dist.join(&p.cfg().output_dir));
     let images_saved = optimize_images(&dist, skip_dir.as_deref())?;
@@ -862,13 +865,17 @@ fn main() -> Result<()> {
         fs::create_dir_all(&preview_dir)?;
         fs::write(preview_dir.join("index.html"), idx)?;
         if let Some(p) = &cfg.images {
-            finish_images(p)?;
+            finish_images(p).map_err(|e| discard_dist(&dist, e))?;
         }
         eprintln!(
             "theme previews built: {} -> /preview/<theme>/",
             built.join(", ")
         );
     }
+
+    // Every image placeholder must be gone from every page and its .gz copy.
+    postcms_build::images::verify_dist(&dist, cfg.images.as_deref())
+        .map_err(|e| discard_dist(&dist, anyhow::anyhow!(e)))?;
 
     let drafts = posts.iter().filter(|p| !p.meta.published).count();
     eprintln!(
@@ -1459,6 +1466,35 @@ fn require_site_config(root: &Path) -> Result<()> {
         "{} is not a post-cms site (no site.yaml); set SITE_ROOT to the site directory. Nothing was built or deleted.",
         root.display()
     )
+}
+
+/// Lock the site root for this build (an advisory lock on the directory,
+/// released when the process exits, even on a crash). A second build-site
+/// on the same site exits before touching dist/: two builds writing one
+/// dist/ mix their pages, and one build's precompressed copies can keep the
+/// other's image placeholders.
+fn lock_site(root: &Path) -> Result<fs::File> {
+    let dir = fs::File::open(root).with_context(|| format!("open {}", root.display()))?;
+    match dir.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another build-site is already building {}; wait for it to finish, or build a separate copy of the site. Nothing was built or deleted.",
+            root.display()
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            eprintln!("warning: cannot lock {} ({e}); concurrent builds of this site are not prevented", root.display());
+        }
+    }
+    Ok(dir)
+}
+
+/// A build that failed after rendering removes the dist/ it wrote, so no
+/// half-finished site (pages with image placeholders) is ever served.
+fn discard_dist(dist: &Path, e: anyhow::Error) -> anyhow::Error {
+    match fs::remove_dir_all(dist) {
+        Ok(()) => e.context(format!("build failed; removed {} so no partial site is served", dist.display())),
+        Err(re) => e.context(format!("build failed; could not remove {} ({re}): do not serve it", dist.display())),
+    }
 }
 
 /// Make `<root>/dist` ready for a fresh build and write the build marker.
