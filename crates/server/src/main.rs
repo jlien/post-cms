@@ -59,44 +59,117 @@ fn content_type_for(path: &StdPath) -> (&'static str, &'static str) {
 }
 
 const USAGE: &str = "\
-Usage: server
+Usage: server [--host ADDR]
 
 Serves the dist/ of the site at SITE_ROOT (else the current directory) on
-PORT (default 8787). Configuration comes from the environment only.
+127.0.0.1, port PORT (default 8787).
 
 Options:
-  -h, --help  Print this help.
+      --host ADDR  IP address to listen on (default 127.0.0.1, or POSTCMS_HOST).
+                   Use 0.0.0.0 (or ::) to accept connections from other
+                   machines, for example inside a container.
+  -h, --help       Print this help.
+
+Environment:
+  SITE_ROOT     site directory (default: the current directory)
+  PORT          port to listen on (default 8787)
+  POSTCMS_HOST  IP address to listen on when --host is not given
 ";
 
 /// Build marker the engine writes in dist/ (see build-site). Never served.
 const DIST_MARKER: &str = ".post-cms-build";
 
-/// `Ok(true)` for help; any other argument is an error, so a flag this
-/// binary does not know never starts a server.
-fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<bool, String> {
+/// Default listen address: loopback only, so a dev or CI run is never
+/// reachable from the network unless the caller asks for it.
+const DEFAULT_HOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Help,
+    /// `host` is the `--host` value, still unparsed.
+    Serve { host: Option<String> },
+}
+
+/// Command line after the program name. Anything not in [`USAGE`] is an
+/// error, so a flag this binary does not know never starts a server.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut help = false;
-    for a in args {
-        match a.as_str() {
-            "-h" | "--help" => help = true,
+    let mut host = None;
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let value = match a.as_str() {
+            "-h" | "--help" => {
+                help = true;
+                continue;
+            }
+            "--host" => it.next().ok_or("--host needs an address, for example --host 0.0.0.0")?,
+            _ if a.starts_with("--host=") => a["--host=".len()..].to_string(),
             _ if a.starts_with('-') => return Err(format!("unknown option {a:?}")),
             _ => return Err(format!("unexpected argument {a:?} (set SITE_ROOT to choose the site)")),
+        };
+        if host.is_some() {
+            return Err("--host given more than once".into());
         }
+        host = Some(value);
     }
-    Ok(help)
+    Ok(if help { Cli::Help } else { Cli::Serve { host } })
+}
+
+/// Listen address: `--host`, else a non-empty `POSTCMS_HOST`, else
+/// 127.0.0.1. Only IP literals (and `localhost`) are accepted, so a name
+/// can never resolve to an unexpected interface.
+fn resolve_host(flag: Option<&str>, env_host: Option<&str>) -> Result<IpAddr, String> {
+    let (raw, source) = match (flag, env_host.map(str::trim).filter(|h| !h.is_empty())) {
+        (Some(h), _) => (h.trim(), "--host"),
+        (None, Some(h)) => (h, "POSTCMS_HOST"),
+        (None, None) => return Ok(DEFAULT_HOST),
+    };
+    if raw.eq_ignore_ascii_case("localhost") {
+        return Ok(DEFAULT_HOST);
+    }
+    let bare = raw.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(raw);
+    bare.parse::<IpAddr>().map_err(|_| {
+        format!("{source} {raw:?} is not an IP address (for example 127.0.0.1, 0.0.0.0, ::1)")
+    })
+}
+
+/// Warning printed when the server listens beyond loopback, or `None`.
+fn exposure_warning(addr: &SocketAddr) -> Option<String> {
+    let ip = addr.ip();
+    if ip.is_loopback() {
+        return None;
+    }
+    let reach = if ip.is_unspecified() {
+        "on every network interface"
+    } else {
+        "on a non-loopback address"
+    };
+    Some(format!(
+        "warning: listening on {addr}, {reach}: other machines can reach this server. \
+         Unset --host / POSTCMS_HOST to listen on 127.0.0.1 only."
+    ))
 }
 
 fn main() -> anyhow::Result<()> {
-    match parse_args(env::args().skip(1)) {
-        Ok(true) => {
+    let host_flag = match parse_args(env::args().skip(1)) {
+        Ok(Cli::Help) => {
             print!("{USAGE}");
             return Ok(());
         }
-        Ok(false) => {}
+        Ok(Cli::Serve { host }) => host,
         Err(e) => {
             eprint!("server: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
-    }
+    };
+    let env_host = env::var("POSTCMS_HOST").ok();
+    let host = match resolve_host(host_flag.as_deref(), env_host.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            eprint!("server: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let root = repo_root()?;
     let dist = root.join("dist");
     if !dist.is_dir() {
@@ -131,13 +204,20 @@ fn main() -> anyhow::Result<()> {
         .fallback(get(serve_path))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = SocketAddr::new(host, port);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        eprintln!("origin serving dist/ on http://{addr}");
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot listen on {addr}"))?;
+        // The bound address (PORT=0 asks the OS for a free port).
+        let bound = listener.local_addr().unwrap_or(addr);
+        if let Some(w) = exposure_warning(&bound) {
+            eprintln!("{w}");
+        }
+        eprintln!("origin serving dist/ on http://{bound}");
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1401,11 +1481,55 @@ headers:
     #[test]
     fn unknown_arguments_are_usage_errors() {
         let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
-        assert_eq!(args(&[]), Ok(false));
-        assert_eq!(args(&["--help"]), Ok(true));
-        assert_eq!(args(&["-h"]), Ok(true));
+        let serve = |h: Option<&str>| Ok(Cli::Serve { host: h.map(String::from) });
+        assert_eq!(args(&[]), serve(None));
+        assert_eq!(args(&["--help"]), Ok(Cli::Help));
+        assert_eq!(args(&["-h"]), Ok(Cli::Help));
+        assert_eq!(args(&["--host", "0.0.0.0", "--help"]), Ok(Cli::Help));
         assert!(args(&["--version"]).unwrap_err().contains("unknown option \"--version\""));
         assert!(args(&["--port", "9000"]).is_err());
         assert!(args(&["site"]).unwrap_err().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn host_flag_takes_one_value() {
+        let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        let serve = |h: &str| Ok(Cli::Serve { host: Some(h.to_string()) });
+        assert_eq!(args(&["--host", "0.0.0.0"]), serve("0.0.0.0"));
+        assert_eq!(args(&["--host=::1"]), serve("::1"));
+        assert!(args(&["--host"]).unwrap_err().contains("needs an address"));
+        assert!(args(&["--host", "a", "--host", "b"]).unwrap_err().contains("more than once"));
+        assert!(args(&["--hostname", "x"]).unwrap_err().contains("unknown option"));
+    }
+
+    #[test]
+    fn default_host_is_loopback() {
+        assert_eq!(resolve_host(None, None), Ok("127.0.0.1".parse().unwrap()));
+        assert_eq!(resolve_host(None, Some("")), Ok("127.0.0.1".parse().unwrap()));
+        assert_eq!(resolve_host(None, Some("  ")), Ok("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn explicit_host_from_flag_or_env() {
+        let ip = |s: &str| Ok(s.parse::<IpAddr>().unwrap());
+        assert_eq!(resolve_host(None, Some("0.0.0.0")), ip("0.0.0.0"));
+        assert_eq!(resolve_host(Some("::"), None), ip("::"));
+        assert_eq!(resolve_host(Some("[::1]"), None), ip("::1"));
+        assert_eq!(resolve_host(Some("localhost"), None), ip("127.0.0.1"));
+        // The flag wins over the environment.
+        assert_eq!(resolve_host(Some("127.0.0.1"), Some("0.0.0.0")), ip("127.0.0.1"));
+        // Names and garbage are refused (no DNS lookup decides the interface).
+        assert!(resolve_host(Some("example.com"), None).unwrap_err().contains("--host"));
+        assert!(resolve_host(None, Some("0.0.0.0:80")).unwrap_err().contains("POSTCMS_HOST"));
+    }
+
+    #[test]
+    fn non_loopback_bind_warns() {
+        let w = |s: &str| exposure_warning(&s.parse::<SocketAddr>().unwrap());
+        assert_eq!(w("127.0.0.1:8787"), None);
+        assert_eq!(w("[::1]:8787"), None);
+        assert!(w("0.0.0.0:8787").unwrap().contains("every network interface"));
+        assert!(w("[::]:8787").unwrap().contains("every network interface"));
+        assert!(w("10.0.0.5:8787").unwrap().contains("non-loopback"));
     }
 }
