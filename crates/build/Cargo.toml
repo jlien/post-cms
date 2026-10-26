@@ -27,8 +27,7 @@ ureq.workspace = true
 avif-parse.workspace = true
 rav1d.workspace = true
 libc.workspace = true
-
-[dev-dependencies]
+# Private per-run temp directories for the compiled theme CSS.
 tempfile = "3"
 
 [lib]
