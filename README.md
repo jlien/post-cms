@@ -40,7 +40,7 @@ an AI agent do all content operations.
 |---|---|
 | `content/posts/<slug>/` | `meta.yaml` + `index.mdx` per post |
 | `crates/build` | static site generator → `dist/` |
-| `crates/server` | axum static origin, port 8787 (`PORT` env to override) |
+| `crates/server` | axum static origin, 127.0.0.1:8787 (`PORT`, `--host` / `POSTCMS_HOST` to override) |
 | `mcp/server.py` | MCP stdio server (stdlib only) |
 | `templates/` | tera templates (base, post, index, 404) |
 | `ci/` | build, deploy, purge scripts |
@@ -59,7 +59,7 @@ The site root is `SITE_ROOT`, else the current directory. Guards against buildin
 - Every build writes `dist/.post-cms-build`. An existing `dist/` is deleted and recreated only when it has that marker. A `dist/` without it is refused with an error naming the directory, and a `dist` that is a symlink or a file is always refused. A missing or empty `dist/` is used as is.
 - A `dist/` from a build-site older than the marker is refused once: check it is build output, then run `build-site --force-clean` (or `cargo run -p build -- --force-clean`). Later builds find the marker. The engine does not guess from contents such as `sitemap.xml`, since other generators write those too.
 - One build at a time per site: build-site takes an advisory lock on the site root directory (released when it exits, even on a crash). A second build-site on the same site exits non-zero with `another build-site is already building <root>` before `dist/` is touched. Build a separate copy of the site to run builds in parallel; separate copies may share `IMAGES_CACHE_DIR`.
-- Unknown flags and arguments (`-V`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage and `--version` the versions, both without building. The server takes no arguments either, and the AVIF decode-only mode takes exactly its three numbers.
+- Unknown flags and arguments (`-V`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage and `--version` the versions, both without building. The server takes only `--host` and `--help` (`server --help` prints its usage and exits without listening), and the AVIF decode-only mode takes exactly its three numbers.
 
 The origin server never serves the marker file.
 
@@ -191,10 +191,28 @@ How it works: rendering records each call and prints a placeholder. After every 
 ## Serve
 
 ```bash
-cargo run -p server     # serves dist/ on http://localhost:8787
+cargo run -p server     # serves dist/ on http://127.0.0.1:8787
 ```
 
 The server reads `SITE_ROOT`, else the current directory, the same way as the build.
+
+It listens on 127.0.0.1 only by default, so a dev or CI run is not reachable from the network. Settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PORT` | `8787` | Port to listen on. `0` lets the OS pick a free one; the startup line prints the address actually bound. |
+| `--host ADDR` | `127.0.0.1` | IP address to listen on (`--host 0.0.0.0` or `--host=::`). Only IP literals and `localhost` are accepted, never other host names. |
+| `POSTCMS_HOST` | unset | Same as `--host`, for environments configured by env vars; `--host` wins when both are set. |
+
+A host that is not an IP address, or an unknown flag, is a usage error (exit 2) and nothing listens. Binding a non-loopback address prints `warning: listening on ...: other machines can reach this server` on stderr.
+
+**Containers and deploys.** Inside a container, 127.0.0.1 is the container's own loopback, so a published port will not reach the server. Set the address explicitly:
+
+```bash
+POSTCMS_HOST=0.0.0.0 PORT=8080 server       # or: server --host 0.0.0.0
+```
+
+Earlier versions always listened on `0.0.0.0`; a deployment that relied on that must now set `POSTCMS_HOST=0.0.0.0` (or pass `--host 0.0.0.0`). Behind a reverse proxy on the same machine, keep the default and point the proxy at `127.0.0.1:$PORT`.
 
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
