@@ -576,7 +576,8 @@ fn unresolved_markers_fail_the_build() {
     let m = p.request_img(img("/x.png"));
     let forged = m.replace("_0__", "_99__");
     std::fs::write(f.dist.join("page.html"), forged).unwrap();
-    assert!(p.finish(2).unwrap_err().contains("unresolved image marker"));
+    let e = p.finish(2).unwrap_err();
+    assert!(e.contains("dist/page.html: image placeholder for an unknown source has no markup"), "{e}");
 }
 
 // ---- Tera and Portable Text ----
@@ -1478,4 +1479,76 @@ fn fetch_deadline_is_capped_and_long_settings_are_refused() {
         let y = format!("images:\n  allowed_hosts: [{HOST}]\n  {key}: 600\n");
         assert!(ImagesCfg::from_site_yaml(&y).is_ok());
     }
+}
+
+// ---- leftover placeholders (a page or .gz that still has one) ----
+
+fn gz(text: &str) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, text.as_bytes()).unwrap();
+    enc.finish().unwrap()
+}
+
+#[test]
+fn verify_passes_a_finished_dist() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(png(500, 250)))]);
+    let m = p.request_img(img(&url));
+    let html = f.render(&p, &format!("<p>{m}</p>"));
+    std::fs::write(f.dist.join("page.html.gz"), gz(&html)).unwrap();
+    verify_dist(&f.dist, Some(&p)).unwrap();
+}
+
+#[test]
+fn verify_names_the_page_and_source_of_a_placeholder_left_in_a_gz_copy() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(png(500, 250)))]);
+    let m = p.request_img(img(&url));
+    let html = f.render(&p, &format!("<p>{m}</p>"));
+    // a .gz written from the page before its placeholders were replaced
+    std::fs::create_dir_all(f.dist.join("events/a")).unwrap();
+    std::fs::write(f.dist.join("events/a/index.html"), &html).unwrap();
+    std::fs::write(f.dist.join("events/a/index.html.gz"), gz(&format!("<p>{m}</p>"))).unwrap();
+    let e = verify_dist(&f.dist, Some(&p)).unwrap_err();
+    assert!(e.starts_with("1 unreplaced image placeholder(s)"), "{e}");
+    assert!(e.contains(&format!("dist/events/a/index.html.gz (precompressed copy): image placeholder for {url}")), "{e}");
+}
+
+#[test]
+fn verify_flags_placeholders_from_another_build_and_cut_off_ones() {
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![]);
+    std::fs::write(f.dist.join("a.html"), "<img src=\"__postcms_img_0123456789ab_7__\">").unwrap();
+    std::fs::write(f.dist.join("b.json"), "{\"x\": \"__postcms_img_01\"}").unwrap();
+    // images and other binary output are not scanned
+    std::fs::write(f.dist.join("c.webp"), "__postcms_img_0123456789ab_7__").unwrap();
+    let e = verify_dist(&f.dist, Some(&p)).unwrap_err();
+    assert!(e.starts_with("2 unreplaced"), "{e}");
+    assert!(e.contains("dist/a.html: image placeholder from another build (nonce 0123456789ab)"), "{e}");
+    assert!(e.contains("dist/b.json: a cut-off image placeholder"), "{e}");
+    // without a pipeline (images off) a placeholder is still an error
+    assert!(verify_dist(&f.dist, None).unwrap_err().contains("another build"));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_fails_the_build_instead_of_keeping_its_placeholders() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(png(500, 250)))]);
+    let m = p.request_img(img(&url));
+    let dir = f.dist.join("locked");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("index.html"), format!("<p>{m}</p>")).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = p.finish(2);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() && unsafe { libc::geteuid() } == 0 {
+        return; // root reads anything; nothing to test
+    }
+    let e = r.unwrap_err();
+    assert!(e.contains("locked"), "{e}");
 }

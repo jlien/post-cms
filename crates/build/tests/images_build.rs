@@ -121,3 +121,69 @@ fn build_survives_an_avif_that_crashes_the_decoder() {
     assert!(html.contains("<img src=\"/assets/astra/images/crash.avif\""), "{html}");
     assert!(html.contains("<picture><source type=\"image/webp\""), "{html}");
 }
+
+/// A minimal site with one page whose template appends `extra`.
+fn small_site(root: &Path, extra: &str) {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    copy_dir(&repo.join("templates"), &root.join("templates"));
+    copy_dir(&repo.join("themes/astra"), &root.join("themes/astra"));
+    fs::create_dir_all(root.join("content/pages/about")).unwrap();
+    fs::write(root.join("content/pages/about/meta.yaml"), "title: About\nslug: about\npublished: true\n").unwrap();
+    fs::write(root.join("content/pages/about/index.mdx"), "Hello.\n").unwrap();
+    fs::write(
+        root.join("site.yaml"),
+        "theme: astra\nbuiltin_pages: false\nbase_url: https://www.example.com\nimages:\n  widths: [32, 64]\n",
+    )
+    .unwrap();
+    let page = fs::read_to_string(root.join("templates/page.html"))
+        .unwrap()
+        .replace("{{ body | safe }}", &format!("{{{{ body | safe }}}}{extra}"));
+    fs::write(root.join("templates/page.html"), page).unwrap();
+}
+
+fn run(root: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_build-site"))
+        .env("SITE_ROOT", root)
+        .env("IMAGES_OFFLINE", "1")
+        .env_remove("SITE_PREVIEW_THEMES")
+        .env_remove("DRAFTS")
+        .output()
+        .unwrap()
+}
+
+/// While one build holds the site, a second build-site exits non-zero
+/// before touching dist/, so two builds never write one dist/.
+#[test]
+fn a_second_build_of_the_same_site_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    small_site(root, "");
+    assert!(run(root).status.success());
+    let before = fs::read_to_string(root.join("dist/about/index.html")).unwrap();
+    // stand in for a build that is still running
+    let held = fs::File::open(root).unwrap();
+    held.try_lock().unwrap();
+    let out = run(root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("another build-site is already building"), "{stderr}");
+    assert_eq!(fs::read_to_string(root.join("dist/about/index.html")).unwrap(), before, "dist/ was touched");
+    held.unlock().unwrap();
+    assert!(run(root).status.success(), "the lock is released with its holder");
+}
+
+/// A placeholder left in a page (here one from another build) fails the
+/// build with the page named, and the dist/ it wrote is removed.
+#[test]
+fn a_leftover_placeholder_fails_the_build_and_removes_dist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    small_site(root, "<img src=\"__postcms_img_0123456789ab_3__\" alt=\"\">");
+    let out = run(root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("dist/about/index.html: image placeholder from another build"), "{stderr}");
+    assert!(stderr.contains("dist/about/index.html.gz (precompressed copy)"), "{stderr}");
+    assert!(stderr.contains("so no partial site is served"), "{stderr}");
+    assert!(!root.join("dist").exists(), "partial dist/ left behind");
+}
