@@ -61,6 +61,8 @@ The site root is `SITE_ROOT`, else the current directory. Guards against buildin
 - One build at a time per site: build-site takes an advisory lock on the site root directory (released when it exits, even on a crash). A second build-site on the same site exits non-zero with `another build-site is already building <root>` before `dist/` is touched. Build a separate copy of the site to run builds in parallel; separate copies may share `IMAGES_CACHE_DIR`.
 - Unknown flags and arguments (`-V`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage and `--version` the versions, both without building. The server takes no arguments either, and the AVIF decode-only mode takes exactly its three numbers.
 
+Temporary files: the Tailwind CLI writes the compiled theme CSS into a private directory created for that build (random name under the system temp directory, `TMPDIR` on Unix, mode 0700, never an existing path or symlink) and removed when the build finishes or fails, so builds of separate site copies on one machine never read each other's CSS. The embedding model is cached in `~/.cache/post-cms-fastembed`; when `HOME` is unset or empty it goes to a private per-run directory instead, downloaded again on each build.
+
 The origin server never serves the marker file.
 
 ## Template data

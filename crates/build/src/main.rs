@@ -1353,6 +1353,20 @@ fn available_themes(root: &Path) -> Vec<String> {
     names
 }
 
+/// A temp-dir builder with a random name under the system temp directory,
+/// created exclusively (an existing path or symlink is never reused) and
+/// mode 0700 on Unix (tempfile otherwise applies the umask).
+fn private_temp_builder(prefix: &str) -> tempfile::Builder<'_, 'static> {
+    let mut b = tempfile::Builder::new();
+    b.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        b.permissions(fs::Permissions::from_mode(0o700));
+    }
+    b
+}
+
 /// Compile the theme CSS with the Tailwind CLI (`@import "tailwindcss"` +
 /// @theme tokens + component layers). Falls back to inlining the raw CSS if
 /// the CLI is missing or fails, so a build never hard-fails on styling.
@@ -1360,7 +1374,14 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<Strin
     let input = theme_dir.join("theme.css");
     let raw = fs::read_to_string(&input)
         .with_context(|| format!("read {}", input.display()))?;
-    let output = std::env::temp_dir().join(format!("postcms-theme-{}.css", theme));
+    // Private per-run directory (random name, created exclusively, mode 0700
+    // on Unix), so concurrent builds never share the output file and nobody
+    // can pre-plant it or a symlink in its place. Removed when `scratch`
+    // drops, on success and on every error path.
+    let scratch = private_temp_builder("postcms-theme-")
+        .tempdir()
+        .context("create a private temp directory for the compiled theme CSS")?;
+    let output = scratch.path().join("theme.css");
     let res = std::process::Command::new("tailwindcss")
         .arg("-i")
         .arg(&input)
@@ -2267,8 +2288,24 @@ fn render_embeddings(
         return Ok(());
     }
 
+    // Without HOME there is no per-user cache, so the weights go to a private
+    // per-run directory (removed when `_scratch` drops) instead of a fixed
+    // path under /tmp that another user could pre-plant.
+    let mut _scratch: Option<tempfile::TempDir> = None;
+    let cache_dir = match embed_cache_dir() {
+        Some(dir) => dir,
+        None => {
+            let t = private_temp_builder("postcms-fastembed-")
+                .tempdir()
+                .context("create a private temp directory for the embedding model")?;
+            eprintln!("embeddings: HOME is not set; caching the model in a private per-run directory");
+            let dir = t.path().to_path_buf();
+            _scratch = Some(t);
+            dir
+        }
+    };
     let opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
-        .with_cache_dir(embed_cache_dir())
+        .with_cache_dir(cache_dir)
         .with_show_download_progress(true);
     let mut model = match TextEmbedding::try_new(opts) {
         Ok(m) => m,
@@ -2358,10 +2395,15 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-/// Where fastembed caches downloaded ONNX weights (shared by build + server).
-fn embed_cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".cache").join("post-cms-fastembed")
+/// Where fastembed caches downloaded ONNX weights (shared by build + server):
+/// ~/.cache/post-cms-fastembed, or None when HOME is unset or empty.
+fn embed_cache_dir() -> Option<PathBuf> {
+    embed_cache_dir_for(std::env::var_os("HOME"))
+}
+
+fn embed_cache_dir_for(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = home.filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".cache").join("post-cms-fastembed"))
 }
 
 /// Emit per-post markdown next to each rendered post (posts/<slug>/index.md),
@@ -3209,6 +3251,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embed_cache_needs_a_home_and_never_falls_back_to_a_shared_tmp_path() {
+        assert_eq!(
+            embed_cache_dir_for(Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.cache/post-cms-fastembed"))
+        );
+        assert_eq!(embed_cache_dir_for(None), None);
+        assert_eq!(embed_cache_dir_for(Some("".into())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_temp_dirs_are_unique_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = private_temp_builder("postcms-test-").tempdir().unwrap();
+        let b = private_temp_builder("postcms-test-").tempdir().unwrap();
+        assert_ne!(a.path(), b.path());
+        let mode = fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let p = a.path().to_path_buf();
+        drop(a);
+        assert!(!p.exists(), "temp dir not removed on drop");
+    }
 
     #[test]
     fn page_url_follows_slash_setting() {
