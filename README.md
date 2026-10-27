@@ -67,13 +67,13 @@ The origin server never serves the marker file.
 
 ### Tailwind CLI
 
-The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
+The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. The CLI's own `PATH` is filtered the same way, so a `node` placed in the site never runs either. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
 
 The CLI is third-party code, so it does not inherit the build's environment (which can hold secrets such as `SANITY_READ_TOKEN`). It gets only these variables, when set:
 
 | Variable | Why |
 |---|---|
-| `PATH` | finds `tailwindcss`, and `node` for the npm CLI's `#!/usr/bin/env node` line |
+| `PATH` | finds `node` for the npm CLI's `#!/usr/bin/env node` line; only its absolute entries, in order |
 | `HOME` | Node and the standalone binary expect a home directory |
 | `TMPDIR` | Node's temp directory (the CLI's config loader caches there) |
 | `NODE_PATH` | extra directories the CLI searches for `@import` and `@plugin` packages |

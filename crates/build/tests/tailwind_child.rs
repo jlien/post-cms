@@ -117,7 +117,8 @@ fn gone_within(pid: i32, limit: Duration) -> bool {
 }
 
 fn read_pids(path: &Path) -> Vec<i32> {
-    fs::read_to_string(path).unwrap().split_whitespace().map(|p| p.parse().unwrap()).collect()
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("the fake never recorded its pids in {}: {e}", path.display())).split_whitespace().map(|p| p.parse().unwrap()).collect()
 }
 
 #[test]
@@ -183,12 +184,14 @@ fn tailwind_past_the_timeout_is_killed_and_fails_the_build() {
     let pids = f.dir.join("pids");
     hanging_tailwind(&f, &pids);
     let start = Instant::now();
-    let o = command(&f).env("POSTCMS_TAILWIND_TIMEOUT_SECS", "1").output().unwrap();
+    // 3 s, not 1: under a loaded parallel test run the fake can take over
+    // a second to record its pids, and the test needs them.
+    let o = command(&f).env("POSTCMS_TAILWIND_TIMEOUT_SECS", "3").output().unwrap();
     let took = start.elapsed();
 
     assert!(!o.status.success(), "build should fail on the timeout");
     let err = stderr(&o);
-    assert!(err.contains("tailwindcss did not finish within 1s"), "{err}");
+    assert!(err.contains("tailwindcss did not finish within 3s"), "{err}");
     assert!(err.contains("POSTCMS_TAILWIND_TIMEOUT_SECS"), "{err}");
     assert!(!err.contains("inlining raw theme.css"), "a timeout must not fall back: {err}");
     assert!(took < Duration::from_secs(30), "took {took:?}");
@@ -319,4 +322,31 @@ fn sigterm_during_the_spawn_still_kills_tailwind() {
     for pid in read_pids(&pids) {
         assert!(gone_within(pid, Duration::from_secs(5)), "process {pid} outlived the build");
     }
+}
+
+/// The CLI's own PATH keeps only absolute entries, so a `node` (or anything
+/// else) placed in the site root is never found through an empty or
+/// relative entry, as `#!/usr/bin/env node` would otherwise do.
+#[test]
+fn tailwind_gets_a_path_of_absolute_entries_only() {
+    let f = fixture();
+    let ran = f.dir.join("planted-node-ran");
+    let seen = f.dir.join("child-path");
+    let node = f.root.join("node");
+    fs::write(&node, format!("#!/bin/sh\ntouch \"{}\"\n", ran.display())).unwrap();
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+    // Like the npm CLI's shebang: look `node` up on PATH.
+    fake_tailwind(
+        &f.bin,
+        &format!(
+            "printf '%s' \"$PATH\" > \"{seen}\"\n/usr/bin/env node 2>/dev/null\ncat \"$in\" > \"$out\"",
+            seen = seen.display()
+        ),
+    );
+    let path = format!(":{}::/usr/bin:.:/bin:rel:", f.bin.display());
+    let o = command(&f).env("PATH", &path).output().unwrap();
+    assert!(o.status.success(), "build failed: {}", stderr(&o));
+    assert!(stderr(&o).contains("tailwindcss minified"), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(&seen).unwrap(), format!("{}:/usr/bin:/bin", f.bin.display()));
+    assert!(!ran.exists(), "a node planted in the site root ran");
 }

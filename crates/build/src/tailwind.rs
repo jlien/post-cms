@@ -20,7 +20,8 @@ const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// The only variables passed to `tailwindcss`, when set:
 /// - `PATH`: finds `tailwindcss`, and `node` for the npm CLI's
-///   `#!/usr/bin/env node` line.
+///   `#!/usr/bin/env node` line. Only its absolute entries are passed, in
+///   order (see [`absolute_path`]).
 /// - `HOME`: Node and the standalone binary expect a home directory.
 /// - `TMPDIR`: Node's `os.tmpdir()` (the CLI's config loader caches there).
 /// - `NODE_PATH`: the CLI resolves `@import` and `@plugin` packages with it.
@@ -71,6 +72,17 @@ const CLI_NAMES: &[&str] = &["tailwindcss"];
 #[cfg(windows)]
 const CLI_NAMES: &[&str] = &["tailwindcss.exe"];
 
+/// `path` with only its absolute entries, in order. An empty or relative
+/// entry resolves against the working directory, the site root for the CLI,
+/// so a `node` or `tailwindcss` placed in the site could run.
+fn absolute_path(path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path?).filter(|d| d.is_absolute()).collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
+}
+
 /// The first `tailwindcss` in `path` that is an executable file, searching
 /// absolute entries only. An empty or relative entry would resolve against
 /// the CLI's working directory (the site root), so a `tailwindcss` planted
@@ -110,7 +122,8 @@ fn is_executable(p: &Path) -> bool {
 /// killed (its whole process group) and is an error naming the timeout.
 /// Anything the CLI leaves running in its group when it exits is killed too.
 pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result<Run> {
-    let Some(exe) = resolve_cli(std::env::var_os("PATH").as_deref()) else {
+    let path = absolute_path(std::env::var_os("PATH").as_deref());
+    let Some(exe) = resolve_cli(path.as_deref()) else {
         return Ok(Run::NotStarted(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no tailwindcss in the absolute PATH entries",
@@ -127,10 +140,13 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for k in ENV_ALLOWLIST {
+    for k in ENV_ALLOWLIST.iter().filter(|k| **k != "PATH") {
         if let Some(v) = std::env::var_os(k) {
             cmd.env(k, v);
         }
+    }
+    if let Some(p) = &path {
+        cmd.env("PATH", p);
     }
     // its own process group, so a timeout or an interrupt kills anything it
     // started too (a wrapper script's node, say)
@@ -391,6 +407,16 @@ mod tests {
         assert_eq!(found(format!("{}:{}", noexec.display(), abs.display())), Some(abs.join("tailwindcss")));
         assert_eq!(found(":.:rel:".into()), None);
         assert_eq!(resolve_cli(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_keeps_absolute_entries_in_order() {
+        let p = |s: &str| absolute_path(Some(std::ffi::OsStr::new(s))).map(|v| v.into_string().unwrap());
+        assert_eq!(p(":/a/bin::rel:.:/usr/bin:/bin:"), Some("/a/bin:/usr/bin:/bin".into()));
+        assert_eq!(p("/x"), Some("/x".into()));
+        assert_eq!(p(":.:rel:"), None);
+        assert_eq!(absolute_path(None), None);
     }
 
     #[test]
