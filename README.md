@@ -216,7 +216,7 @@ A host that is not an IP address (including a `POSTCMS_HOST` or `--host` value t
 | No response within 60 s | 504 | `{"error":"upstream timed out"}` |
 | Upstream returns a non-2xx status, or a 2xx body that is not JSON | 502 | `{"error":"upstream error"}` |
 
-The detail goes to the server log (stderr) as one line starting `ask: `: the request URL with any username, password, query string and fragment removed, the error chain, and for a non-2xx status the status code and the first 300 characters of the upstream body.
+The detail goes to the server log (stderr) as one line starting `ask: `: the request URL with any username, password, query string and fragment removed (or `<unparseable LLM_BASE_URL>` when the value has no `http` or `https` scheme), the error chain, and for a non-2xx status the status code and the first 300 characters of the upstream body, with every occurrence of `LLM_API_KEY` replaced by `[redacted]`.
 
 **Embeddings without HOME.** `/api/ask` embeds the question with the model cached in `$HOME/.cache/post-cms-fastembed`. When `HOME` is unset or empty, the server never falls back to a shared path such as `/tmp/.cache`, where another local user could plant model files. It turns semantic retrieval off instead, logs `embeddings: HOME is not set; semantic retrieval is off ...` at startup, and `/api/ask` inlines the corpus (the same fallback as a site without `embeddings.json`). Set `HOME` to turn retrieval back on. The build uses a private per-run directory in this case; the server does not, because a long-running process stopped by a signal never removes that directory, and each start would download the model again.
 

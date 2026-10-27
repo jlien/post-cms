@@ -362,10 +362,14 @@ fn ask_site(name: &str) -> tempfile::TempDir {
 /// Starts the server with `LLM_BASE_URL=base`, POSTs one question to
 /// /api/ask, stops the server, and returns the full HTTP response and the
 /// stderr printed after the "serving" line.
-fn ask_once(site: &Path, base: &str) -> (String, String) {
+fn ask_once(site: &Path, base: &str, key: Option<&str>) -> (String, String) {
     use std::io::Write;
     let mut cmd = server();
-    cmd.env("LLM_BASE_URL", base).env("LLM_MODEL", "test").env_remove("LLM_API_KEY");
+    cmd.env("LLM_BASE_URL", base).env("LLM_MODEL", "test");
+    match key {
+        Some(k) => cmd.env("LLM_API_KEY", k),
+        None => cmd.env_remove("LLM_API_KEY"),
+    };
     let (mut server, addr, _startup, rest) = start_cmd(cmd, site);
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -400,7 +404,7 @@ fn unreachable_upstream_keeps_the_url_out_of_the_response() {
         ("http://llm-upstream.invalid:4321/internal-v1".to_string(), "llm-upstream.invalid".to_string()),
     ];
     for (base, host) in cases {
-        let (resp, log) = ask_once(site.path(), &base);
+        let (resp, log) = ask_once(site.path(), &base, None);
         let body = body_of(&resp);
         assert!(resp.starts_with("HTTP/1.1 502"), "{base}: {resp}");
         assert_eq!(body, r#"{"error":"upstream unreachable"}"#, "{base}: {resp}");
@@ -425,13 +429,15 @@ fn upstream_error_status_and_body_stay_in_the_log() {
     // A one-shot upstream that answers 500 with a body naming internal detail.
     let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let up = upstream.local_addr().unwrap();
-    let marker = "db-7.internal.example: Authorization: Bearer sk-leaked";
+    let marker = "db-7.internal.example";
+    let api_key = "sk-test-KEY123";
     let handle = std::thread::spawn(move || {
         let (mut c, _) = upstream.accept().unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         // Read the request head and its body before answering.
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
+        let mut auth = String::new();
         loop {
             let n = c.read(&mut chunk).unwrap_or(0);
             if n == 0 {
@@ -445,11 +451,18 @@ fn upstream_error_status_and_body_stay_in_the_log() {
                     .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
                     .unwrap_or(0);
                 if rest.len() >= len {
+                    // Echo the request's Authorization header, as some
+                    // upstream error pages do.
+                    auth = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                        .unwrap_or("")
+                        .to_string();
                     break;
                 }
             }
         }
-        let body = format!("upstream failure at {marker}");
+        let body = format!("upstream failure at {marker}; request {auth}");
         write!(
             c,
             "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -458,11 +471,11 @@ fn upstream_error_status_and_body_stay_in_the_log() {
         .unwrap();
     });
     let base = format!("http://{up}/internal-v1");
-    let (resp, log) = ask_once(site.path(), &base);
+    let (resp, log) = ask_once(site.path(), &base, Some(api_key));
     handle.join().unwrap();
     assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
     assert_eq!(body_of(&resp), r#"{"error":"upstream error"}"#, "{resp}");
-    for leak in [base.as_str(), up.to_string().as_str(), "internal", "sk-leaked", "500"] {
+    for leak in [base.as_str(), up.to_string().as_str(), "internal", api_key, "500"] {
         assert!(!body_of(&resp).contains(leak), "response leaks {leak:?}: {resp}");
     }
     let line = log
@@ -471,4 +484,7 @@ fn upstream_error_status_and_body_stay_in_the_log() {
         .unwrap_or_else(|| panic!("no log line: {log}"));
     assert!(line.contains(&format!("http://{up}/internal-v1/chat/completions returned 500")), "{line}");
     assert!(line.contains(marker), "{line}");
+    // The upstream echoed the API key; the log has it redacted.
+    assert!(line.contains("Bearer [redacted]"), "{line}");
+    assert!(!log.contains(api_key), "API key in the log: {log}");
 }
