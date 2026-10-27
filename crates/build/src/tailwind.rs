@@ -7,7 +7,7 @@
 //! (`POSTCMS_TAILWIND_TIMEOUT_SECS`, default [`DEFAULT_TIMEOUT_SECS`]) or when the
 //! build itself gets SIGINT, SIGTERM or SIGHUP.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -65,12 +65,58 @@ pub enum Run {
     NotStarted(std::io::Error),
 }
 
+/// The CLI's file name on this platform.
+#[cfg(not(windows))]
+const CLI_NAMES: &[&str] = &["tailwindcss"];
+#[cfg(windows)]
+const CLI_NAMES: &[&str] = &["tailwindcss.exe"];
+
+/// The first `tailwindcss` in `path` that is an executable file, searching
+/// absolute entries only. An empty or relative entry would resolve against
+/// the CLI's working directory (the site root), so a `tailwindcss` planted
+/// in the site would run; such entries are skipped.
+fn resolve_cli(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path?) {
+        if !dir.is_absolute() {
+            continue;
+        }
+        for name in CLI_NAMES {
+            let cand = dir.join(name);
+            if is_executable(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn is_executable(p: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(p) else { return false };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        m.is_file()
+    }
+}
+
 /// Run `tailwindcss -i <input> -o <output> --minify` in `cwd` (Tailwind 4
 /// detects template content from its working directory), with the cleared
-/// environment and no stdin, stdout or stderr. A run past `timeout` is
+/// environment and no stdin, stdout or stderr. The CLI is resolved to an
+/// absolute path from the absolute `PATH` entries. A run past `timeout` is
 /// killed (its whole process group) and is an error naming the timeout.
+/// Anything the CLI leaves running in its group when it exits is killed too.
 pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result<Run> {
-    let mut cmd = Command::new("tailwindcss");
+    let Some(exe) = resolve_cli(std::env::var_os("PATH").as_deref()) else {
+        return Ok(Run::NotStarted(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no tailwindcss in the absolute PATH entries",
+        )));
+    };
+    let mut cmd = Command::new(&exe);
     cmd.arg("-i")
         .arg(input)
         .arg("-o")
@@ -93,26 +139,45 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
 
     #[cfg(unix)]
     let _forward = signals::Forward::install();
-    let mut child = match cmd.spawn() {
+    // Hold SIGINT, SIGTERM and SIGHUP until the handler knows the CLI's
+    // group, so one arriving during the spawn still kills it. The child
+    // starts with an empty signal mask (std resets it before exec).
+    #[cfg(unix)]
+    let held = signals::Hold::new();
+    let spawned = cmd.spawn();
+    #[cfg(unix)]
+    if let Ok(c) = &spawned {
+        signals::watch(c);
+    }
+    #[cfg(unix)]
+    drop(held);
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => return Ok(Run::NotStarted(e)),
     };
-    #[cfg(unix)]
-    signals::watch(&child);
     let started = Instant::now();
     let result = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Ok(Run::Exited(st)),
-            Ok(None) if started.elapsed() >= timeout => {
+        match exited(&mut child) {
+            Ok(true) => {
+                // the group may still hold processes the CLI started
                 kill_group(&mut child);
+                break match child.wait() {
+                    Ok(st) => Ok(Run::Exited(st)),
+                    Err(e) => Err(anyhow::anyhow!("waiting for tailwindcss failed: {e}")),
+                };
+            }
+            Ok(false) if started.elapsed() >= timeout => {
+                kill_group(&mut child);
+                let _ = child.wait();
                 break Err(anyhow::anyhow!(
                     "tailwindcss did not finish within {}s and was killed; set {TIMEOUT_ENV} (1 to {MAX_TIMEOUT_SECS} seconds) to allow longer",
                     timeout.as_secs()
                 ));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => {
                 kill_group(&mut child);
+                let _ = child.wait();
                 break Err(anyhow::anyhow!("waiting for tailwindcss failed: {e}"));
             }
         }
@@ -122,16 +187,38 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
     result
 }
 
-/// Kill the child and its process group, and reap it.
+/// Whether the child has exited, without reaping it on Unix: while it is
+/// an unreaped zombie its pid, and so its process group id, cannot be
+/// reused, which keeps the group kill after a normal exit safe.
+#[cfg(unix)]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    let pid = libc::id_t::from(child.id());
+    // SAFETY: waitid writes only into `info`, a zeroed siginfo_t; WNOWAIT
+    // leaves the child waitable for Child::wait.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+#[cfg(not(unix))]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|s| s.is_some())
+}
+
+/// Kill the child's process group (Unix) and the child; the caller reaps it.
 fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: signals the group this child leads (it was started with
-        // process_group(0), so its group id is its pid); no memory involved.
+        // process_group(0), so its group id is its pid, and it is not yet
+        // reaped); no memory involved.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// While the CLI runs, SIGINT, SIGTERM and SIGHUP to the build also kill the
@@ -196,6 +283,35 @@ mod signals {
         }
     }
 
+    /// Blocks the forwarded signals until dropped (then any that arrived
+    /// are delivered).
+    pub(super) struct Hold {
+        old: libc::sigset_t,
+    }
+
+    impl Hold {
+        pub(super) fn new() -> Hold {
+            // SAFETY: plain sigset manipulation on this thread's mask.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for sig in SIGNALS {
+                    libc::sigaddset(&mut set, sig);
+                }
+                let mut old: libc::sigset_t = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+                Hold { old }
+            }
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            // SAFETY: restores the mask saved by new.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+        }
+    }
+
     pub(super) fn watch(child: &std::process::Child) {
         if let Ok(pid) = i32::try_from(child.id()) {
             GROUP.store(pid, Ordering::SeqCst);
@@ -222,6 +338,25 @@ mod tests {
             let e = parse_timeout(Some(bad)).unwrap_err();
             assert!(e.contains(TIMEOUT_ENV) && e.contains("1 to 3600"), "{bad}: {e}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_resolves_from_absolute_path_entries_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (abs, noexec) = (tmp.path().join("abs"), tmp.path().join("noexec"));
+        for (d, mode) in [(&abs, 0o755), (&noexec, 0o644)] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("tailwindcss"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(d.join("tailwindcss"), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let path = |s: String| Some(std::ffi::OsString::from(s));
+        let found = |s: String| resolve_cli(path(s).as_deref());
+        assert_eq!(found(format!(":.:rel:{}", abs.display())), Some(abs.join("tailwindcss")));
+        assert_eq!(found(format!("{}:{}", noexec.display(), abs.display())), Some(abs.join("tailwindcss")));
+        assert_eq!(found(":.:rel:".into()), None);
+        assert_eq!(resolve_cli(None), None);
     }
 
     #[test]

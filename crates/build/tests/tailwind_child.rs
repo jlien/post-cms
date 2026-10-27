@@ -241,3 +241,50 @@ fn sigterm_to_the_build_kills_tailwind_too() {
         assert!(gone_within(pid, Duration::from_secs(5)), "process {pid} outlived the build");
     }
 }
+
+#[test]
+fn tailwind_in_the_site_root_is_not_found_through_empty_or_relative_path_entries() {
+    let f = fixture();
+    fs::create_dir_all(&f.bin).unwrap(); // no tailwindcss here
+    let ran = f.dir.join("planted-ran");
+    let planted = format!("#!/bin/sh\ntouch \"{}\"\nexit 1\n", ran.display());
+    for p in [f.root.join("tailwindcss"), f.root.join("rel/tailwindcss")] {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, &planted).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // An empty entry (leading, trailing and doubled colons), "." and a
+    // relative directory all mean the CLI's working directory, the site root.
+    let path = format!(":{}::/usr/bin:/bin:.:rel:", f.bin.display());
+    let o = command(&f).env("PATH", &path).output().unwrap();
+    assert!(o.status.success(), "build failed: {}", stderr(&o));
+    assert!(stderr(&o).contains("tailwindcss CLI unavailable"), "{}", stderr(&o));
+    assert!(!ran.exists(), "a tailwindcss planted in the site root ran");
+
+    // Control: the same script on an absolute entry does run.
+    let path = format!("{}:/usr/bin:/bin", f.root.display());
+    let o = command(&f).env("PATH", &path).output().unwrap();
+    assert!(o.status.success(), "build failed: {}", stderr(&o));
+    assert!(ran.exists(), "control: the planted script should run from an absolute entry");
+}
+
+#[test]
+fn processes_left_by_a_successful_tailwind_are_killed() {
+    let f = fixture();
+    let pids = f.dir.join("pids");
+    fake_tailwind(
+        &f.bin,
+        &format!(
+            "cat \"$in\" > \"$out\"\nprintf '%s\\n' '{FAKE_MARK}' >> \"$out\"\nsleep 300 &\necho $! > \"{p}\"\nexit 0",
+            p = pids.display()
+        ),
+    );
+    let o = command(&f).output().unwrap();
+    assert!(o.status.success(), "build failed: {}", stderr(&o));
+    assert!(stderr(&o).contains("tailwindcss minified"), "{}", stderr(&o));
+    let html = fs::read_to_string(f.root.join("dist/about/index.html")).unwrap();
+    assert!(html.contains(FAKE_MARK), "compiled CSS not used");
+    for pid in read_pids(&pids) {
+        assert!(gone_within(pid, Duration::from_secs(5)), "process {pid} outlived the build");
+    }
+}

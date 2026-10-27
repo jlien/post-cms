@@ -67,7 +67,7 @@ The origin server never serves the marker file.
 
 ### Tailwind CLI
 
-The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
+The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
 
 The CLI is third-party code, so it does not inherit the build's environment (which can hold secrets such as `SANITY_READ_TOKEN`). It gets only these variables, when set:
 
@@ -81,7 +81,7 @@ The CLI is third-party code, so it does not inherit the build's environment (whi
 
 On Windows `SYSTEMROOT`, `TEMP`, `TMP` and `USERPROFILE` are passed too. Everything else (`NODE_OPTIONS`, tokens, CI variables) is dropped.
 
-The CLI gets no stdin, and its stdout and stderr are discarded. It runs in its own process group and is killed, with everything it started, after `POSTCMS_TAILWIND_TIMEOUT_SECS` (default 120, whole seconds from 1 to 3600). The build then fails with `tailwindcss did not finish within <n>s and was killed`; a timeout never falls back to raw CSS. An invalid `POSTCMS_TAILWIND_TIMEOUT_SECS` fails the build before `dist/` is touched. SIGINT, SIGTERM or SIGHUP to `build-site` while the CLI runs kills the CLI's group too, then ends the build with that signal; after a SIGKILL to `build-site` the CLI runs until it finishes on its own.
+The CLI gets no stdin, and its stdout and stderr are discarded. It runs in its own process group. When it exits, anything it left running in that group is killed. It is killed, with everything it started, after `POSTCMS_TAILWIND_TIMEOUT_SECS` (default 120, whole seconds from 1 to 3600). The build then fails with `tailwindcss did not finish within <n>s and was killed`; a timeout never falls back to raw CSS. An invalid `POSTCMS_TAILWIND_TIMEOUT_SECS` fails the build before `dist/` is touched. SIGINT, SIGTERM or SIGHUP to `build-site` while the CLI runs kills the CLI's group too, then ends the build with that signal; after a SIGKILL to `build-site` the CLI runs until it finishes on its own.
 
 The only other child process, the AVIF decoder (a copy of `build-site`, see Images), also starts with an empty environment, in its own process group, and is killed after `decode_timeout_secs`.
 
