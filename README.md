@@ -61,9 +61,29 @@ The site root is `SITE_ROOT`, else the current directory. Guards against buildin
 - One build at a time per site: build-site takes an advisory lock on the site root directory (released when it exits, even on a crash). A second build-site on the same site exits non-zero with `another build-site is already building <root>` before `dist/` is touched. Build a separate copy of the site to run builds in parallel; separate copies may share `IMAGES_CACHE_DIR`.
 - Unknown flags and arguments (`-V`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage and `--version` the versions, both without building. The server takes only `--host` and `--help` (`server --help` prints its usage and exits without listening), and the AVIF decode-only mode takes exactly its three numbers.
 
-Temporary files: the Tailwind CLI writes the compiled theme CSS into a private directory created for that build (random name under the system temp directory, `TMPDIR` on Unix, mode 0700, never an existing path or symlink) and removed when the build finishes or fails, so builds of separate site copies on one machine never read each other's CSS. The embedding model is cached in `~/.cache/post-cms-fastembed`; when `HOME` is unset or empty it goes to a private per-run directory instead, downloaded again on each build.
+Temporary files: the Tailwind CLI writes the compiled theme CSS into a private directory created for that build (random name under the system temp directory, `TMPDIR` on Unix, mode 0700, never an existing path or symlink) and removed when the build finishes or fails, so builds of separate site copies on one machine never read each other's CSS. An interrupted build (SIGTERM, SIGINT, SIGHUP, or SIGKILL) can leave an empty or partly written `postcms-theme-*` directory there; it is private to your user and safe to delete. The embedding model is cached in `~/.cache/post-cms-fastembed`; when `HOME` is unset or empty it goes to a private per-run directory instead, downloaded again on each build.
 
 The origin server never serves the marker file.
+
+### Tailwind CLI
+
+The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
+
+The CLI is third-party code, so it does not inherit the build's environment (which can hold secrets such as `SANITY_READ_TOKEN`). It gets only these variables, when set:
+
+| Variable | Why |
+|---|---|
+| `PATH` | finds `tailwindcss`, and `node` for the npm CLI's `#!/usr/bin/env node` line |
+| `HOME` | Node and the standalone binary expect a home directory |
+| `TMPDIR` | Node's temp directory (the CLI's config loader caches there) |
+| `NODE_PATH` | extra directories the CLI searches for `@import` and `@plugin` packages |
+| `LANG`, `LC_ALL`, `LC_CTYPE` | locale, so non-ASCII file names and messages decode as in the build |
+
+On Windows `SYSTEMROOT`, `TEMP`, `TMP` and `USERPROFILE` are passed too. Everything else (`NODE_OPTIONS`, tokens, CI variables) is dropped.
+
+The CLI gets no stdin, and its stdout and stderr are discarded. It runs in its own process group and is killed, with everything it started, after `TAILWIND_TIMEOUT_SECS` (default 120, whole seconds from 1 to 3600). The build then fails with `tailwindcss did not finish within <n>s and was killed`; a timeout never falls back to raw CSS. An invalid `TAILWIND_TIMEOUT_SECS` fails the build before `dist/` is touched. SIGINT, SIGTERM or SIGHUP to `build-site` while the CLI runs kills the CLI's group too, then ends the build with that signal; after a SIGKILL to `build-site` the CLI runs until it finishes on its own.
+
+The only other child process, the AVIF decoder (a copy of `build-site`, see Images), also starts with an empty environment, in its own process group, and is killed after `decode_timeout_secs`.
 
 ## Template data
 
