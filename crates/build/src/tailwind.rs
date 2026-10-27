@@ -4,7 +4,7 @@
 //! gets a cleared environment with only [`ENV_ALLOWLIST`]: build secrets such
 //! as `SANITY_READ_TOKEN` never reach it. It runs in its own process group
 //! and is killed with everything it started when it runs past the timeout
-//! (`TAILWIND_TIMEOUT_SECS`, default [`DEFAULT_TIMEOUT_SECS`]) or when the
+//! (`POSTCMS_TAILWIND_TIMEOUT_SECS`, default [`DEFAULT_TIMEOUT_SECS`]) or when the
 //! build itself gets SIGINT, SIGTERM or SIGHUP.
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 /// Environment variable that overrides the timeout, in whole seconds.
-pub const TIMEOUT_ENV: &str = "TAILWIND_TIMEOUT_SECS";
+pub const TIMEOUT_ENV: &str = "POSTCMS_TAILWIND_TIMEOUT_SECS";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 

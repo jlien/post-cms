@@ -1,6 +1,6 @@
 //! `tailwindcss` runs with a cleared environment (only the allowlist in
 //! src/tailwind.rs), is killed with its process group after
-//! TAILWIND_TIMEOUT_SECS, and dies with the build on SIGTERM.
+//! POSTCMS_TAILWIND_TIMEOUT_SECS, and dies with the build on SIGTERM.
 //!
 //! Each test puts a fake `tailwindcss` (a shell script) first on PATH.
 #![cfg(unix)]
@@ -183,13 +183,13 @@ fn tailwind_past_the_timeout_is_killed_and_fails_the_build() {
     let pids = f.dir.join("pids");
     hanging_tailwind(&f, &pids);
     let start = Instant::now();
-    let o = command(&f).env("TAILWIND_TIMEOUT_SECS", "1").output().unwrap();
+    let o = command(&f).env("POSTCMS_TAILWIND_TIMEOUT_SECS", "1").output().unwrap();
     let took = start.elapsed();
 
     assert!(!o.status.success(), "build should fail on the timeout");
     let err = stderr(&o);
     assert!(err.contains("tailwindcss did not finish within 1s"), "{err}");
-    assert!(err.contains("TAILWIND_TIMEOUT_SECS"), "{err}");
+    assert!(err.contains("POSTCMS_TAILWIND_TIMEOUT_SECS"), "{err}");
     assert!(!err.contains("inlining raw theme.css"), "a timeout must not fall back: {err}");
     assert!(took < Duration::from_secs(30), "took {took:?}");
     assert!(entries(&f.tmpdir).is_empty(), "temp dir left behind: {:?}", entries(&f.tmpdir));
@@ -203,10 +203,10 @@ fn bad_timeout_value_fails_before_dist_is_touched() {
     let f = fixture();
     fake_tailwind(&f.bin, "cat \"$in\" > \"$out\"");
     for bad in ["0", "abc", "9999"] {
-        let o = command(&f).env("TAILWIND_TIMEOUT_SECS", bad).output().unwrap();
+        let o = command(&f).env("POSTCMS_TAILWIND_TIMEOUT_SECS", bad).output().unwrap();
         assert!(!o.status.success(), "{bad} accepted");
         let err = stderr(&o);
-        assert!(err.contains("TAILWIND_TIMEOUT_SECS") && err.contains("1 to 3600"), "{err}");
+        assert!(err.contains("POSTCMS_TAILWIND_TIMEOUT_SECS") && err.contains("1 to 3600"), "{err}");
         assert!(!f.root.join("dist").exists(), "dist created for {bad}");
     }
 }
@@ -226,7 +226,7 @@ fn sigterm_to_the_build_kills_tailwind_too() {
     let f = fixture();
     let pids = f.dir.join("pids");
     hanging_tailwind(&f, &pids);
-    let mut build = command(&f).env("TAILWIND_TIMEOUT_SECS", "600").spawn().unwrap();
+    let mut build = command(&f).env("POSTCMS_TAILWIND_TIMEOUT_SECS", "600").spawn().unwrap();
     let start = Instant::now();
     while !pids.exists() {
         assert!(start.elapsed() < Duration::from_secs(30), "fake tailwindcss never started");

@@ -81,7 +81,7 @@ The CLI is third-party code, so it does not inherit the build's environment (whi
 
 On Windows `SYSTEMROOT`, `TEMP`, `TMP` and `USERPROFILE` are passed too. Everything else (`NODE_OPTIONS`, tokens, CI variables) is dropped.
 
-The CLI gets no stdin, and its stdout and stderr are discarded. It runs in its own process group and is killed, with everything it started, after `TAILWIND_TIMEOUT_SECS` (default 120, whole seconds from 1 to 3600). The build then fails with `tailwindcss did not finish within <n>s and was killed`; a timeout never falls back to raw CSS. An invalid `TAILWIND_TIMEOUT_SECS` fails the build before `dist/` is touched. SIGINT, SIGTERM or SIGHUP to `build-site` while the CLI runs kills the CLI's group too, then ends the build with that signal; after a SIGKILL to `build-site` the CLI runs until it finishes on its own.
+The CLI gets no stdin, and its stdout and stderr are discarded. It runs in its own process group and is killed, with everything it started, after `POSTCMS_TAILWIND_TIMEOUT_SECS` (default 120, whole seconds from 1 to 3600). The build then fails with `tailwindcss did not finish within <n>s and was killed`; a timeout never falls back to raw CSS. An invalid `POSTCMS_TAILWIND_TIMEOUT_SECS` fails the build before `dist/` is touched. SIGINT, SIGTERM or SIGHUP to `build-site` while the CLI runs kills the CLI's group too, then ends the build with that signal; after a SIGKILL to `build-site` the CLI runs until it finishes on its own.
 
 The only other child process, the AVIF decoder (a copy of `build-site`, see Images), also starts with an empty environment, in its own process group, and is killed after `decode_timeout_secs`.
 

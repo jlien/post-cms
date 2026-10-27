@@ -664,7 +664,7 @@ fn main() -> Result<()> {
     };
     let root = repo_root()?;
     require_site_config(&root)?;
-    // A bad TAILWIND_TIMEOUT_SECS fails here, before dist/ is touched.
+    // A bad POSTCMS_TAILWIND_TIMEOUT_SECS fails here, before dist/ is touched.
     let tailwind_timeout = tailwind::timeout_from_env()?;
     // Held until exit: one build-site at a time per site, so two builds
     // never write (or clear) the same dist/.
