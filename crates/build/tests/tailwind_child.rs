@@ -288,3 +288,35 @@ fn processes_left_by_a_successful_tailwind_are_killed() {
         assert!(gone_within(pid, Duration::from_secs(5)), "process {pid} outlived the build");
     }
 }
+
+/// A SIGTERM that lands while the CLI is being spawned (before the build
+/// knows its process group), possibly on a thread other than the one
+/// spawning, still kills the CLI and ends the build with SIGTERM. The
+/// debug-only POSTCMS_TEST_TAILWIND_SPAWN_WINDOW_MS holds the build in that
+/// window with an extra idle thread running.
+#[test]
+fn sigterm_during_the_spawn_still_kills_tailwind() {
+    let f = fixture();
+    let pids = f.dir.join("pids");
+    hanging_tailwind(&f, &pids);
+    let mut build = command(&f)
+        .env("POSTCMS_TAILWIND_TIMEOUT_SECS", "600")
+        .env("POSTCMS_TEST_TAILWIND_SPAWN_WINDOW_MS", "3000")
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !pids.exists() {
+        assert!(start.elapsed() < Duration::from_secs(30), "fake tailwindcss never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The fake is running; the build is still inside the 3 s window.
+    // SAFETY: signals the build-site process this test started.
+    unsafe { libc::kill(build.id() as i32, libc::SIGTERM) };
+    let st = build.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(st.signal(), Some(libc::SIGTERM), "{st:?}");
+    assert!(start.elapsed() < Duration::from_secs(30), "build did not end promptly");
+    for pid in read_pids(&pids) {
+        assert!(gone_within(pid, Duration::from_secs(5)), "process {pid} outlived the build");
+    }
+}

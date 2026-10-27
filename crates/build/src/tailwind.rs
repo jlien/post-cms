@@ -139,18 +139,20 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
 
     #[cfg(unix)]
     let _forward = signals::Forward::install();
-    // Hold SIGINT, SIGTERM and SIGHUP until the handler knows the CLI's
-    // group, so one arriving during the spawn still kills it. The child
-    // starts with an empty signal mask (std resets it before exec).
+    // A forwarded signal that arrives during the spawn, on any thread, is
+    // only recorded; once the CLI's group is known it is killed and the
+    // signal re-raised (see signals::spawning).
     #[cfg(unix)]
-    let held = signals::Hold::new();
+    signals::spawning(true);
     let spawned = cmd.spawn();
     #[cfg(unix)]
-    if let Ok(c) = &spawned {
-        signals::watch(c);
+    {
+        test_hooks::spawn_window();
+        if let Ok(c) = &spawned {
+            signals::watch(c);
+        }
+        signals::spawning(false);
     }
-    #[cfg(unix)]
-    drop(held);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => return Ok(Run::NotStarted(e)),
@@ -161,6 +163,7 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
             Ok(true) => {
                 // the group may still hold processes the CLI started
                 kill_group(&mut child);
+                unwatch();
                 break match child.wait() {
                     Ok(st) => Ok(Run::Exited(st)),
                     Err(e) => Err(anyhow::anyhow!("waiting for tailwindcss failed: {e}")),
@@ -168,6 +171,7 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
             }
             Ok(false) if started.elapsed() >= timeout => {
                 kill_group(&mut child);
+                unwatch();
                 let _ = child.wait();
                 break Err(anyhow::anyhow!(
                     "tailwindcss did not finish within {}s and was killed; set {TIMEOUT_ENV} (1 to {MAX_TIMEOUT_SECS} seconds) to allow longer",
@@ -177,14 +181,42 @@ pub fn run(input: &Path, output: &Path, cwd: &Path, timeout: Duration) -> Result
             Ok(false) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => {
                 kill_group(&mut child);
+                unwatch();
                 let _ = child.wait();
                 break Err(anyhow::anyhow!("waiting for tailwindcss failed: {e}"));
             }
         }
     };
+    result
+}
+
+/// Stop forwarding signals to the CLI's group; called before the CLI is
+/// reaped, after which its pid (the group id) may be reused.
+fn unwatch() {
     #[cfg(unix)]
     signals::unwatch();
-    result
+}
+
+/// Debug builds only: with POSTCMS_TEST_TAILWIND_SPAWN_WINDOW_MS set, start
+/// an idle thread (so a process-directed signal may land off the main
+/// thread) and stay that long in the spawn window. Lets the tests hit the
+/// window deterministically; release builds ignore the variable.
+#[cfg(unix)]
+mod test_hooks {
+    #[cfg(debug_assertions)]
+    pub(super) fn spawn_window() {
+        let Some(ms) = std::env::var("POSTCMS_TEST_TAILWIND_SPAWN_WINDOW_MS").ok().and_then(|v| v.parse::<u64>().ok())
+        else {
+            return;
+        };
+        std::thread::spawn(|| loop {
+            std::thread::park();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(super) fn spawn_window() {}
 }
 
 /// Whether the child has exited, without reaping it on Unix: while it is
@@ -228,13 +260,18 @@ fn kill_group(child: &mut std::process::Child) {
 /// ignored. The previous handlers come back when the CLI is done.
 #[cfg(unix)]
 mod signals {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
     /// Process group of the running CLI, 0 when none.
     static GROUP: AtomicI32 = AtomicI32::new(0);
+    /// Set while the CLI is being spawned and its group is not yet known.
+    static SPAWNING: AtomicBool = AtomicBool::new(false);
+    /// A signal that arrived while SPAWNING, 0 when none.
+    static PENDING: AtomicI32 = AtomicI32::new(0);
 
-    extern "C" fn forward(sig: libc::c_int) {
+    /// Kill the CLI's group (if any), then end the process with `sig`.
+    fn kill_and_reraise(sig: libc::c_int) {
         let g = GROUP.load(Ordering::SeqCst);
         // SAFETY: kill, signal and raise are async-signal-safe.
         unsafe {
@@ -243,6 +280,32 @@ mod signals {
             }
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
+        }
+    }
+
+    extern "C" fn forward(sig: libc::c_int) {
+        // Record first, then check: either this handler sees SPAWNING
+        // cleared (and acts, with GROUP already set), or spawning(false)
+        // sees PENDING (and acts). Acting twice is harmless.
+        PENDING.store(sig, Ordering::SeqCst);
+        if SPAWNING.load(Ordering::SeqCst) {
+            return;
+        }
+        kill_and_reraise(sig);
+    }
+
+    /// Enter (true) or leave (false) the spawn window. Leaving it acts on
+    /// a signal that arrived inside it.
+    pub(super) fn spawning(on: bool) {
+        if on {
+            PENDING.store(0, Ordering::SeqCst);
+            SPAWNING.store(true, Ordering::SeqCst);
+            return;
+        }
+        SPAWNING.store(false, Ordering::SeqCst);
+        let sig = PENDING.load(Ordering::SeqCst);
+        if sig != 0 {
+            kill_and_reraise(sig);
         }
     }
 
@@ -280,35 +343,6 @@ mod signals {
                 // SAFETY: restores the action saved by install.
                 unsafe { libc::sigaction(*sig, prev, std::ptr::null_mut()) };
             }
-        }
-    }
-
-    /// Blocks the forwarded signals until dropped (then any that arrived
-    /// are delivered).
-    pub(super) struct Hold {
-        old: libc::sigset_t,
-    }
-
-    impl Hold {
-        pub(super) fn new() -> Hold {
-            // SAFETY: plain sigset manipulation on this thread's mask.
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                for sig in SIGNALS {
-                    libc::sigaddset(&mut set, sig);
-                }
-                let mut old: libc::sigset_t = std::mem::zeroed();
-                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-                Hold { old }
-            }
-        }
-    }
-
-    impl Drop for Hold {
-        fn drop(&mut self) {
-            // SAFETY: restores the mask saved by new.
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
         }
     }
 
