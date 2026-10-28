@@ -13,6 +13,8 @@ use pulldown_cmark::{html, Options, Parser};
 use serde::Deserialize;
 use tera::{Context as TeraContext, Tera};
 
+mod tailwind;
+
 #[derive(Debug, Deserialize)]
 struct Meta {
     title: String,
@@ -662,6 +664,8 @@ fn main() -> Result<()> {
     };
     let root = repo_root()?;
     require_site_config(&root)?;
+    // A bad POSTCMS_TAILWIND_TIMEOUT_SECS fails here, before dist/ is touched.
+    let tailwind_timeout = tailwind::timeout_from_env()?;
     // Held until exit: one build-site at a time per site, so two builds
     // never write (or clear) the same dist/.
     let _site_lock = lock_site(&root)?;
@@ -684,7 +688,7 @@ fn main() -> Result<()> {
     }
     let templates_dir = root.join("templates");
     let mut tera = load_tera(&root, &theme_dir, &templates_dir)?;
-    let style = compile_theme_css(&root, &theme_dir, &theme_name)?;
+    let style = compile_theme_css(&root, &theme_dir, &theme_name, tailwind_timeout)?;
     let css_hash = sha256_hex(style.as_bytes());
     let styling = Styling {
         css: style,
@@ -837,7 +841,7 @@ fn main() -> Result<()> {
             let out = preview_dir.join(name);
             let mut ttera = load_tera(&root, &tdir, &templates_dir)?;
             postcms_build::images::register(&mut ttera, cfg.images.clone(), &cfg.base_url);
-            let tcss = compile_theme_css(&root, &tdir, name)?;
+            let tcss = compile_theme_css(&root, &tdir, name, tailwind_timeout)?;
             let tcss_hash = sha256_hex(tcss.as_bytes());
             let tstyle = Styling {
                 css: tcss,
@@ -1369,29 +1373,26 @@ fn private_temp_builder(prefix: &str) -> tempfile::Builder<'_, 'static> {
 
 /// Compile the theme CSS with the Tailwind CLI (`@import "tailwindcss"` +
 /// @theme tokens + component layers). Falls back to inlining the raw CSS if
-/// the CLI is missing or fails, so a build never hard-fails on styling.
-fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<String> {
+/// the CLI is missing or fails, so a build never hard-fails on styling. The
+/// CLI runs with only the variables in [`tailwind::ENV_ALLOWLIST`]; one that
+/// runs past `timeout` is killed and fails the build.
+fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str, timeout: std::time::Duration) -> Result<String> {
     let input = theme_dir.join("theme.css");
     let raw = fs::read_to_string(&input)
         .with_context(|| format!("read {}", input.display()))?;
     // Private per-run directory (random name, created exclusively, mode 0700
     // on Unix), so concurrent builds never share the output file and nobody
     // can pre-plant it or a symlink in its place. Removed when `scratch`
-    // drops, on success and on every error path.
+    // drops, on success and on every error path (a timeout included).
     let scratch = private_temp_builder("postcms-theme-")
         .tempdir()
         .context("create a private temp directory for the compiled theme CSS")?;
     let output = scratch.path().join("theme.css");
-    let res = std::process::Command::new("tailwindcss")
-        .arg("-i")
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .arg("--minify")
-        .current_dir(root) // v4 auto-detects template content from cwd
-        .output();
+    // v4 auto-detects template content from cwd
+    let res = tailwind::run(&input, &output, root, timeout)
+        .with_context(|| format!("theme {theme:?}: compile theme.css"))?;
     match res {
-        Ok(o) if o.status.success() && output.exists() => {
+        tailwind::Run::Exited(st) if st.success() && output.exists() => {
             let compiled = fs::read_to_string(&output)
                 .with_context(|| format!("read {}", output.display()))?;
             if compiled.trim().is_empty() {
@@ -1408,8 +1409,8 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str) -> Result<Strin
         }
         _ => {
             let why = match res {
-                Ok(o) => format!("exit {}", o.status),
-                Err(e) => format!("{e}"),
+                tailwind::Run::Exited(st) => format!("exit {st}"),
+                tailwind::Run::NotStarted(e) => format!("{e}"),
             };
             eprintln!(
                 "warning: tailwindcss CLI unavailable ({why}); inlining raw theme.css"
