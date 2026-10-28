@@ -133,9 +133,29 @@ fn resolve_host(flag: Option<&str>, env_host: Option<&str>) -> Result<IpAddr, St
     })
 }
 
+/// `POSTCMS_HOST` as text. A value that is not UTF-8 is an error (exit 2,
+/// like any other bad value), never silently treated as unset.
+fn env_host_value(raw: Option<std::ffi::OsString>) -> Result<Option<String>, String> {
+    match raw {
+        None => Ok(None),
+        Some(v) => v.into_string().map(Some).map_err(|v| {
+            format!("POSTCMS_HOST {v:?} is not valid UTF-8 (for example 127.0.0.1, 0.0.0.0, ::1)")
+        }),
+    }
+}
+
+/// Command-line arguments as text; a non-UTF-8 argument is a usage error.
+fn utf8_args<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .map(|a| a.into_string().map_err(|a| format!("argument {a:?} is not valid UTF-8")))
+        .collect()
+}
+
 /// Warning printed when the server listens beyond loopback, or `None`.
 fn exposure_warning(addr: &SocketAddr) -> Option<String> {
-    let ip = addr.ip();
+    // An IPv4-mapped IPv6 address (::ffff:127.0.0.1) is the IPv4 address it
+    // carries: loopback when that is, every interface for ::ffff:0.0.0.0.
+    let ip = addr.ip().to_canonical();
     if ip.is_loopback() {
         return None;
     }
@@ -151,7 +171,7 @@ fn exposure_warning(addr: &SocketAddr) -> Option<String> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let host_flag = match parse_args(env::args().skip(1)) {
+    let host_flag = match utf8_args(env::args_os().skip(1)).and_then(parse_args) {
         Ok(Cli::Help) => {
             print!("{USAGE}");
             return Ok(());
@@ -162,8 +182,9 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let env_host = env::var("POSTCMS_HOST").ok();
-    let host = match resolve_host(host_flag.as_deref(), env_host.as_deref()) {
+    let host = match env_host_value(env::var_os("POSTCMS_HOST"))
+        .and_then(|env_host| resolve_host(host_flag.as_deref(), env_host.as_deref()))
+    {
         Ok(h) => h,
         Err(e) => {
             eprint!("server: {e}\n\n{USAGE}");
@@ -188,6 +209,9 @@ fn main() -> anyhow::Result<()> {
     // in a value, or a server-owned header refuses to start.
     let site_headers = load_site_headers(&root)?;
     let _ = SITE_HEADERS.set(site_headers);
+    if embed_cache_dir().is_none() {
+        eprintln!("{EMBED_OFF_NO_HOME}");
+    }
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -922,8 +946,14 @@ static EMBED: std::sync::OnceLock<std::sync::Mutex<Option<fastembed::TextEmbeddi
 fn embed_model() -> Option<&'static std::sync::Mutex<Option<fastembed::TextEmbedding>>> {
     let m = EMBED
         .get_or_init(|| {
+            // No HOME, no model: never fall back to a shared path such as
+            // /tmp/.cache, where another local user could plant model files.
+            let Some(cache_dir) = embed_cache_dir() else {
+                eprintln!("{EMBED_OFF_NO_HOME}");
+                return std::sync::Mutex::new(None);
+            };
             let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
-                .with_cache_dir(embed_cache_dir());
+                .with_cache_dir(cache_dir);
             std::sync::Mutex::new(match fastembed::TextEmbedding::try_new(opts) {
                 Ok(m) => {
                     Some(m)
@@ -937,10 +967,21 @@ fn embed_model() -> Option<&'static std::sync::Mutex<Option<fastembed::TextEmbed
     Some(m)
 }
 
-/// Where fastembed caches downloaded ONNX weights (same default as the build crate).
-fn embed_cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(home).join(".cache").join("post-cms-fastembed")
+/// Logged when HOME is unset or empty: semantic retrieval is off.
+const EMBED_OFF_NO_HOME: &str = "embeddings: HOME is not set; semantic retrieval is off and \
+     /api/ask inlines the corpus (set HOME to cache the model in $HOME/.cache/post-cms-fastembed)";
+
+/// Where fastembed caches downloaded ONNX weights (same path as the build
+/// crate), or `None` when HOME is unset or empty. The build then uses a
+/// private per-run directory; the long-running server turns embeddings off
+/// instead (see README, "Embeddings without HOME").
+fn embed_cache_dir() -> Option<PathBuf> {
+    embed_cache_dir_for(std::env::var_os("HOME"))
+}
+
+fn embed_cache_dir_for(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = home.filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".cache").join("post-cms-fastembed"))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -1199,18 +1240,42 @@ async fn ask(
 mod tests {
     use super::*;
 
+    /// A private temp directory (random name, mode 0700) removed on drop.
+    /// Derefs to its path so tests can pass `&dir` where a `&PathBuf` goes.
+    struct TestDir {
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.path
+        }
+    }
+
+    fn test_dir(prefix: &str) -> TestDir {
+        let mut b = tempfile::Builder::new();
+        b.prefix(prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            b.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = b.tempdir().unwrap();
+        TestDir { path: dir.path().to_path_buf(), _dir: dir }
+    }
+
     #[test]
     fn image_types_and_svg_policy() {
         assert_eq!(content_type_for(StdPath::new("a/b.avif")).0, "image/avif");
-        let root = std::env::temp_dir().join(format!("postcms-svg-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_dir("postcms-svg-");
         std::fs::write(root.join("x.svg"), "<svg/>").unwrap();
         std::fs::write(root.join("x.png"), "png").unwrap();
         let svg = serve(&root, "x.svg", false);
         assert_eq!(svg.headers()[header::CONTENT_SECURITY_POLICY], SVG_CSP);
         let png = serve(&root, "x.png", false);
         assert!(png.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1272,9 +1337,8 @@ mod tests {
         assert_eq!(redirect_response(&ok).headers()[header::LOCATION], "/fine");
     }
 
-    fn temp_dist(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("postcms-headers-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn temp_dist(name: &str) -> TestDir {
+        let dir = test_dir(&format!("postcms-headers-{name}-"));
         std::fs::create_dir_all(dir.join("signup")).unwrap();
         std::fs::write(dir.join("signup/index.html"), "<p>signup</p>").unwrap();
         std::fs::write(dir.join("signup/index.html.gz"), "gz").unwrap();
@@ -1363,9 +1427,8 @@ headers:
         }
     }
 
-    fn case_dist(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("postcms-case-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn case_dist(name: &str) -> TestDir {
+        let dir = test_dir(&format!("postcms-case-{name}-"));
         std::fs::create_dir_all(dir.join("pricing")).unwrap();
         std::fs::create_dir_all(dir.join("events/speakers")).unwrap();
         std::fs::write(dir.join("pricing/index.html"), "<p>pricing</p>").unwrap();
@@ -1459,8 +1522,7 @@ headers:
 
     #[test]
     fn startup_refuses_invalid_headers() {
-        let dir = env::temp_dir().join(format!("postcms-headers-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("postcms-headers-bad-");
         std::fs::write(dir.join("site.yaml"), "headers:\n  default:\n    Content-Length: \"1\"\n").unwrap();
         let err = load_site_headers(&dir).unwrap_err();
         assert!(format!("{err:#}").contains("set by the server"), "{err:#}");
@@ -1531,5 +1593,55 @@ headers:
         assert!(w("0.0.0.0:8787").unwrap().contains("every network interface"));
         assert!(w("[::]:8787").unwrap().contains("every network interface"));
         assert!(w("10.0.0.5:8787").unwrap().contains("non-loopback"));
+    }
+
+    #[test]
+    fn mapped_loopback_bind_does_not_warn() {
+        let w = |s: &str| exposure_warning(&s.parse::<SocketAddr>().unwrap());
+        assert_eq!(w("[::ffff:127.0.0.1]:8787"), None);
+        assert_eq!(w("[::ffff:127.9.8.7]:8787"), None);
+        assert!(w("[::ffff:10.0.0.5]:8787").unwrap().contains("non-loopback"));
+        assert!(w("[::ffff:0.0.0.0]:8787").unwrap().contains("every network interface"));
+        // Still the address the caller gave, unmapped only for the check.
+        assert!(w("[::ffff:10.0.0.5]:8787").unwrap().contains("[::ffff:10.0.0.5]:8787"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_host_is_an_error() {
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(env_host_value(None), Ok(None));
+        assert_eq!(env_host_value(Some("::1".into())), Ok(Some("::1".into())));
+        let bad = std::ffi::OsString::from_vec(b"127.0.0.\xff".to_vec());
+        assert!(env_host_value(Some(bad)).unwrap_err().contains("not valid UTF-8"));
+        let bad_arg = std::ffi::OsString::from_vec(b"--host=\xff".to_vec());
+        assert!(utf8_args([bad_arg]).unwrap_err().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn no_home_means_no_embed_cache_dir() {
+        assert_eq!(
+            embed_cache_dir_for(Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.cache/post-cms-fastembed"))
+        );
+        assert_eq!(embed_cache_dir_for(None), None);
+        assert_eq!(embed_cache_dir_for(Some("".into())), None);
+    }
+
+    #[test]
+    fn test_dirs_are_private_and_removed_on_drop() {
+        let a = case_dist("drop");
+        let b = case_dist("drop");
+        let (pa, pb) = (a.to_path_buf(), b.to_path_buf());
+        assert_ne!(pa, pb, "names must be unpredictable, not per-pid");
+        assert!(pa.join("pricing/index.html").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&pa).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        drop(a);
+        drop(b);
+        assert!(!pa.exists() && !pb.exists());
     }
 }

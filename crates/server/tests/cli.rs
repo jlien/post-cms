@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -12,13 +12,17 @@ fn server() -> Command {
     c
 }
 
-/// A site with a one-page dist/, unique per test.
-fn temp_site(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("post-cms-server-cli-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("dist")).unwrap();
-    std::fs::write(dir.join("site.yaml"), "title: x\n").unwrap();
-    std::fs::write(dir.join("dist/index.html"), "<p>hello</p>").unwrap();
+/// A site with a one-page dist/, in a private temp directory (random name)
+/// that is removed when the returned guard drops.
+fn temp_site(name: &str) -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("post-cms-server-cli-{name}-"))
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("dist")).unwrap();
+    std::fs::write(root.join("site.yaml"), "title: x\n").unwrap();
+    std::fs::write(root.join("dist/index.html"), "<p>hello</p>").unwrap();
     dir
 }
 
@@ -46,26 +50,37 @@ impl Drop for Running {
 
 /// Starts the server on an OS-picked port and returns it with the bound
 /// address and every stderr line printed before the "serving" line.
-fn start(site: &PathBuf, args: &[&str], env_host: Option<&str>) -> (Running, SocketAddr, Vec<String>) {
+fn start(site: &Path, args: &[&str], env_host: Option<&str>) -> (Running, SocketAddr, Vec<String>) {
     let mut cmd = server();
-    cmd.args(args)
-        .env("SITE_ROOT", site)
-        .env("PORT", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    cmd.args(args);
     if let Some(h) = env_host {
         cmd.env("POSTCMS_HOST", h);
     }
+    let (child, addr, lines, _rest) = start_cmd(cmd, site);
+    (child, addr, lines)
+}
+
+/// Like [`start`] for a prepared command; also returns the rest of stderr.
+fn start_cmd(
+    mut cmd: Command,
+    site: &Path,
+) -> (Running, SocketAddr, Vec<String>, BufReader<std::process::ChildStderr>) {
+    cmd.env("SITE_ROOT", site)
+        .env("PORT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let mut child = Running(cmd.spawn().unwrap());
-    let stderr = child.0.stderr.take().unwrap();
+    let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
     let mut lines = Vec::new();
-    for line in BufReader::new(stderr).lines() {
-        let line = line.unwrap();
-        if let Some(addr) = line.strip_prefix("origin serving dist/ on http://") {
+    let mut line = String::new();
+    while stderr.read_line(&mut line).unwrap() > 0 {
+        let l = line.trim_end().to_string();
+        line.clear();
+        if let Some(addr) = l.strip_prefix("origin serving dist/ on http://") {
             let addr: SocketAddr = addr.parse().unwrap();
-            return (child, addr, lines);
+            return (child, addr, lines, stderr);
         }
-        lines.push(line);
+        lines.push(l);
     }
     panic!("server exited before serving: {lines:?}");
 }
@@ -87,7 +102,7 @@ fn help_prints_usage_and_exits_without_listening() {
         // A real site and port, so only the flag keeps it from serving.
         let mut child = server()
             .arg(flag)
-            .env("SITE_ROOT", &site)
+            .env("SITE_ROOT", site.path())
             .env("PORT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,7 +124,7 @@ fn unknown_flag_is_a_usage_error() {
     for args in [&["--version"][..], &["--bind", "0.0.0.0"], &["--host"], &["--host", "example.com"], &["."]] {
         let mut child = server()
             .args(args)
-            .env("SITE_ROOT", &site)
+            .env("SITE_ROOT", site.path())
             .env("PORT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -128,7 +143,7 @@ fn unknown_flag_is_a_usage_error() {
 fn bad_env_host_is_a_usage_error() {
     let site = temp_site("badenv");
     let mut child = server()
-        .env("SITE_ROOT", &site)
+        .env("SITE_ROOT", site.path())
         .env("PORT", "0")
         .env("POSTCMS_HOST", "not-an-ip")
         .stdout(Stdio::null())
@@ -143,7 +158,7 @@ fn bad_env_host_is_a_usage_error() {
 #[test]
 fn default_bind_is_loopback_only() {
     let site = temp_site("default");
-    let (_server, addr, warnings) = start(&site, &[], None);
+    let (_server, addr, warnings) = start(site.path(), &[], None);
     assert_eq!(addr.ip().to_string(), "127.0.0.1");
     assert!(warnings.iter().all(|l| !l.contains("warning")), "{warnings:?}");
     assert!(get(addr).contains("hello"));
@@ -153,7 +168,7 @@ fn default_bind_is_loopback_only() {
 fn explicit_loopback_host_does_not_warn() {
     let site = temp_site("explicit");
     // ::1 from the flag; the flag wins over POSTCMS_HOST.
-    let (_server, addr, warnings) = start(&site, &["--host", "::1"], Some("127.0.0.1"));
+    let (_server, addr, warnings) = start(site.path(), &["--host", "::1"], Some("127.0.0.1"));
     assert_eq!(addr.ip().to_string(), "::1");
     assert!(warnings.iter().all(|l| !l.contains("warning")), "{warnings:?}");
     assert!(get(addr).contains("hello"));
@@ -162,7 +177,7 @@ fn explicit_loopback_host_does_not_warn() {
 #[test]
 fn env_host_is_used_when_no_flag() {
     let site = temp_site("envhost");
-    let (_server, addr, _) = start(&site, &[], Some("::1"));
+    let (_server, addr, _) = start(site.path(), &[], Some("::1"));
     assert_eq!(addr.ip().to_string(), "::1");
     assert!(get(addr).contains("hello"));
 }
@@ -170,7 +185,7 @@ fn env_host_is_used_when_no_flag() {
 #[test]
 fn all_interfaces_bind_warns() {
     let site = temp_site("all");
-    let (_server, addr, warnings) = start(&site, &["--host=0.0.0.0"], None);
+    let (_server, addr, warnings) = start(site.path(), &["--host=0.0.0.0"], None);
     assert_eq!(addr.ip().to_string(), "0.0.0.0");
     assert!(
         warnings.iter().any(|l| l.starts_with("warning: listening on 0.0.0.0:") && l.contains("every network interface")),
@@ -179,4 +194,158 @@ fn all_interfaces_bind_warns() {
     // Reachable over loopback too.
     let local = SocketAddr::from(([127, 0, 0, 1], addr.port()));
     assert!(get(local).contains("hello"));
+}
+
+#[test]
+fn mapped_loopback_host_does_not_warn() {
+    let site = temp_site("mapped");
+    for host in ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+        let (_server, addr, warnings) = start(site.path(), &["--host", host], None);
+        assert_eq!(addr.ip().to_string(), "::ffff:127.0.0.1", "{host}");
+        assert!(warnings.iter().all(|l| !l.contains("warning")), "{host}: {warnings:?}");
+        assert!(get(addr).contains("hello"), "{host}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_env_host_is_a_usage_error_before_listening() {
+    use std::os::unix::ffi::OsStrExt;
+    let site = temp_site("nonutf8");
+    let bad = std::ffi::OsStr::from_bytes(b"127.0.0.\xff");
+    // A bad flag value and a bad env value both stop before anything listens.
+    for (args, env) in [(&[][..], Some(bad)), (&[bad][..], None)] {
+        let mut cmd = server();
+        if args.is_empty() {
+            cmd.env("POSTCMS_HOST", env.unwrap());
+        } else {
+            cmd.arg("--host").args(args);
+        }
+        let mut child = cmd
+            .env("SITE_ROOT", site.path())
+            .env("PORT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(wait_exit(&mut child), Some(2), "{args:?} {env:?}");
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.starts_with("server: ") && stderr.contains("not valid UTF-8"), "{stderr}");
+        assert!(stderr.contains("Usage: server"), "{stderr}");
+        assert!(!stderr.contains("origin serving"), "{stderr}");
+    }
+}
+
+/// The path the server used for its model cache when HOME was unset.
+const SHARED_CACHE: &str = "/tmp/.cache/post-cms-fastembed";
+
+/// Plants a symlink at [`SHARED_CACHE`] when nothing is there, pointing at a
+/// private directory holding a fake model file; removes what it created on
+/// drop. When the path already exists (an older server left it), it is left
+/// alone and only watched for changes.
+struct Planted {
+    _target: tempfile::TempDir,
+    created_link: bool,
+    created_parent: bool,
+}
+
+impl Planted {
+    fn new() -> Planted {
+        let target = tempfile::Builder::new().prefix("post-cms-planted-").tempdir().unwrap();
+        std::fs::write(target.path().join("model.onnx"), b"planted").unwrap();
+        let link = Path::new(SHARED_CACHE);
+        let parent = link.parent().unwrap();
+        let created_parent = std::fs::create_dir(parent).is_ok();
+        let created_link = std::os::unix::fs::symlink(target.path(), link).is_ok();
+        Planted { _target: target, created_link, created_parent }
+    }
+
+    /// Every entry under the shared path (following the link) with its
+    /// modification time, so a download or a write shows up as a change.
+    fn listing(&self) -> Vec<(String, std::time::SystemTime)> {
+        fn walk(dir: &Path, out: &mut Vec<(String, std::time::SystemTime)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let path = e.path();
+                let modified = std::fs::symlink_metadata(&path).and_then(|m| m.modified()).unwrap();
+                out.push((path.display().to_string(), modified));
+                if e.file_type().map_or(false, |t| t.is_dir()) {
+                    walk(&path, out);
+                }
+            }
+        }
+        let mut v = Vec::new();
+        walk(Path::new(SHARED_CACHE), &mut v);
+        v.sort();
+        v
+    }
+}
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        if self.created_link {
+            let _ = std::fs::remove_file(SHARED_CACHE);
+        }
+        if self.created_parent {
+            let _ = std::fs::remove_dir(Path::new(SHARED_CACHE).parent().unwrap());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn no_home_turns_embeddings_off_and_never_reads_the_shared_cache() {
+    use std::io::Write;
+    let site = temp_site("nohome");
+    let root = site.path();
+    std::fs::create_dir_all(root.join("dist/posts/a")).unwrap();
+    std::fs::write(root.join("dist/posts/a/index.md"), "# A\n\nSome text about a thing.\n").unwrap();
+    std::fs::write(
+        root.join("dist/embeddings.json"),
+        r#"[{"text":"Some text","url":"/posts/a/","title":"A","embedding":[0.1,0.2]}]"#,
+    )
+    .unwrap();
+    let planted = Planted::new();
+    let before = planted.listing();
+    // A closed port, so the upstream call fails fast after retrieval ran.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+
+    for home in [None, Some("")] {
+        let mut cmd = server();
+        match home {
+            None => cmd.env_remove("HOME"),
+            Some(h) => cmd.env("HOME", h),
+        };
+        cmd.env("LLM_BASE_URL", format!("http://{closed}"))
+            .env("LLM_MODEL", "test")
+            .env_remove("LLM_API_KEY");
+        let (mut server, addr, startup, rest) = start_cmd(cmd, root);
+        assert!(
+            startup.iter().any(|l| l.starts_with("embeddings: HOME is not set; semantic retrieval is off")),
+            "{home:?}: {startup:?}"
+        );
+
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let body = r#"{"question":"what is a thing?"}"#;
+        write!(
+            s,
+            "POST /api/ask HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 502"), "{home:?}: {resp}");
+        assert!(resp.contains("upstream unreachable"), "{home:?}: {resp}");
+
+        let _ = server.0.kill();
+        let _ = server.0.wait();
+        let mut later = String::new();
+        let _ = { rest }.read_to_string(&mut later);
+        assert!(later.contains("retrieval failed (no embedding model)"), "{home:?}: {later}");
+        assert!(!later.contains("model unavailable"), "{home:?}: {later}");
+        assert_eq!(planted.listing(), before, "{home:?}: the shared cache path was used");
+    }
 }
