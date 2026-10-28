@@ -1216,7 +1216,10 @@ async fn ask(
     let req = req.send().await;
     match req {
         Ok(resp) if resp.status().is_success() => {
-            let j: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let j: serde_json::Value = match resp.json().await {
+                Ok(j) => j,
+                Err(e) => return upstream_failure(UpstreamFailure::decode(&url, e)),
+            };
             let answer = j["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -1230,10 +1233,126 @@ async fn ask(
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            (StatusCode::BAD_GATEWAY, Json(json!({ "error": "upstream LLM error", "status": status.as_u16(), "detail": text.chars().take(300).collect::<String>() }))).into_response()
+            upstream_failure(UpstreamFailure::status(&url, status, &text, key.as_deref()))
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("upstream unreachable: {e}") }))).into_response(),
+        Err(e) => upstream_failure(UpstreamFailure::send(&url, e)),
     }
+}
+
+// ---- /api/ask upstream failures ----
+//
+// The client gets a fixed message and status; the detail (redacted upstream
+// URL, error chain, upstream status and body) goes only to the server log.
+// reqwest's own error text names the request URL, and an upstream error body
+// can echo hosts, headers or keys, so neither reaches a response body.
+
+/// A failed upstream call: what the client sees and what the log gets.
+#[derive(Debug)]
+struct UpstreamFailure {
+    status: StatusCode,
+    /// Fixed client-facing message.
+    error: &'static str,
+    /// Server-log detail; never sent to the client.
+    log: String,
+}
+
+/// Most upstream body characters kept in the log line.
+const UPSTREAM_LOG_BODY_CHARS: usize = 300;
+
+impl UpstreamFailure {
+    /// The request never got a response: connect, DNS, TLS or timeout.
+    fn send(url: &str, e: reqwest::Error) -> UpstreamFailure {
+        let (status, error) = if e.is_timeout() {
+            (StatusCode::GATEWAY_TIMEOUT, "upstream timed out")
+        } else {
+            (StatusCode::BAD_GATEWAY, "upstream unreachable")
+        };
+        UpstreamFailure { status, error, log: format!("{error}: POST {}: {}", redact_url(url), error_chain(e)) }
+    }
+
+    /// The upstream answered with a non-success status.
+    /// `key` is the configured LLM_API_KEY: an upstream that echoes the
+    /// request headers would otherwise write it to the log.
+    fn status(url: &str, upstream: StatusCode, body: &str, key: Option<&str>) -> UpstreamFailure {
+        // Redact before truncating, so a key that crosses the cut is not
+        // left half-logged.
+        let body = redact_key(body, key);
+        let body: String = body.chars().take(UPSTREAM_LOG_BODY_CHARS).collect();
+        UpstreamFailure {
+            status: StatusCode::BAD_GATEWAY,
+            error: "upstream error",
+            log: format!("upstream error: POST {} returned {}: body {:?}", redact_url(url), upstream.as_u16(), body),
+        }
+    }
+
+    /// A success status whose body could not be read or parsed as JSON.
+    fn decode(url: &str, e: reqwest::Error) -> UpstreamFailure {
+        let (status, error) = if e.is_timeout() {
+            (StatusCode::GATEWAY_TIMEOUT, "upstream timed out")
+        } else {
+            (StatusCode::BAD_GATEWAY, "upstream error")
+        };
+        UpstreamFailure {
+            status,
+            error,
+            log: format!("{error}: POST {}: unreadable response: {}", redact_url(url), error_chain(e)),
+        }
+    }
+}
+
+/// Logs the detail and returns the fixed client response.
+fn upstream_failure(f: UpstreamFailure) -> Response {
+    eprintln!("ask: {}", f.log);
+    (f.status, Json(json!({ "error": f.error }))).into_response()
+}
+
+/// The error and each of its sources, without the URL reqwest attaches (the
+/// caller logs a redacted copy instead).
+fn error_chain(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut out = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    // One log line per failure, even if a source spans lines.
+    out.escape_debug().to_string()
+}
+
+/// The upstream URL for the log: scheme, host, port and path, with any
+/// userinfo, query and fragment removed (they can carry credentials).
+fn redact_url(url: &str) -> String {
+    const UNPARSEABLE: &str = "<unparseable LLM_BASE_URL>";
+    match reqwest::Url::parse(url) {
+        // A value without a scheme, such as `user:pw@host/v1`, parses as an
+        // opaque URL whose userinfo cannot be cleared: never log those.
+        Ok(u) if u.cannot_be_a_base() || !matches!(u.scheme(), "http" | "https") => UNPARSEABLE.to_string(),
+        Ok(mut u) => {
+            if u.set_username("").is_err() || u.set_password(None).is_err() {
+                return UNPARSEABLE.to_string();
+            }
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => UNPARSEABLE.to_string(),
+    }
+}
+
+/// `text` with every occurrence of the configured API key replaced by
+/// `[redacted]` (no-op when the key is unset or blank).
+fn redact_key(text: &str, key: Option<&str>) -> String {
+    let mut out = text.to_string();
+    if let Some(k) = key {
+        for k in [k, k.trim()] {
+            if !k.is_empty() {
+                out = out.replace(k, "[redacted]");
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1643,5 +1762,78 @@ headers:
         drop(a);
         drop(b);
         assert!(!pa.exists() && !pb.exists());
+    }
+
+    #[test]
+    fn redact_url_drops_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://user:pw@llm.example.com:8443/v1/chat/completions?key=abc#frag"),
+            "https://llm.example.com:8443/v1/chat/completions"
+        );
+        assert_eq!(redact_url("not a url sk-secret"), "<unparseable LLM_BASE_URL>");
+        // No scheme: `user:` parses as the scheme and the password would stay.
+        for raw in [
+            "user:pw-SECRET1@llm.example.com/v1/chat/completions",
+            "mailto:pw-SECRET1@llm.example.com",
+            "ftp://user:pw-SECRET1@llm.example.com/v1",
+        ] {
+            assert_eq!(redact_url(raw), "<unparseable LLM_BASE_URL>", "{raw}");
+        }
+        let f = UpstreamFailure::status(
+            "user:pw-SECRET1@llm.example.com/v1/chat/completions",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "",
+            None,
+        );
+        assert!(!f.log.contains("SECRET1"), "{}", f.log);
+        assert!(f.log.contains("<unparseable LLM_BASE_URL>"), "{}", f.log);
+    }
+
+    #[test]
+    fn upstream_status_keeps_body_out_of_the_client_message() {
+        let f = UpstreamFailure::status(
+            "http://internal.example:9/v1/chat/completions?key=k1",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boom at internal.example\nAuthorization: Bearer sk-x",
+            Some("sk-x"),
+        );
+        assert_eq!(f.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(f.error, "upstream error");
+        assert!(f.log.contains("http://internal.example:9/v1/chat/completions returned 500"), "{}", f.log);
+        assert!(!f.log.contains("sk-x"), "API key in the log: {}", f.log);
+        assert!(f.log.contains("Bearer [redacted]"), "{}", f.log);
+        assert!(!f.log.contains("key=k1"), "{}", f.log);
+        assert!(!f.log.contains('\n'), "one log line: {}", f.log);
+        let long = "x".repeat(UPSTREAM_LOG_BODY_CHARS + 50);
+        let f = UpstreamFailure::status("http://h/", StatusCode::BAD_REQUEST, &long, None);
+        assert!(f.log.contains(&"x".repeat(UPSTREAM_LOG_BODY_CHARS)));
+        assert!(!f.log.contains(&"x".repeat(UPSTREAM_LOG_BODY_CHARS + 1)));
+        // A key crossing the 300-character cut is redacted whole, not cut.
+        let body = format!("{}sk-crossing-key", "y".repeat(UPSTREAM_LOG_BODY_CHARS - 5));
+        let f = UpstreamFailure::status("http://h/", StatusCode::BAD_REQUEST, &body, Some("sk-crossing-key"));
+        assert!(!f.log.contains("sk-cr"), "{}", f.log);
+        // No key configured: nothing is replaced.
+        assert_eq!(redact_key("a b", None), "a b");
+        assert_eq!(redact_key("a b", Some("  ")), "a b");
+    }
+
+    /// A real reqwest timeout (an upstream that accepts and never answers)
+    /// maps to 504 with a fixed message; the URL stays in the log.
+    #[tokio::test]
+    async fn upstream_timeout_is_504_without_the_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/hidden-path/chat/completions");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let e = client.post(&url).send().await.unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        let f = UpstreamFailure::send(&url, e);
+        assert_eq!(f.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(f.error, "upstream timed out");
+        assert!(f.log.contains(&url), "{}", f.log);
+        drop(listener);
     }
 }

@@ -228,6 +228,16 @@ It listens on 127.0.0.1 only by default, so a dev or CI run is not reachable fro
 
 A host that is not an IP address (including a `POSTCMS_HOST` or `--host` value that is not valid UTF-8), or an unknown flag, is a usage error (exit 2) and nothing listens. Binding a non-loopback address prints `warning: listening on ...: other machines can reach this server` on stderr. IPv4-mapped IPv6 addresses count as the IPv4 address they carry, so `::ffff:127.0.0.1` is loopback and does not warn.
 
+**Upstream errors.** When the model call fails, `/api/ask` returns a fixed message and never the upstream's own error text, which can name `LLM_BASE_URL`, internal hosts or headers:
+
+| Failure | Status | Body |
+|---|---|---|
+| Connect, DNS or TLS failure | 502 | `{"error":"upstream unreachable"}` |
+| No response within 60 s | 504 | `{"error":"upstream timed out"}` |
+| Upstream returns a non-2xx status, or a 2xx body that is not JSON | 502 | `{"error":"upstream error"}` |
+
+The detail goes to the server log (stderr) as one line starting `ask: `: the request URL with any username, password, query string and fragment removed (or `<unparseable LLM_BASE_URL>` when the value has no `http` or `https` scheme), the error chain, and for a non-2xx status the status code and the first 300 characters of the upstream body, with every occurrence of `LLM_API_KEY` replaced by `[redacted]`.
+
 **Embeddings without HOME.** `/api/ask` embeds the question with the model cached in `$HOME/.cache/post-cms-fastembed`. When `HOME` is unset or empty, the server never falls back to a shared path such as `/tmp/.cache`, where another local user could plant model files. It turns semantic retrieval off instead, logs `embeddings: HOME is not set; semantic retrieval is off ...` at startup, and `/api/ask` inlines the corpus (the same fallback as a site without `embeddings.json`). Set `HOME` to turn retrieval back on. The build uses a private per-run directory in this case; the server does not, because a long-running process stopped by a signal never removes that directory, and each start would download the model again.
 
 **Containers and deploys.** Inside a container, 127.0.0.1 is the container's own loopback, so a published port will not reach the server. Set the address explicitly:
