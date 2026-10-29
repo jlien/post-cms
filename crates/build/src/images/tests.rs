@@ -1552,3 +1552,23 @@ fn an_unreadable_directory_fails_the_build_instead_of_keeping_its_placeholders()
     let e = r.unwrap_err();
     assert!(e.contains("locked"), "{e}");
 }
+
+/// Cache keys and output names are SHA-256 hex digests; a hashing crate
+/// upgrade must not change them, or every image cache is invalidated.
+#[test]
+fn sha_hex_matches_fips_180_vectors() {
+    assert_eq!(sha_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert_eq!(sha_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    assert_eq!(sha_hex(long), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+/// Retry jitter is derived from the URL hash: same input, same delay, within
+/// a quarter of the base.
+#[test]
+fn retry_delay_is_deterministic_and_bounded() {
+    let a = retry_delay("https://img.example.com/a.png", 1);
+    assert_eq!(a, retry_delay("https://img.example.com/a.png", 1));
+    let base = RETRY_BASE_MS * 2;
+    assert!(a.as_millis() as u64 >= base && a.as_millis() as u64 <= base + base / 4, "{a:?}");
+}
