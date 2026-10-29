@@ -65,6 +65,10 @@ Temporary files: the Tailwind CLI writes the compiled theme CSS into a private d
 
 The origin server never serves the marker file.
 
+### Embeddings
+
+`dist/embeddings.json` holds one vector per text chunk (about 700 characters) of every published post and indexable collection item. The build sends the chunks to the model `POSTCMS_EMBED_BATCH` at a time (default 32, a whole number from 1 to 1024), so peak memory follows the batch size, not the number of chunks. Larger batches can be a little faster and use more memory; the vectors are the same within float rounding. An invalid `POSTCMS_EMBED_BATCH` fails the build before `dist/` is touched.
+
 ### Tailwind CLI
 
 The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. The CLI's own `PATH` is filtered the same way, so a `node` placed in the site never runs either. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
