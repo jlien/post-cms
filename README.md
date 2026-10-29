@@ -308,6 +308,11 @@ ORIGIN_TARGET=./deploy-target bash ci/deploy.sh   # build + rsync
 bash ci/purge.sh                                  # stub purge, appends ci/purge.log
 ```
 
+## Security
+
+Dependency audit commands and the accepted unmaintained-crate warnings are in
+[SECURITY.md](SECURITY.md).
+
 ## Agent workflow
 
 See [agents/CONVENTIONS.md](agents/CONVENTIONS.md) — in particular the
