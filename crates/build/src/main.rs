@@ -666,6 +666,8 @@ fn main() -> Result<()> {
     require_site_config(&root)?;
     // A bad POSTCMS_TAILWIND_TIMEOUT_SECS fails here, before dist/ is touched.
     let tailwind_timeout = tailwind::timeout_from_env()?;
+    // So does a bad POSTCMS_EMBED_BATCH.
+    let embed_batch = embed_batch_from_env()?;
     // Held until exit: one build-site at a time per site, so two builds
     // never write (or clear) the same dist/.
     let _site_lock = lock_site(&root)?;
@@ -751,7 +753,7 @@ fn main() -> Result<()> {
     render_mcp_card(&root, &dist)?;
     render_search_index(&root, &dist, &posts, &collections)?;
     render_posts_markdown(&dist, &posts)?;
-    render_embeddings(&root, &dist, &posts, &collections)?;
+    render_embeddings(&root, &dist, &posts, &collections, embed_batch)?;
     // ---- draft previews --------------------------------------------------
     // DRAFTS=1 renders unpublished posts + collection items under
     // dist/preview/drafts/ with a draft banner and embedded agent_notes, so
@@ -2277,6 +2279,7 @@ fn render_embeddings(
     dist: &Path,
     posts: &[Post],
     collections: &[Collection],
+    embed_batch: usize,
 ) -> Result<()> {
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
@@ -2362,9 +2365,11 @@ fn render_embeddings(
     }
 
     let docs: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
-    let vecs = model
-        .embed(docs, None)
-        .map_err(|e| anyhow::anyhow!("embed chunks: {e}"))?;
+    let vecs = embed_in_batches(&docs, embed_batch, |batch| {
+        model
+            .embed(batch, Some(batch.len()))
+            .map_err(|e| anyhow::anyhow!("embed chunks: {e}"))
+    })?;
 
     let mut out = Vec::with_capacity(rows.len());
     for ((meta, text), vec) in rows.into_iter().zip(vecs) {
@@ -2374,6 +2379,55 @@ fn render_embeddings(
         .with_context(|| "write embeddings.json".to_string())?;
     println!("embedded {} chunks -> embeddings.json", out.len());
     Ok(())
+}
+
+/// Env var for how many chunks go to the embedding model per call.
+const EMBED_BATCH_ENV: &str = "POSTCMS_EMBED_BATCH";
+const DEFAULT_EMBED_BATCH: usize = 32;
+const MAX_EMBED_BATCH: usize = 128;
+
+/// The batch size from [`EMBED_BATCH_ENV`]: unset or empty is the default;
+/// anything but a whole number from 1 to [`MAX_EMBED_BATCH`] is an error.
+fn embed_batch_from_env() -> Result<usize> {
+    let v = std::env::var_os(EMBED_BATCH_ENV);
+    let v = v.as_deref().map(|s| s.to_str().unwrap_or("\u{fffd}"));
+    parse_embed_batch(v).map_err(anyhow::Error::msg)
+}
+
+fn parse_embed_batch(v: Option<&str>) -> std::result::Result<usize, String> {
+    let v = v.map(str::trim).unwrap_or("");
+    if v.is_empty() {
+        return Ok(DEFAULT_EMBED_BATCH);
+    }
+    match v.parse::<usize>() {
+        Ok(n) if (1..=MAX_EMBED_BATCH).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "{EMBED_BATCH_ENV}={v:?} is not a whole number from 1 to {MAX_EMBED_BATCH}. Nothing was built or deleted."
+        )),
+    }
+}
+
+/// Embed `docs` with one `embed` call per `batch` of them, in order, so the
+/// model's working memory (including the raw per-token outputs fastembed
+/// keeps until a call returns) is bounded by the batch, not the corpus.
+/// Every call must return one vector per input.
+fn embed_in_batches<F>(docs: &[String], batch: usize, mut embed: F) -> Result<Vec<Vec<f32>>>
+where
+    F: FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
+{
+    anyhow::ensure!(batch > 0, "embedding batch size must be at least 1");
+    let mut out = Vec::with_capacity(docs.len());
+    for chunk in docs.chunks(batch) {
+        let vecs = embed(chunk)?;
+        anyhow::ensure!(
+            vecs.len() == chunk.len(),
+            "embedding model returned {} vectors for {} chunks",
+            vecs.len(),
+            chunk.len()
+        );
+        out.extend(vecs);
+    }
+    Ok(out)
 }
 
 /// Split plain text into word-boundary chunks of at most `max_chars`.
@@ -3261,6 +3315,134 @@ mod tests {
         );
         assert_eq!(embed_cache_dir_for(None), None);
         assert_eq!(embed_cache_dir_for(Some("".into())), None);
+    }
+
+    #[test]
+    fn embed_batch_defaults_to_32_and_accepts_only_1_to_128() {
+        assert_eq!(parse_embed_batch(None), Ok(32));
+        assert_eq!(parse_embed_batch(Some("")), Ok(32));
+        assert_eq!(parse_embed_batch(Some("  ")), Ok(32));
+        assert_eq!(parse_embed_batch(Some("1")), Ok(1));
+        assert_eq!(parse_embed_batch(Some(" 64 ")), Ok(64));
+        assert_eq!(parse_embed_batch(Some("128")), Ok(128));
+        for bad in ["0", "129", "1024", "-1", "8.5", "1e3", "abc", "\u{fffd}", "99999999999999999999999"] {
+            let err = parse_embed_batch(Some(bad)).unwrap_err();
+            assert!(err.contains("POSTCMS_EMBED_BATCH"), "{bad}: {err}");
+            assert!(err.contains("from 1 to 128"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn embed_in_batches_keeps_order_and_bounds_each_call() {
+        let docs: Vec<String> = (0..10).map(|i| format!("doc {i}")).collect();
+        let mut sizes = Vec::new();
+        let out = embed_in_batches(&docs, 4, |b| {
+            sizes.push(b.len());
+            Ok(b.iter().map(|d| vec![d[4..].parse::<f32>().unwrap()]).collect())
+        })
+        .unwrap();
+        assert_eq!(sizes, vec![4, 4, 2]);
+        let got: Vec<f32> = out.into_iter().map(|v| v[0]).collect();
+        assert_eq!(got, (0..10).map(|i| i as f32).collect::<Vec<_>>());
+
+        // A batch at least as big as the corpus is one call.
+        let mut calls = 0;
+        embed_in_batches(&docs, 128, |b| {
+            calls += 1;
+            Ok(vec![vec![0.0]; b.len()])
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        // No docs, no calls.
+        embed_in_batches(&[], 4, |_| -> Result<Vec<Vec<f32>>> { panic!("called") }).unwrap();
+    }
+
+    #[test]
+    fn embed_in_batches_fails_when_a_call_returns_the_wrong_count() {
+        let docs: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+        let err = embed_in_batches(&docs, 2, |b| Ok(vec![vec![0.0]; b.len().saturating_sub(1)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("returned 1 vectors for 2 chunks"), "{err}");
+        let err = embed_in_batches(&docs, 2, |_| anyhow::bail!("boom")).unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+        assert!(embed_in_batches(&docs, 0, |b| Ok(vec![vec![0.0]; b.len()])).is_err());
+    }
+
+    /// Batched embeddings match one call over the whole set, within 1e-6 per
+    /// component. Needs the model in the local cache. It loads the files
+    /// itself (no hub client, so no network request is possible) and skips,
+    /// with a note, unless one cached snapshot has every file it needs.
+    #[test]
+    fn batched_embeddings_match_a_single_call() {
+        use fastembed::{
+            InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
+            UserDefinedEmbeddingModel,
+        };
+        const FILES: [&str; 5] = [
+            "onnx/model.onnx",
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ];
+        let Some(cache) = embed_cache_dir() else {
+            eprintln!("skip: HOME is not set");
+            return;
+        };
+        let snapshots = cache.join("models--Xenova--bge-small-en-v1.5").join("snapshots");
+        let snapshot = fs::read_dir(&snapshots).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|dir| FILES.iter().all(|f| dir.join(f).is_file()))
+        });
+        let Some(snapshot) = snapshot else {
+            eprintln!("skip: no complete embedding model snapshot in {}", snapshots.display());
+            return;
+        };
+        let read = |f: &str| fs::read(snapshot.join(f)).unwrap();
+        let user_model = UserDefinedEmbeddingModel::new(
+            read(FILES[0]),
+            TokenizerFiles {
+                tokenizer_file: read(FILES[1]),
+                config_file: read(FILES[2]),
+                special_tokens_map_file: read(FILES[3]),
+                tokenizer_config_file: read(FILES[4]),
+            },
+        )
+        .with_pooling(Pooling::Cls);
+        let mut model = match TextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::default(),
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skip: embedding model unavailable ({e})");
+                return;
+            }
+        };
+        // Varied lengths, so batches pad to different widths.
+        let docs: Vec<String> = (0..23)
+            .map(|i| {
+                let words = ["speaker", "schedule", "venue", "ticket", "session", "keynote"];
+                let body: Vec<&str> = (0..(5 + i * 9)).map(|j| words[(i + j) % words.len()]).collect();
+                format!("# Event {i}\n\n{}", body.join(" "))
+            })
+            .collect();
+        let whole = model.embed(&docs, Some(docs.len())).unwrap();
+        let batched =
+            embed_in_batches(&docs, 5, |b| Ok(model.embed(b, Some(b.len())).unwrap())).unwrap();
+        assert_eq!(whole.len(), docs.len());
+        assert_eq!(batched.len(), docs.len());
+        let mut max = 0f32;
+        for (a, b) in whole.iter().zip(&batched) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                max = max.max((x - y).abs());
+            }
+        }
+        assert!(max <= 1e-6, "max component difference {max}");
     }
 
     #[cfg(unix)]
