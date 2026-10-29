@@ -500,4 +500,45 @@ mod tests {
         let items = sync(&source(), &SiteDefaults::default(), tmp.path(), true, &no_net).unwrap();
         assert_eq!(fs::read_dir(items).unwrap().count(), 3);
     }
+
+    /// CMS text reaches the YAML parser only as escaped scalars: editor
+    /// strings that look like YAML structure round-trip as plain strings and
+    /// add no keys, tags, anchors or documents (SECURITY.md relies on this).
+    #[test]
+    fn materialize_escapes_cms_strings_in_meta_yaml() {
+        let hostile = [
+            "x\ninjected: true",
+            "---\nsecond: doc",
+            "!!binary aGk=",
+            "&a [1, 2]",
+            "*a",
+            "{published: true}",
+            "- item",
+            "key: value # comment",
+            "'quoted\" \\ \t tab",
+            "yes",
+            "0x1F",
+            "~",
+        ];
+        for h in hostile {
+            let tmp = tempfile::tempdir().unwrap();
+            let doc = serde_json::json!({
+                "_id": "d", "slug": {"current": "post"}, "title": h,
+                "tags": [h], h: "value under a hostile key",
+            });
+            materialize(&[doc], &source(), tmp.path()).unwrap();
+            let raw = fs::read_to_string(tmp.path().join("post/meta.yaml")).unwrap();
+            let meta: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+            let map = meta.as_mapping().unwrap();
+            assert_eq!(meta["title"].as_str(), Some(h), "{raw}");
+            assert_eq!(meta["tags"][0].as_str(), Some(h), "{raw}");
+            assert_eq!(meta[h].as_str(), Some("value under a hostile key"), "{raw}");
+            let mut keys: Vec<&str> = map.keys().map(|k| k.as_str().unwrap()).collect();
+            keys.sort();
+            assert_eq!(meta["published"].as_bool(), Some(true), "{raw}");
+            let mut want = vec!["published", "slug", "tags", "title", h];
+            want.sort();
+            assert_eq!(keys, want, "{raw}");
+        }
+    }
 }
