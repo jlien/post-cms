@@ -67,7 +67,16 @@ The origin server never serves the marker file.
 
 ### Embeddings
 
-`dist/embeddings.json` holds one vector per text chunk (about 700 characters) of every published post and indexable collection item. The build sends the chunks to the model `POSTCMS_EMBED_BATCH` at a time (default 32, a whole number from 1 to 1024), so peak memory follows the batch size, not the number of chunks. Larger batches can be a little faster and use more memory; the vectors are the same within float rounding. An invalid `POSTCMS_EMBED_BATCH` fails the build before `dist/` is touched.
+`dist/embeddings.json` holds one vector per text chunk (about 700 characters) of every published post and indexable collection item. The build sends the chunks to the model `POSTCMS_EMBED_BATCH` at a time (default 32, a whole number from 1 to 128), so peak memory follows the batch size, not the number of chunks. An invalid `POSTCMS_EMBED_BATCH` fails the build before `dist/` is touched. The vectors are the same at any batch size within float rounding (under 1e-6 per component).
+
+Memory grows about linearly with the batch, and above 16 the speed stays about the same. Peak RSS of a whole build of a 2,879-chunk site on an Apple Silicon Mac (`/usr/bin/time -l`):
+
+| `POSTCMS_EMBED_BATCH` | 1 | 8 | 16 | 32 (default) | 64 | 128 |
+|---|---|---|---|---|---|---|
+| peak RSS | 0.44 GB | 0.57 GB | 0.72 GB | 1.04 GB | 1.83 GB | 3.27 GB |
+| wall time | 45 s | 42 s | 31 s | 30 s | 31 s | 31 s |
+
+Lower the batch on small CI runners. Raising it above 32 costs memory and gains no speed.
 
 ### Tailwind CLI
 

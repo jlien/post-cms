@@ -2384,7 +2384,7 @@ fn render_embeddings(
 /// Env var for how many chunks go to the embedding model per call.
 const EMBED_BATCH_ENV: &str = "POSTCMS_EMBED_BATCH";
 const DEFAULT_EMBED_BATCH: usize = 32;
-const MAX_EMBED_BATCH: usize = 1024;
+const MAX_EMBED_BATCH: usize = 128;
 
 /// The batch size from [`EMBED_BATCH_ENV`]: unset or empty is the default;
 /// anything but a whole number from 1 to [`MAX_EMBED_BATCH`] is an error.
@@ -3318,17 +3318,17 @@ mod tests {
     }
 
     #[test]
-    fn embed_batch_defaults_to_32_and_accepts_only_1_to_1024() {
+    fn embed_batch_defaults_to_32_and_accepts_only_1_to_128() {
         assert_eq!(parse_embed_batch(None), Ok(32));
         assert_eq!(parse_embed_batch(Some("")), Ok(32));
         assert_eq!(parse_embed_batch(Some("  ")), Ok(32));
         assert_eq!(parse_embed_batch(Some("1")), Ok(1));
         assert_eq!(parse_embed_batch(Some(" 64 ")), Ok(64));
-        assert_eq!(parse_embed_batch(Some("1024")), Ok(1024));
-        for bad in ["0", "1025", "-1", "8.5", "1e3", "abc", "\u{fffd}", "99999999999999999999999"] {
+        assert_eq!(parse_embed_batch(Some("128")), Ok(128));
+        for bad in ["0", "129", "1024", "-1", "8.5", "1e3", "abc", "\u{fffd}", "99999999999999999999999"] {
             let err = parse_embed_batch(Some(bad)).unwrap_err();
             assert!(err.contains("POSTCMS_EMBED_BATCH"), "{bad}: {err}");
-            assert!(err.contains("from 1 to 1024"), "{bad}: {err}");
+            assert!(err.contains("from 1 to 128"), "{bad}: {err}");
         }
     }
 
@@ -3347,7 +3347,7 @@ mod tests {
 
         // A batch at least as big as the corpus is one call.
         let mut calls = 0;
-        embed_in_batches(&docs, 1024, |b| {
+        embed_in_batches(&docs, 128, |b| {
             calls += 1;
             Ok(vec![vec![0.0]; b.len()])
         })
@@ -3370,23 +3370,52 @@ mod tests {
     }
 
     /// Batched embeddings match one call over the whole set, within 1e-6 per
-    /// component. Needs the model in the local cache; it never downloads, and
-    /// skips (with a note) when the weights are not there.
+    /// component. Needs the model in the local cache. It loads the files
+    /// itself (no hub client, so no network request is possible) and skips,
+    /// with a note, unless one cached snapshot has every file it needs.
     #[test]
     fn batched_embeddings_match_a_single_call() {
-        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        use fastembed::{
+            InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
+            UserDefinedEmbeddingModel,
+        };
+        const FILES: [&str; 5] = [
+            "onnx/model.onnx",
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ];
         let Some(cache) = embed_cache_dir() else {
             eprintln!("skip: HOME is not set");
             return;
         };
-        if !cache.join("models--Xenova--bge-small-en-v1.5").is_dir() {
-            eprintln!("skip: embedding model not cached in {}", cache.display());
+        let snapshots = cache.join("models--Xenova--bge-small-en-v1.5").join("snapshots");
+        let snapshot = fs::read_dir(&snapshots).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|dir| FILES.iter().all(|f| dir.join(f).is_file()))
+        });
+        let Some(snapshot) = snapshot else {
+            eprintln!("skip: no complete embedding model snapshot in {}", snapshots.display());
             return;
-        }
-        let opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
-            .with_cache_dir(cache)
-            .with_show_download_progress(false);
-        let mut model = match TextEmbedding::try_new(opts) {
+        };
+        let read = |f: &str| fs::read(snapshot.join(f)).unwrap();
+        let user_model = UserDefinedEmbeddingModel::new(
+            read(FILES[0]),
+            TokenizerFiles {
+                tokenizer_file: read(FILES[1]),
+                config_file: read(FILES[2]),
+                special_tokens_map_file: read(FILES[3]),
+                tokenizer_config_file: read(FILES[4]),
+            },
+        )
+        .with_pooling(Pooling::Cls);
+        let mut model = match TextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::default(),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("skip: embedding model unavailable ({e})");
