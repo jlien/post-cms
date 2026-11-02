@@ -12,6 +12,7 @@ Run:   python3 mcp/server.py            # JSON-RPC server on stdio
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import json
 import os
 import re
@@ -27,6 +28,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT = ROOT / "content" / "posts"
 TEMPLATES_FOR_BUILD = "cargo run -p build"
+
+# Who may call which tool (mcp/authz.py). Loaded by path: this file is run
+# as a script and also loaded by path from http_server.py.
+_authz_spec = importlib.util.spec_from_file_location(
+    "pcms_authz", Path(__file__).with_name("authz.py"))
+assert _authz_spec is not None and _authz_spec.loader is not None
+authz = importlib.util.module_from_spec(_authz_spec)
+_authz_spec.loader.exec_module(authz)
 PROTOCOL_VERSION = "2024-11-05"
 
 TOOLS = [
@@ -106,16 +115,19 @@ TOOLS = [
         "description": (
             "Upload a binary file (image/video/audio/pdf) to the media bucket at "
             "upload-time with resized variants for images; returns markdown/HTML "
-            "snippets to embed in a post. Binaries never go in git."
+            "snippets to embed in a post. Binaries never go in git. Send the "
+            "file as content_base64; the type is read from its content."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Post slug to namespace media under."},
-                "file_path": {"type": "string", "description": "Local path of the file to upload."},
+                "content_base64": {"type": "string", "description": "The file, base64 (size cap MCP_MEDIA_MAX_BYTES, default 25 MiB)."},
+                "filename": {"type": "string", "description": "Name for the uploaded file; only its stem is used."},
+                "file_path": {"type": "string", "description": "stdio only: a file inside the uploads dir (MCP_UPLOADS_DIR, default uploads/), no symlinks."},
                 "alt": {"type": "string", "description": "Alt text / link label."},
             },
-            "required": ["slug", "file_path"],
+            "required": ["slug"],
         },
     },
     {
@@ -1886,11 +1898,27 @@ def tool_publish_status(_args: dict[str, Any]) -> dict[str, Any]:
 def tool_add_media(args: dict[str, Any]) -> dict[str, Any]:
     import media as media_mod
 
-    if not _post_dir(args["slug"]).is_dir():
-        raise ValueError(f"post not found: {args['slug']} (create the draft first)")
-    return media_mod.add_media(
-        args["slug"], args["file_path"], args.get("alt", "")
-    )
+    slug = args.get("slug")
+    if not isinstance(slug, str) or not _slug_ok(slug):
+        raise ValueError(f"invalid slug: {slug!r}")
+    if not _post_dir(slug).is_dir():
+        raise ValueError(f"post not found: {slug} (create the draft first)")
+    alt = args.get("alt", "")
+    alt = alt if isinstance(alt, str) else ""
+    if ("content_base64" in args) == ("file_path" in args):
+        raise ValueError("pass exactly one of content_base64 or file_path")
+    if "file_path" in args:
+        # A server path names the server's disk: stdio only, and only
+        # inside the uploads dir.
+        if _caller_role()[1]:
+            raise ValueError("file_path is not accepted over HTTP; send the "
+                             "file as content_base64")
+        data = media_mod.read_confined(args["file_path"], media_mod.uploads_dir(ROOT))
+        name = args["file_path"]
+    else:
+        data = media_mod.decode_upload(args["content_base64"])
+        name = args.get("filename") or "upload"
+    return media_mod.add_media_bytes(slug, data, name, alt)
 
 
 def tool_set_theme(args: dict[str, Any]) -> dict[str, Any]:
@@ -1935,6 +1963,19 @@ HANDLERS = {
 
 # --------------------------------------------------------------- protocol
 
+def _caller_role() -> tuple[str | None, bool]:
+    """(role, over_http). Over HTTP the role is the one http_server.py bound
+    with the validated identity; no identity means no role. On stdio the one
+    local user has MCP_STDIO_ROLE (default admin)."""
+    ident = _HTTP_IDENTITY.get()
+    if ident is not None or os.environ.get("PCMS_TRANSPORT") == "http":
+        return (ident or {}).get("role"), True
+    try:
+        return authz.stdio_role(), False
+    except authz.Forbidden:
+        return None, False
+
+
 def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     method = req.get("method")
     req_id = req.get("id")
@@ -1949,15 +1990,34 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+        role, http = _caller_role()
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "tools": authz.visible_tools(TOOLS, role, http=http)}}
     if method == "tools/call":
-        params = req.get("params", {})
+        params = req.get("params")
+        params = {} if params is None else params
+        if not isinstance(params, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "params must be an object"}}
         name = params.get("name")
-        args = params.get("arguments", {})
+        args = params.get("arguments")
+        args = {} if args is None else args
+        if not isinstance(name, str):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "tool name must be a string"}}
+        if not isinstance(args, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "arguments must be an object"}}
         handler = HANDLERS.get(name)
         if handler is None:
             return {"jsonrpc": "2.0", "id": req_id, "error": {
                 "code": -32601, "message": f"unknown tool: {name}"}}
+        role, http = _caller_role()
+        refusal = authz.allowed(role, name, http=http, args=args)
+        if refusal is not None:
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": f"forbidden: {refusal}"}],
+                "isError": True}}
         try:
             result = handler(args)
         except Exception as exc:  # noqa: BLE001 — surfaced as tool error content

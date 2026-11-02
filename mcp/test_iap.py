@@ -461,6 +461,11 @@ class HttpIapTest(unittest.TestCase):
         cls.hs = _load_http_server()
         cls.key = Key("key-1")
         cls.hs._IAP_VERIFIER, _ = verifier(cls.key, mod=cls.hs.iap)
+        # The IAP identity's stable id is what the roles file lists.
+        cls.hs.ROLES_CFG = cls.hs.authz.parse_config({
+            "allowed_domains": ["example.com"],
+            "users": [{"id": "https://cloud.google.com/iap|accounts.google.com:1234567890",
+                       "role": "reader"}]}, require_domains=True)
         cls.seen: list = []
 
         def handle(req):
@@ -501,6 +506,21 @@ class HttpIapTest(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.seen[0]["email"], "alice@example.com")
         self.assertEqual(self.seen[0]["sub"], "accounts.google.com:1234567890")
+        self.assertEqual(self.seen[0]["role"], "reader")
+        self.assertEqual(self.seen[0]["kind"], "iap")
+
+    def test_unlisted_iap_identity_is_403(self):
+        saved = self.hs.ROLES_CFG
+        self.hs.ROLES_CFG = self.hs.authz.parse_config({
+            "allowed_domains": ["example.com"],
+            "users": [{"id": "https://cloud.google.com/iap|someone-else", "role": "admin"}]},
+            require_domains=True)
+        try:
+            resp, _ = self.post({iap.IAP_HEADER: token(self.key)})
+        finally:
+            self.hs.ROLES_CFG = saved
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(self.seen, [])
 
     def test_missing_header(self):
         self.assert_401({})
@@ -587,10 +607,15 @@ class HttpIapTest(unittest.TestCase):
 
     def test_bad_content_length_refused_without_hanging(self):
         tok = token(self.key).encode()
-        for cl in (b"-1", b"abc", b"+5", b"1e3", b"%d" % (2 * 1024 * 1024), b"99999999999"):
+        for cl in (b"-1", b"abc", b"+5", b"1e3", b"9999999999999"):
             req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
                    + b"\r\nContent-Length: " + cl + b"\r\n\r\n{}")
             self.assert_one_response(self.raw(req), b"400")
+        # Well-formed but over the caller's cap: 413 before the body is read.
+        for cl in (b"%d" % (2 * 1024 * 1024), b"99999999999"):
+            req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
+                   + b"\r\nContent-Length: " + cl + b"\r\n\r\n{}")
+            self.assert_one_response(self.raw(req), b"413")
         req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
                + b"\r\nContent-Length: 2\r\nContent-Length: 40\r\n\r\n{}")
         self.assert_one_response(self.raw(req), b"400")

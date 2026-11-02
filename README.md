@@ -343,13 +343,15 @@ JWKS, with `iss` `https://cloud.google.com/iap`, `aud` equal to
 most 32 levels deep. The
 keys are cached for an hour; an unknown `kid` triggers at most one refresh
 every 30 seconds, and a failed fetch keeps the keys already held. The
-identity's stable `id` is `https://cloud.google.com/iap|<sub>`; `email` (the
+identity's stable `id` is `https://cloud.google.com/iap|<sub>`, which is the
+`id` to list in the roles file; `email` (the
 claim, lowercased) is kept for display and the commit record. A missing or
 invalid assertion gets a bare `401 {"error": "unauthorized"}`; the reason goes
 to the server log only.
 
-In every mode, request bodies are capped at 1 MiB, `Transfer-Encoding` and
-malformed or conflicting `Content-Length` get a 400, a body on GET or HEAD
+In every mode, request bodies are capped at 1 MiB (an admin's `add_media`
+call may be larger, see MCP roles; over the cap is a 413), `Transfer-Encoding`
+and malformed or conflicting `Content-Length` get a 400, a body on GET or HEAD
 gets a 400, and every error response closes the connection, so an unread body
 is never parsed as the next request. Faults inside a tool or the connector
 return a generic 500; details go to the server log.
@@ -361,6 +363,86 @@ commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
 ```bash
 python3 -m unittest discover -s mcp -p 'test_*.py'
 ```
+
+## MCP roles
+
+Every tool call is checked against the caller's role (`mcp/authz.py`). Roles
+build on each other:
+
+| Role | Tools |
+| --- | --- |
+| reader | `list_posts`, `get_post`, `list_proposals`, `publish_status` |
+| author | reader, plus `propose_change`, `propose_template`, `propose_plugin`, `revise_proposal`, `build_preview` |
+| approver | author, plus `approve_proposal`, `reject_proposal`, `revert_proposal`, and `merge=true` on a `propose_*` tool |
+| admin | everything, plus `create_draft`, `update_post`, `set_theme`, `build_site`, `add_media` |
+
+`create_draft`, `update_post` and `set_theme` commit straight to the shared
+tree with no review. Over HTTP they are off, even for admins, unless
+`MCP_ALLOW_DIRECT_COMMIT=1`. `tools/list` shows only the tools the caller may
+call.
+
+`add_media` reads the file type from the content (magic bytes), never the
+name, and accepts PNG, JPEG, GIF, WebP, PDF, MP4, MOV, WebM, MP3, WAV and M4A
+(not SVG). The size cap is `MCP_MEDIA_MAX_BYTES` (default 25 MiB). Send the
+file as `content_base64` (with an optional `filename`). Over HTTP that is the
+only way: a server `file_path` is refused. On stdio `file_path` also works,
+but only for a regular file inside `MCP_UPLOADS_DIR` (default `uploads/`,
+gitignored), opened one directory at a time with no symlink followed.
+Images are probed with ffprobe first and refused over `MCP_MEDIA_MAX_PIXELS`
+(default 50,000,000) or `MCP_MEDIA_MAX_SECONDS` (default 600); every
+ffmpeg/ffprobe run has a timeout (`MCP_FFMPEG_TIMEOUT`, default 60 s), no
+stdin and only `PATH` in its environment.
+
+Request bodies over HTTP: 1 MiB, except an admin's `add_media` call, which may
+be up to `ceil(MCP_MEDIA_MAX_BYTES * 4 / 3) + 64 KiB`. `Content-Length` is
+checked before the body is read (413, connection closed); chunked bodies and
+malformed lengths get 400; a body that stalls for 30 s gets 408. A cached
+OIDC token is dropped at its `exp`.
+
+**stdio** (`python3 mcp/server.py`): one local user, who already holds the
+checkout. The default role is admin; set `MCP_STDIO_ROLE=reader|author|approver`
+to narrow it. No roles file is read.
+
+**HTTP** (`mcp/http_server.py`): roles come from a JSON file,
+`MCP_ROLES_FILE` (default `mcp/roles.json`, gitignored):
+
+```json
+{
+  "allowed_domains": ["example.com"],
+  "users": [
+    {"id": "https://issuer.example.com|0f3c9a", "email": "alice@example.com", "role": "admin"},
+    {"id": "github:583231", "email": "octocat@example.com", "role": "author"},
+    {"email": "bob@example.com", "role": "reader"}
+  ]
+}
+```
+
+- Prefer `id`, the stable actor id: `<iss>|<sub>` for OIDC (the token's
+  issuer and subject), `github:<numeric user id>` for GitHub (`id` from
+  `GET /user`). Logins and emails can be renamed and re-registered; ids
+  cannot. On an entry with `id`, `email` is for display only.
+- An email-only entry matches only an OIDC or IAP identity whose `email_verified`
+  claim is true, whose email is plain ASCII on `allowed_domains`, and which
+  equals the entry (ASCII case-insensitive). Non-ASCII emails are refused,
+  so Unicode lookalikes cannot match.
+- `OAUTH_MODE=iap` matches by `id` (`https://cloud.google.com/iap|<sub>`), or
+  an email-only entry by the email the proxy signed (treated as verified).
+- `OAUTH_MODE=github` matches by numeric id only. A GitHub login or profile
+  email never grants a role.
+- An identity with no entry gets HTTP 403 on every request, including
+  `initialize`. A valid GitHub or OIDC token alone grants nothing.
+- The server refuses to start when the file is missing, is not a regular
+  file, is world-writable, is not valid JSON, repeats a JSON key, has an
+  unknown key or role, has a malformed id or a non-ASCII email, lists one
+  identity twice, lists an email outside `allowed_domains`, or has no
+  non-empty `allowed_domains` (fail closed; the list is required in GitHub
+  mode too).
+- The file is read once at startup. Restart the server to apply a change,
+  including a revocation; a validated token is also cached for up to five
+  minutes.
+- Approver rights come only from this file: the server refuses to start when
+  `MCP_APPROVERS` is set. With no approver or admin listed it warns at
+  startup, and approve, reject and revert are refused for everyone.
 
 ## Deploy + CDN purge
 
