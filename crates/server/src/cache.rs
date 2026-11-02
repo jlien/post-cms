@@ -50,15 +50,13 @@ const HASHED_EXTS: &[&str] = &["avif", "webp", "jpg", "png", "gif", "svg"];
 /// Length of the pipeline's hex id (the first 16 hex digits of a sha256).
 const HASH_LEN: usize = 16;
 
-/// Response classes with a configurable policy.
+// Classes of files under dist/ (404s and redirects have their own fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Html,
     Hashed,
     Static,
     Feeds,
-    NotFound,
-    Redirects,
 }
 
 #[derive(Clone, Debug)]
@@ -128,8 +126,6 @@ impl CachePolicy {
             Class::Hashed => self.hashed.clone(),
             Class::Static => self.static_files.clone(),
             Class::Feeds => self.feeds.clone(),
-            Class::NotFound => self.not_found.clone(),
-            Class::Redirects => self.redirects.clone(),
         }
     }
 
@@ -298,8 +294,8 @@ mod tests {
         assert_eq!(p.get(Class::Hashed), "public, max-age=600");
         assert_eq!(p.get(Class::Static), "no-cache");
         assert_eq!(p.get(Class::Feeds), "public, max-age=60");
-        assert_eq!(p.get(Class::NotFound), "no-store");
-        assert_eq!(p.get(Class::Redirects), "public, max-age=30");
+        assert_eq!(p.not_found, "no-store");
+        assert_eq!(p.redirects, "public, max-age=30");
         // A partial block keeps the other defaults.
         let p = pol("cache:\n  html: no-cache\n");
         assert_eq!(p.html, "no-cache");
