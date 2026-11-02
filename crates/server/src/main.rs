@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use serde_json::json;
 
 mod serve;
+mod iap;
 mod site_headers;
 use site_headers::SiteHeaders;
 
@@ -77,6 +78,11 @@ Environment:
   POSTCMS_HOST  IP address to listen on when --host is not given
   POSTCMS_HEADER_READ_TIMEOUT_SECS  seconds to send a request head (default 10)
   POSTCMS_SHUTDOWN_TIMEOUT_SECS     seconds connections get after SIGTERM (default 25)
+  IAP_AUDIENCE  serve /preview/ (the DRAFTS=1 build) only to requests with a
+                verified x-goog-iap-jwt-assertion for this audience
+                (/projects/<number>/global/backendServices/<id>). Unset:
+                /preview/ is always 404.
+  IAP_JWKS_URL  IAP key set (default Google's; https only)
 ";
 
 /// Build marker the engine writes in dist/ (see build-site). Never served.
@@ -215,6 +221,26 @@ fn main() -> anyhow::Result<()> {
     if embed_cache_dir().is_none() {
         eprintln!("{EMBED_OFF_NO_HOME}");
     }
+    // Draft preview: fail closed. No IAP_AUDIENCE, no preview; a malformed
+    // value refuses to start.
+    let iap_cfg = iap::IapConfig::from_env(|k| env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    match iap_cfg {
+        Some(cfg) => {
+            eprintln!(
+                "preview: /preview/ is served only to requests with a verified IAP token for {}",
+                cfg.audience
+            );
+            let v = iap::IapVerifier::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+            iap::install(Some(std::sync::Arc::new(v)));
+        }
+        None => {
+            if dist.join("preview").is_dir() {
+                eprintln!("{PREVIEW_OFF_NO_AUDIENCE}");
+            }
+            iap::install(None);
+        }
+    }
 
     let timeouts = match serve::timeouts_from(|k| env::var(k).ok()) {
         Ok(t) => t,
@@ -237,6 +263,9 @@ fn main() -> anyhow::Result<()> {
         .route("/mcp", axum::routing::post(mcp_endpoint))
         // Everything else (pages, posts, feeds) is a file under dist/.
         .fallback(get(serve_path))
+        // Draft headers on every /preview response, including the 405 the
+        // router sends for POST or OPTIONS.
+        .layer(axum::middleware::from_fn(preview_response_headers))
         .with_state(state);
 
     let addr = SocketAddr::new(host, port);
@@ -954,9 +983,80 @@ async fn mcp_endpoint(
     }
 }
 
+/// Logged once at startup when dist/preview/ exists but IAP_AUDIENCE is unset.
+const PREVIEW_OFF_NO_AUDIENCE: &str = "warning: dist/preview/ exists but IAP_AUDIENCE is unset, \
+     so draft previews are off: every /preview/ request returns 404. Set IAP_AUDIENCE \
+     to the preview backend service (/projects/<number>/global/backendServices/<id>).";
+
+/// Headers on every /preview/ response, served or refused.
+const PREVIEW_CACHE_CONTROL: &str = "private, no-store";
+const PREVIEW_ROBOTS: &str = "noindex, nofollow";
+
+/// True for /preview and everything under it, in the form `serve` resolves
+/// (surrounding slashes stripped, so `//preview/x` counts too).
+fn is_preview_path(path: &str) -> bool {
+    let rel = path.trim_matches('/');
+    rel == "preview" || rel.starts_with("preview/")
+}
+
+/// Mark a preview response private and unindexable. Applied after site.yaml
+/// headers so no site rule can make a draft cacheable.
+fn preview_headers(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(PREVIEW_CACHE_CONTROL));
+    h.insert(HeaderName::from_static("x-robots-tag"), HeaderValue::from_static(PREVIEW_ROBOTS));
+    resp
+}
+
+/// Router layer: any response to a /preview path gets the draft headers,
+/// whatever produced it (method errors included).
+async fn preview_response_headers(req: Request, next: axum::middleware::Next) -> Response {
+    let preview = is_preview_path(req.uri().path());
+    let resp = next.run(req).await;
+    if preview {
+        preview_headers(resp)
+    } else {
+        resp
+    }
+}
+
+/// /preview/: served only after the IAP assertion verifies against `v`.
+/// The Host header plays no part: the public and preview hosts can reach the
+/// same origin, and any client can send any header to either. Refusals are
+/// the site's plain 404, so the public host does not reveal that previews
+/// exist.
+async fn serve_preview(
+    v: Option<&iap::IapVerifier>,
+    site: Option<&SiteHeaders>,
+    root: &PathBuf,
+    req: Request,
+) -> Response {
+    let path = req.uri().path();
+    let finish = |resp: Response| {
+        let resp = match site {
+            Some(cfg) if !cfg.is_empty() => with_site_headers(cfg, path, resp),
+            _ => resp,
+        };
+        preview_headers(resp)
+    };
+    if iap::verify_with(v, req.headers()).await.is_err() {
+        return finish(not_found(root.clone()));
+    }
+    if redirect_for(path).is_none() {
+        if let Some(to) = slash_redirect(path, req.uri().query()) {
+            return finish(redirect_response(&Redirect { from: String::new(), to, status: 301 }));
+        }
+    }
+    finish(serve(root, path, wants_gzip(&req)))
+}
+
 async fn serve_path(State(s): State<StaticDir>, req: Request) -> Response {
     let gzip = wants_gzip(&req);
     let path = req.uri().path();
+    if is_preview_path(path) {
+        let v = iap::verifier();
+        return serve_preview(v.as_deref(), SITE_HEADERS.get(), &s.0, req).await;
+    }
     // A redirect-map hit wins, so a migrated `/old/` goes straight to its
     // target in one hop. Otherwise normalize the slash form.
     if redirect_for(path).is_none() {
@@ -1855,6 +1955,149 @@ headers:
         // No key configured: nothing is replaced.
         assert_eq!(redact_key("a b", None), "a b");
         assert_eq!(redact_key("a b", Some("  ")), "a b");
+    }
+
+    // ---- Draft preview behind IAP (E6) -----------------------------------
+
+    const PREVIEW_AUD: &str = "/projects/123456789/global/backendServices/987654321";
+
+    fn preview_dist(name: &str) -> TestDir {
+        let dir = temp_dist(name);
+        std::fs::create_dir_all(dir.join("preview/drafts/new-post")).unwrap();
+        std::fs::write(dir.join("preview/drafts/index.html"), "<p>drafts</p>").unwrap();
+        std::fs::write(dir.join("preview/drafts/new-post/index.html"), "<p>draft post</p>").unwrap();
+        dir
+    }
+
+    fn preview_verifier(key: &iap::test_keys::TestKey) -> iap::IapVerifier {
+        let body = iap::test_keys::jwks(&[key]);
+        iap::IapVerifier::new(iap::IapConfig {
+            audience: PREVIEW_AUD.into(),
+            keys: iap::KeySource::Fixed(std::sync::Arc::new(move || Ok(body.clone()))),
+            min_refresh: std::time::Duration::ZERO,
+            ttl: iap::KEYS_TTL,
+            max_stale: iap::MAX_STALE,
+        })
+        .unwrap()
+    }
+
+    /// A token for PREVIEW_AUD valid right now, with `aud` overridable.
+    fn preview_token(key: &iap::test_keys::TestKey, aud: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        key.token(&json!({
+            "iss": iap::ISSUER, "aud": aud, "iat": now, "exp": now + 600,
+            "email": "reviewer@example.com", "sub": "accounts.google.com:1",
+        }))
+    }
+
+    fn preview_req(path: &str, host: &str, token: Option<&str>) -> Request {
+        let mut b = axum::http::Request::builder().uri(path).header(header::HOST, host);
+        if let Some(t) = token {
+            b = b.header(iap::ASSERTION_HEADER, t);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn assert_preview_headers(resp: &Response) {
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+        assert_eq!(resp.headers()["x-robots-tag"], "noindex, nofollow");
+    }
+
+    #[test]
+    fn preview_paths_cover_every_spelling_serve_resolves() {
+        for p in ["/preview", "/preview/", "/preview/drafts/", "//preview/drafts/x", "/preview//x"] {
+            assert!(is_preview_path(p), "{p}");
+        }
+        for p in ["/", "/previews/", "/about/preview/", "/preview.html", "/blog/"] {
+            assert!(!is_preview_path(p), "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_without_a_token_is_404_with_draft_headers() {
+        let dist = preview_dist("pv-none");
+        let key = iap::test_keys::TestKey::new("k1");
+        let v = preview_verifier(&key);
+        for path in ["/preview/", "/preview/drafts/", "/preview/drafts/new-post/", "//preview/drafts/"] {
+            let resp = serve_preview(Some(&v), None, &dist, preview_req(path, "preview.example.com", None)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_preview_headers(&resp);
+            assert!(!body_text(resp).await.contains("draft"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_with_a_verified_token_serves_the_draft() {
+        let dist = preview_dist("pv-ok");
+        let key = iap::test_keys::TestKey::new("k1");
+        let v = preview_verifier(&key);
+        let t = preview_token(&key, PREVIEW_AUD);
+        let req = preview_req("/preview/drafts/new-post/", "preview.example.com", Some(&t));
+        let resp = serve_preview(Some(&v), None, &dist, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_preview_headers(&resp);
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(body_text(resp).await, "<p>draft post</p>");
+    }
+
+    /// The Host header is never the decision: a fake assertion sent to the
+    /// public host is refused, and a verified one is judged by the token alone.
+    #[tokio::test]
+    async fn host_header_plays_no_part() {
+        let dist = preview_dist("pv-host");
+        let key = iap::test_keys::TestKey::new("k1");
+        let v = preview_verifier(&key);
+        let forger = iap::test_keys::TestKey::new("k1");
+        for (host, token) in [
+            ("www.example.com", "fake".to_string()),
+            ("preview.example.com", "fake".to_string()),
+            ("preview.example.com", preview_token(&forger, PREVIEW_AUD)),
+            ("preview.example.com", preview_token(&key, "/projects/1/global/backendServices/2")),
+        ] {
+            let req = preview_req("/preview/drafts/", host, Some(&token));
+            let resp = serve_preview(Some(&v), None, &dist, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{host} {token:.12}");
+        }
+        let t = preview_token(&key, PREVIEW_AUD);
+        let req = preview_req("/preview/drafts/", "www.example.com", Some(&t));
+        assert_eq!(serve_preview(Some(&v), None, &dist, req).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn preview_is_off_without_an_audience() {
+        let dist = preview_dist("pv-off");
+        let key = iap::test_keys::TestKey::new("k1");
+        let t = preview_token(&key, PREVIEW_AUD);
+        let req = preview_req("/preview/drafts/", "preview.example.com", Some(&t));
+        let resp = serve_preview(None, None, &dist, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_preview_headers(&resp);
+    }
+
+    /// A site.yaml rule that sets Cache-Control on /preview cannot make a
+    /// draft cacheable or indexable.
+    #[tokio::test]
+    async fn site_rules_cannot_override_draft_headers() {
+        let dist = preview_dist("pv-site");
+        let yaml = "headers:\n  rules:\n    - path: /preview/*\n      headers:\n        \
+                    Cache-Control: \"public, max-age=600\"\n        X-Robots-Tag: all\n";
+        let cfg = SiteHeaders::from_site_yaml(yaml).unwrap();
+        let key = iap::test_keys::TestKey::new("k1");
+        let v = preview_verifier(&key);
+        let t = preview_token(&key, PREVIEW_AUD);
+        for token in [Some(t.as_str()), None] {
+            let req = preview_req("/preview/drafts/new-post/", "preview.example.com", token);
+            let resp = serve_preview(Some(&v), Some(&cfg), &dist, req).await;
+            assert_preview_headers(&resp);
+        }
     }
 
     /// A real reqwest timeout (an upstream that accepts and never answers)
