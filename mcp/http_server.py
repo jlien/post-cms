@@ -13,8 +13,9 @@ STANDARD connector — no FusionAuth, no bespoke IdP:
 
 The validated principal is bound into the request context; approve / reject
 / revert take the approver's identity from that login — the same structural
-gate as the local gh session, minus the shared machine. MCP_ALLOW_APPROVE=0
-still disables merging on the server as a whole.
+gate as the local gh session, minus the shared machine. Over HTTP, approve,
+merge=true and revert are off unless MCP_ALLOW_APPROVE=1, and the caller may
+not publish a change they authored or committed (see README "Publish gate").
 
 Endpoints:
     POST /mcp                                          JSON-RPC (MCP), auth required

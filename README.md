@@ -301,6 +301,53 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
+Publish gate tests (standard library, no network; git runs against a local
+bare origin and every `gh` call is stubbed):
+
+```bash
+python3 -m unittest discover -s mcp -p 'test_*.py'
+```
+
+## Publish gate
+
+Every MCP action that lands a change on main goes through one gate:
+`approve_proposal`, `merge: true` on `propose_change`, `propose_template` and
+`propose_plugin`, and `revert_proposal`. In order:
+
+1. **Approval allowed.** `MCP_ALLOW_APPROVE=0` refuses everywhere. Over HTTP
+   (`mcp/http_server.py`) publishing is off unless `MCP_ALLOW_APPROVE=1`.
+2. **Approver rights.** The identity comes from the login (the OAuth token
+   over HTTP, the `gh` session on stdio), never from typed names. With
+   `MCP_APPROVERS` set (comma-separated logins or emails), only those
+   identities may approve, merge or revert. Unset, any authenticated identity
+   may, once step 1 allows it.
+3. **Distinct approver.** The approver must not be an author or committer of
+   any commit on the proposal branch since its merge base with main. Adding a
+   commit to someone else's branch makes you one of its authors. Before
+   merging, `approve_proposal` pins the merge to the head it checked
+   (`gh pr merge --match-head-commit`), so a commit pushed after the check
+   fails the merge. `merge: true` is an approval of a change the same session
+   just authored, so wherever this check applies it is refused before
+   anything is pushed.
+
+| Setting | Over HTTP | On stdio |
+| --- | --- | --- |
+| `MCP_ALLOW_APPROVE` | off unless `1` | on unless `0` |
+| Distinct approver for approve and `merge: true` | on; `REQUIRE_DISTINCT_APPROVER=0` turns it off | off; `REQUIRE_DISTINCT_APPROVER=1` turns it on |
+| Reverter must not be an author of the reverted change | always on | off; `REQUIRE_DISTINCT_APPROVER=1` turns it on |
+
+stdio is a single local user: every commit carries that user's identity, so
+the author checks would block all publishing there. They apply on stdio only
+when `REQUIRE_DISTINCT_APPROVER=1`.
+
+**Break-glass for reverts.** `MCP_ALLOW_SELF_REVERT=1` lets the author of a
+change revert it when no other approver is available. It skips only the
+author check (steps 1 and 2 still apply) and defaults to off. Every use is
+logged: a `BREAK-GLASS` line on the server's stderr, a note on the PR, and
+`"break_glass": "MCP_ALLOW_SELF_REVERT"` in the tool result. Unset it once
+the incident is over. `REQUIRE_DISTINCT_APPROVER=0` does not relax the
+revert check over HTTP.
+
 ## Deploy + CDN purge
 
 ```bash
