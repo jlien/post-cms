@@ -21,6 +21,7 @@ import base64
 import hashlib
 import json
 import re
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -110,9 +111,54 @@ class IapError(Exception):
 
 
 def b64url_decode(s: str) -> bytes:
+    """Strict, canonical base64url without padding: the input must be what
+    encoding the decoded bytes gives back, so one value has one spelling."""
     if not isinstance(s, str) or not _B64URL.fullmatch(s) or len(s) % 4 == 1:
         raise IapError("bad base64url")
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != s:
+        raise IapError("non-canonical base64url")
+    return raw
+
+
+MAX_JSON_DEPTH = 32
+
+
+def json_depth_ok(text: str | bytes, limit: int = MAX_JSON_DEPTH) -> bool:
+    """True when the JSON text nests arrays/objects at most `limit` deep.
+    Checked before json.loads, so a deep document cannot recurse."""
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode("utf-8", "replace")
+    depth = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif ch in "]}":
+            depth -= 1
+    return True
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"{name} is not JSON")
+
+
+def loads_bounded(text: str | bytes) -> Any:
+    """json.loads with a nesting bound and no NaN/Infinity. Raises ValueError."""
+    if not json_depth_ok(text):
+        raise ValueError("JSON nested too deeply")
+    return json.loads(text, parse_constant=_reject_constant)
 
 
 def jwk_to_point(jwk: Any) -> tuple[int, int] | None:
@@ -134,8 +180,13 @@ def jwk_to_point(jwk: Any) -> tuple[int, int] | None:
     return pt if on_curve(pt) else None
 
 
-def _num(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+MAX_NUMERIC_DATE = 9_999_999_999
+
+
+def _numeric_date(v: Any) -> bool:
+    """A JWT NumericDate as the proxy sends it: an integer in [1, 9999999999].
+    Floats, NaN, Infinity, booleans and strings are refused."""
+    return type(v) is int and 1 <= v <= MAX_NUMERIC_DATE
 
 
 # ---- JWKS cache --------------------------------------------------------------
@@ -173,10 +224,15 @@ class JwksCache:
 
     def __init__(self, url: str, fetch: Callable[[str], bytes] = fetch_https,
                  ttl: float = 3600.0, min_refresh: float = 30.0,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 max_stale: float = 86400.0,
+                 log: Callable[[str], None] = lambda m: sys.stderr.write(m + "\n")):
         self.url = url
         self._fetch = fetch
         self.ttl = ttl
+        self.max_stale = max_stale  # beyond ttl, while fetches fail
+        self._log = log
+        self._expired_logged = False
         self.min_refresh = min_refresh
         self._clock = clock
         self._keys: dict[str, tuple[int, int]] = {}
@@ -189,7 +245,7 @@ class JwksCache:
         self._tried_at = self._clock()
         self.fetches += 1
         try:
-            doc = json.loads(self._fetch(self.url))
+            doc = loads_bounded(self._fetch(self.url))
         except Exception:  # noqa: BLE001 - network or parse failure keeps old keys
             return
         keys: dict[str, tuple[int, int]] = {}
@@ -203,6 +259,7 @@ class JwksCache:
         if keys:
             self._keys = keys
             self._loaded_at = self._tried_at
+            self._expired_logged = False
 
     def _may_retry(self, now: float) -> bool:
         return self._tried_at is None or now - self._tried_at >= self.min_refresh
@@ -219,6 +276,15 @@ class JwksCache:
             pt = self._keys.get(kid)
             if (pt is None or stale) and self._may_retry(now):
                 self._refresh_locked()
+            if self._loaded_at is not None and \
+                    self._clock() - self._loaded_at >= self.ttl + self.max_stale:
+                # Fetches have failed for longer than the stale cap: the
+                # held keys may have been rotated out. Fail closed.
+                if not self._expired_logged:
+                    self._expired_logged = True
+                    self._log("iap: JWKS keys expired (no successful fetch within "
+                              "the TTL plus IAP_JWKS_MAX_STALE_SECS); refusing tokens")
+                return None
             return self._keys.get(kid)
 
 
@@ -243,8 +309,8 @@ class IapVerifier:
             raise IapError("not a compact JWS")
         h64, p64, s64 = parts
         try:
-            header = json.loads(b64url_decode(h64))
-        except (ValueError, UnicodeDecodeError) as exc:
+            header = loads_bounded(b64url_decode(h64))
+        except ValueError as exc:
             raise IapError("bad header") from exc
         if not isinstance(header, dict):
             raise IapError("bad header")
@@ -263,8 +329,8 @@ class IapVerifier:
             raise IapError("bad signature")
         # Signature holds: the claims are the proxy's own.
         try:
-            claims = json.loads(b64url_decode(p64))
-        except (ValueError, UnicodeDecodeError) as exc:
+            claims = loads_bounded(b64url_decode(p64))
+        except ValueError as exc:
             raise IapError("bad payload") from exc
         if not isinstance(claims, dict):
             raise IapError("bad payload")
@@ -274,13 +340,13 @@ class IapVerifier:
             raise IapError("wrong audience")
         now = self._now()
         exp, iat, nbf = claims.get("exp"), claims.get("iat"), claims.get("nbf")
-        if not _num(exp) or not _num(iat):
-            raise IapError("exp and iat required")
+        if not _numeric_date(exp) or not _numeric_date(iat):
+            raise IapError("exp and iat must be integers in [1, 9999999999]")
         if now >= exp + self.skew:
             raise IapError("expired")
         if iat > now + self.skew:
             raise IapError("issued in the future")
-        if nbf is not None and (not _num(nbf) or nbf > now + self.skew):
+        if nbf is not None and (not _numeric_date(nbf) or nbf > now + self.skew):
             raise IapError("not yet valid")
         email = claims.get("email")
         sub = claims.get("sub")
@@ -290,6 +356,9 @@ class IapVerifier:
             raise IapError("no sub claim")
         email = email.strip().lower()
         return {
+            # Stable principal for authorization (survives an email change);
+            # email is for display and the commit record.
+            "id": f"{IAP_ISSUER}|{sub}",
             "login": email,
             "name": "",
             "email": email,

@@ -267,6 +267,61 @@ class VerifyTest(unittest.TestCase):
         self.bad(token(self.key, claims(sub=None)), "sub")
         self.bad("x" * 9000, "oversized")
 
+    def test_stable_id(self):
+        ident = self.v.verify(token(self.key))
+        self.assertEqual(ident["id"], "https://cloud.google.com/iap|accounts.google.com:1234567890")
+        self.assertEqual(ident["email"], "alice@example.com")
+
+    def test_numeric_dates_are_bounded_integers(self):
+        for field in ("exp", "iat", "nbf"):
+            for bad in (float(NOW), NOW + 0.5, True, 0, -1, 10_000_000_000, 2**64, "1"):
+                self.bad(token(self.key, claims(**{field: bad})))
+
+    def raw_token(self, payload_text: str) -> str:
+        h = b64j({"alg": "ES256", "kid": "key-1"})
+        p = b64(payload_text.encode())
+        return f"{h}.{p}.{b64(self.key.sign(f'{h}.{p}'.encode()))}"
+
+    def test_nan_and_infinity_refused(self):
+        base = json.dumps(claims())
+        for lit in ("NaN", "Infinity", "-Infinity", "1e400"):
+            self.bad(self.raw_token(base.replace(str(NOW + 590), lit)))
+
+    def test_non_canonical_base64url(self):
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+        def lenient(seg):
+            return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
+
+        def twin(seg):
+            """Same bytes, different spelling: flip the unused low bits of the
+            last character (a segment of length 2 or 3 mod 4 has some)."""
+            spare = {2: 4, 3: 2}[len(seg) % 4]
+            i = alphabet.index(seg[-1]) ^ 1
+            assert spare >= 1
+            return seg[:-1] + alphabet[i]
+
+        tok = token(self.key, claims(email="ab@example.co"))
+        parts = tok.split(".")
+        tested = 0
+        for n in range(3):
+            if len(parts[n]) % 4 == 0:
+                continue
+            forged = list(parts)
+            forged[n] = twin(parts[n])
+            self.assertEqual(lenient(forged[n]), lenient(parts[n]))  # same bytes
+            self.bad(".".join(forged), "non-canonical")
+            tested += 1
+        self.assertGreaterEqual(tested, 2)  # the signature (86 chars) always qualifies
+        with self.assertRaises(iap.IapError):
+            iap.b64url_decode(parts[2] + "==")
+
+    def test_deep_json_header_refused(self):
+        h = b64(("[" * 2000 + "]" * 2000).encode())
+        self.bad(f"{h}.{b64j(claims())}.{b64(bytes(64))}", "header")
+        self.assertFalse(iap.json_depth_ok("[" * 33 + "]" * 33))
+        self.assertTrue(iap.json_depth_ok('{"a": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["}'))
+
     def test_audience_required(self):
         with self.assertRaises(ValueError):
             iap.IapVerifier("", self.v.jwks)
@@ -339,6 +394,32 @@ class JwksTest(unittest.TestCase):
         clock.t += 31
         v.verify(token(key))
         self.assertEqual(fetch.calls, 3)
+
+    def test_keys_expire_after_max_stale(self):
+        key = Key("k")
+        clock = Clock()
+        logs: list = []
+        fetch = FakeJwks(key)
+        jwks = iap.JwksCache(iap.DEFAULT_JWKS_URL, fetch=fetch, ttl=100.0, min_refresh=30.0,
+                             clock=clock, max_stale=1000.0, log=logs.append)
+        v = iap.IapVerifier(AUD, jwks, skew=30.0, now=lambda: NOW)
+        v.verify(token(key))
+        fetch.fail = True
+        clock.t += 1099
+        v.verify(token(key))                   # stale, still inside the cap
+        clock.t += 2
+        for _ in range(3):
+            with self.assertRaises(iap.IapError):
+                v.verify(token(key))           # past ttl + max_stale: fail closed
+            clock.t += 31
+        self.assertEqual(len(logs), 1)         # one logged error
+        fetch.fail = False
+        v.verify(token(key))                   # recovers on the next good fetch
+        clock.t += 1200
+        fetch.fail = True
+        with self.assertRaises(iap.IapError):
+            v.verify(token(key))
+        self.assertEqual(len(logs), 2)
 
     def test_first_fetch_failure_rejects(self):
         key = Key("k")
@@ -471,6 +552,102 @@ class HttpIapTest(unittest.TestCase):
         self.assertEqual(data.count(b"HTTP/1.1 "), 1)
         self.assertIn(b"401", data.split(b"\r\n", 1)[0])
 
+    def raw(self, request: bytes) -> bytes:
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(request)
+            data = b""
+            while chunk := sock.recv(65536):
+                data += chunk
+        return data
+
+    def assert_one_response(self, data: bytes, status: bytes):
+        self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        self.assertIn(status, data.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close", data)
+
+    def test_body_on_get_and_head_refused(self):
+        inner = b"GET /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: x\r\n\r\n"
+        for method in (b"GET", b"HEAD"):
+            req = (method + b" / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(inner)
+                   + inner)
+            self.assert_one_response(self.raw(req), b"400")
+            req = (method + b" / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                   b"0\r\n\r\n" + inner)
+            self.assert_one_response(self.raw(req), b"400")
+        # an unhandled method with a body: refused and closed by the stdlib
+        req = b"PUT /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(inner) + inner
+        self.assert_one_response(self.raw(req), b"501")
+
+    def test_get_without_body_keeps_working(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/nothing")
+        self.assertEqual(conn.getresponse().status, 404)
+        conn.close()
+
+    def test_bad_content_length_refused_without_hanging(self):
+        tok = token(self.key).encode()
+        for cl in (b"-1", b"abc", b"+5", b"1e3", b"%d" % (2 * 1024 * 1024), b"99999999999"):
+            req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
+                   + b"\r\nContent-Length: " + cl + b"\r\n\r\n{}")
+            self.assert_one_response(self.raw(req), b"400")
+        req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
+               + b"\r\nContent-Length: 2\r\nContent-Length: 40\r\n\r\n{}")
+        self.assert_one_response(self.raw(req), b"400")
+        req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: " + tok
+               + b"\r\nContent-Length: 50\r\n\r\n{}")      # short body: client closes
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(req)
+            sock.shutdown(socket.SHUT_WR)
+            data = sock.recv(65536)
+        self.assertIn(b"400", data.split(b"\r\n", 1)[0])
+
+    def test_deep_json_body_is_400(self):
+        body = b"[" * 100000 + b"]" * 100000
+        req = (b"POST /mcp HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: "
+               + token(self.key).encode() + b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        data = self.raw(req)
+        self.assert_one_response(data, b"400")
+        self.assertIn(b"parse error", data)
+        self.assertNotIn(b"Recursion", data)
+
+    def test_tool_fault_is_generic_500(self):
+        saved = self.hs.srv.handle_request
+
+        def boom(req):
+            raise RecursionError("secret detail")
+        self.hs.srv.handle_request = boom
+        try:
+            resp, data = self.post({iap.IAP_HEADER: token(self.key)})
+        finally:
+            self.hs.srv.handle_request = saved
+        self.assertEqual(resp.status, 500)
+        self.assertNotIn(b"secret", data)
+        self.assertNotIn(b"Recursion", data)
+
+    def test_config_fault_is_generic_500(self):
+        saved = self.hs._IAP_VERIFIER, self.hs.IAP_AUDIENCE
+        self.hs._IAP_VERIFIER, self.hs.IAP_AUDIENCE = None, ""
+        try:
+            resp, data = self.post({iap.IAP_HEADER: token(self.key)})
+        finally:
+            self.hs._IAP_VERIFIER, self.hs.IAP_AUDIENCE = saved
+        self.assertEqual(resp.status, 500)
+        self.assertEqual(json.loads(data), {"error": "server error"})
+
+    def test_recursion_in_verifier_is_401(self):
+        saved = self.hs._IAP_VERIFIER
+
+        class Deep:
+            def verify(self, assertion):
+                raise RecursionError("deep")
+        self.hs._IAP_VERIFIER = Deep()
+        try:
+            self.assert_401({iap.IAP_HEADER: token(self.key)})
+        finally:
+            self.hs._IAP_VERIFIER = saved
+
     def test_metadata_not_served(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("GET", "/.well-known/oauth-protected-resource")
@@ -496,6 +673,12 @@ class StartupTest(unittest.TestCase):
                                "IAP_JWKS_URL": "http://127.0.0.1:1/jwks"})
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("https", res.stderr)
+
+    def test_refuses_bad_max_stale(self):
+        res = self.run_server({"OAUTH_MODE": "iap", "IAP_AUDIENCE": AUD,
+                               "IAP_JWKS_MAX_STALE_SECS": "-5"})
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("IAP_JWKS_MAX_STALE_SECS", res.stderr)
 
     def test_refuses_unknown_mode(self):
         res = self.run_server({"OAUTH_MODE": "iapp"})

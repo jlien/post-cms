@@ -68,6 +68,8 @@ PORT = int(os.environ.get("PORT", "8791"))
 
 IAP_AUDIENCE = os.environ.get("IAP_AUDIENCE", "").strip()
 IAP_JWKS_URL = os.environ.get("IAP_JWKS_URL", "").strip() or iap.DEFAULT_JWKS_URL
+IAP_JWKS_MAX_STALE_SECS = os.environ.get("IAP_JWKS_MAX_STALE_SECS", "86400").strip()
+MAX_BODY_BYTES = 1024 * 1024  # largest JSON-RPC request body accepted
 
 _TOKEN_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_LOCK = threading.Lock()
@@ -191,6 +193,8 @@ def iap_config_error() -> str | None:
         return "OAUTH_MODE=iap requires IAP_AUDIENCE"
     if not IAP_JWKS_URL.startswith("https://"):
         return "IAP_JWKS_URL must be an https:// URL"
+    if not IAP_JWKS_MAX_STALE_SECS.isdigit():
+        return "IAP_JWKS_MAX_STALE_SECS must be a whole number of seconds"
     return None
 
 
@@ -201,20 +205,20 @@ def _iap_verifier():
             err = iap_config_error()
             if err:
                 raise RuntimeError(err)
-            _IAP_VERIFIER = iap.IapVerifier(IAP_AUDIENCE, iap.JwksCache(IAP_JWKS_URL))
+            _IAP_VERIFIER = iap.IapVerifier(IAP_AUDIENCE, iap.JwksCache(
+                IAP_JWKS_URL, max_stale=float(int(IAP_JWKS_MAX_STALE_SECS))))
         return _IAP_VERIFIER
 
 
 def validate_iap(assertion: str) -> dict:
     """Proxy assertion → principal (email lowercased, sub kept). Raises
     AuthError; the reason goes to the server log, never to the client."""
+    verifier = _iap_verifier()  # config errors (RuntimeError) stay server errors
     try:
-        return _iap_verifier().verify(assertion)
+        return verifier.verify(assertion)
     except iap.IapError as exc:
         raise AuthError(str(exc)) from exc
-    except RuntimeError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - any verifier fault fails closed
+    except Exception as exc:  # noqa: BLE001 - any verifier fault (RecursionError too) fails closed
         raise AuthError(f"verifier error: {type(exc).__name__}") from exc
 
 
@@ -244,14 +248,47 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
-        if self.command == "POST" and code >= 400:
-            # Refused before (or while) reading the body: close, so an
-            # unread body is never parsed as the next request on a reused
-            # connection (a proxy pools connections across clients).
+        if code >= 400:
+            # Any refusal may leave a body unread: close, so it is never
+            # parsed as the next request on a reused connection (a proxy
+            # pools connections across clients).
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
+
+    def _body_length(self) -> int | None:
+        """Declared body length, or None when the framing is unacceptable:
+        Transfer-Encoding (not supported), a Content-Length that is not a
+        plain non-negative integer, conflicting Content-Length headers, or
+        a body over MAX_BODY_BYTES."""
+        if self.headers.get_all("Transfer-Encoding"):
+            return None
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return 0
+        if len(set(v.strip() for v in values)) != 1:
+            return None
+        raw = values[0].strip()
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 10:
+            return None
+        length = int(raw)
+        return length if length <= MAX_BODY_BYTES else None
+
+    def _reject_body(self) -> bool:
+        """For methods that take no body (GET): refuse one with 400 and close
+        the connection, so it is never parsed as the next request."""
+        if self._body_length() == 0:
+            return False
+        if self.command == "HEAD":  # a HEAD response carries no body
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+        else:
+            self._json(400, {"error": "request body not allowed"})
+        return True
 
     def _auth(self) -> dict:
         if OAUTH_MODE == "iap":
@@ -262,12 +299,26 @@ class Handler(BaseHTTPRequestHandler):
         return validate_token(header[7:].strip())
 
     def do_GET(self):  # noqa: N802 (stdlib naming)
+        if self._reject_body():
+            return
         if self.path == "/.well-known/oauth-protected-resource" and OAUTH_MODE != "iap":
             self._json(200, protected_resource_metadata())
             return
         self._json(404, {"error": "not found"})
 
+    def do_HEAD(self):  # noqa: N802
+        if self._reject_body():
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):  # noqa: N802
+        length = self._body_length()
+        if length is None:
+            self._json(400, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32600, "message": "invalid request"}})
+            return
         if self.path != "/mcp":
             self._json(404, {"error": "not found"})
             return
@@ -282,14 +333,17 @@ class Handler(BaseHTTPRequestHandler):
                 "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"',
             })
             return
-        except RuntimeError as exc:
-            self._json(500, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - config or connector fault: no detail to the client
+            sys.stderr.write(f"auth: 500 ({type(exc).__name__}: {exc})\n")
+            self._json(500, {"error": "server error"})
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length).decode() or "null")
-        except (ValueError, json.JSONDecodeError):
+            body = self.rfile.read(length) if length else b""
+            if len(body) != length:
+                raise ValueError("short body")
+            req = iap.loads_bounded(body.decode() or "null")
+        except (ValueError, RecursionError):
             self._json(400, {"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32700, "message": "parse error"}})
             return
@@ -309,6 +363,11 @@ class Handler(BaseHTTPRequestHandler):
         token = ctx_token.set(ident)
         try:
             resp = srv.handle_request(req)
+        except Exception as exc:  # noqa: BLE001 - no traceback or detail to the client
+            sys.stderr.write(f"mcp: 500 ({type(exc).__name__}: {exc})\n")
+            self._json(500, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32603, "message": "internal error"}})
+            return
         finally:
             ctx_token.reset(token)
         if resp is None:
