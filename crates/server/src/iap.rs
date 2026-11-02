@@ -12,10 +12,11 @@
 //!   the future, each with [`LEEWAY_SECS`] of clock skew.
 //!
 //! The key set is fetched over HTTPS with a timeout and a size cap, cached for
-//! [`KEYS_TTL`], and refetched early when a token names an unknown `kid`. At
-//! most one fetch runs at a time and fetches are spaced by
-//! [`MIN_REFRESH_INTERVAL`], so a flood of forged `kid`s cannot hammer the
-//! key endpoint.
+//! [`KEYS_TTL`], used up to [`MAX_STALE`] longer while refreshes fail, and
+//! refetched early when a token names an unknown `kid`. At most one fetch
+//! runs at a time; unknown-`kid` refreshes and stale-set refreshes have
+//! separate budgets (see [`IapVerifier::key_for`]), so a flood of forged
+//! `kid`s can neither hammer the key endpoint nor delay a real refresh.
 //!
 //! Signature checks use `ring` (already in the tree through rustls), so this
 //! module adds no new crates.
@@ -42,8 +43,19 @@ pub const DEFAULT_JWKS_URL: &str = "https://www.gstatic.com/iap/verify/public_ke
 pub const LEEWAY_SECS: u64 = 30;
 /// How long a fetched key set is trusted before it is refetched.
 pub const KEYS_TTL: Duration = Duration::from_secs(3600);
-/// Minimum spacing between key fetches (unknown-`kid` refreshes included).
+/// Minimum spacing between key fetches of one kind: refreshes for an
+/// unknown `kid`, and retries after a failed refresh of a stale set.
 pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// How long past [`KEYS_TTL`] a key set is still used while every refresh
+/// fails. After that every token is refused (`IAP_JWKS_MAX_STALE_SECS`).
+pub const MAX_STALE: Duration = Duration::from_secs(24 * 3600);
+/// How long a `kid` missing from a freshly fetched set is remembered, so
+/// repeats of it do not use the refresh budget.
+pub const NEGATIVE_KID_TTL: Duration = Duration::from_secs(300);
+/// Cap on remembered missing `kid`s.
+pub const MAX_NEGATIVE_KIDS: usize = 4096;
+/// Largest NumericDate accepted (year 2286); anything larger is malformed.
+pub const MAX_NUMERIC_DATE: u64 = 9_999_999_999;
 /// Fetch timeout for the key set.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest key set body accepted. Google's is about 2 KB.
@@ -96,6 +108,8 @@ pub struct IapConfig {
     pub keys: KeySource,
     pub min_refresh: Duration,
     pub ttl: Duration,
+    /// How long past `ttl` the set is still used while refreshes fail.
+    pub max_stale: Duration,
 }
 
 impl IapConfig {
@@ -119,11 +133,19 @@ impl IapConfig {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_JWKS_URL.to_string());
         check_jwks_url(&url, allow_http)?;
+        let max_stale = match get("IAP_JWKS_MAX_STALE_SECS").map(|v| v.trim().to_string()) {
+            None => MAX_STALE,
+            Some(v) if v.is_empty() => MAX_STALE,
+            Some(v) => Duration::from_secs(v.parse::<u64>().map_err(|_| {
+                format!("IAP_JWKS_MAX_STALE_SECS {v:?} is not a whole number of seconds")
+            })?),
+        };
         Ok(Some(IapConfig {
             audience,
             keys: KeySource::Url { url, allow_http },
             min_refresh: MIN_REFRESH_INTERVAL,
             ttl: KEYS_TTL,
+            max_stale,
         }))
     }
 }
@@ -167,8 +189,17 @@ fn check_jwks_url(url: &str, allow_http: bool) -> Result<(), String> {
 
 struct KeyCache {
     keys: HashMap<String, Vec<u8>>,
+    /// Last successful fetch.
     fetched_at: Option<Instant>,
-    last_attempt: Option<Instant>,
+    /// Last refresh for a `kid` the fresh set did not hold. Its own budget, so
+    /// forged `kid`s never delay a refresh of a stale set.
+    last_kid_refresh: Option<Instant>,
+    /// Last refresh because the set was stale or missing.
+    last_stale_refresh: Option<Instant>,
+    /// `kid`s missing from the set fetched after they were first seen.
+    missing: HashMap<String, Instant>,
+    /// The past-the-cap warning was logged for the current set.
+    expired_logged: bool,
 }
 
 /// Verifies assertions against one audience with a cached key set.
@@ -190,9 +221,6 @@ struct Header {
 struct Claims {
     iss: Option<String>,
     aud: Option<serde_json::Value>,
-    exp: Option<serde_json::Value>,
-    iat: Option<serde_json::Value>,
-    nbf: Option<serde_json::Value>,
     email: Option<String>,
     sub: Option<String>,
 }
@@ -219,7 +247,14 @@ impl IapVerifier {
         };
         Ok(IapVerifier {
             cfg,
-            cache: Mutex::new(KeyCache { keys: HashMap::new(), fetched_at: None, last_attempt: None }),
+            cache: Mutex::new(KeyCache {
+                keys: HashMap::new(),
+                fetched_at: None,
+                last_kid_refresh: None,
+                last_stale_refresh: None,
+                missing: HashMap::new(),
+                expired_logged: false,
+            }),
             fetch_lock: tokio::sync::Mutex::new(()),
             client,
         })
@@ -256,7 +291,13 @@ impl IapVerifier {
         else {
             return Err(IapError::Malformed("not three segments"));
         };
-        let header: Header = decode_json(h64)?;
+        let raw_header: serde_json::Value = decode_json(h64)?;
+        // Any `crit` (even null or empty) is refused: no extensions are understood.
+        if raw_header.get("crit").is_some() {
+            return Err(IapError::Malformed("crit header"));
+        }
+        let header: Header =
+            serde_json::from_value(raw_header).map_err(|_| IapError::Malformed("segment json"))?;
         // Exactly ES256. Rejects "none", HS256 (key confusion) and anything else
         // before any key is looked up.
         if header.alg != "ES256" {
@@ -274,7 +315,12 @@ impl IapVerifier {
             .map_err(|_| IapError::BadSignature)?;
 
         // Claims are read only after the signature holds.
-        let c: Claims = decode_json(p64)?;
+        let raw: serde_json::Value = decode_json(p64)?;
+        // Time claims come from the raw object, so an explicit null is
+        // malformed rather than absent.
+        let time = |name: &str| raw.get(name).cloned();
+        let (exp, nbf, iat) = (time("exp"), time("nbf"), time("iat"));
+        let c: Claims = serde_json::from_value(raw).map_err(|_| IapError::Malformed("segment json"))?;
         if c.iss.as_deref() != Some(ISSUER) {
             return Err(IapError::WrongIssuer);
         }
@@ -288,16 +334,16 @@ impl IapVerifier {
         if !aud_ok {
             return Err(IapError::WrongAudience);
         }
-        let exp = numeric(&c.exp)?.ok_or(IapError::Malformed("missing exp"))?;
+        let exp = numeric(&exp)?.ok_or(IapError::Malformed("missing exp"))?;
         if now >= exp.saturating_add(LEEWAY_SECS) {
             return Err(IapError::Expired);
         }
-        if let Some(nbf) = numeric(&c.nbf)? {
+        if let Some(nbf) = numeric(&nbf)? {
             if nbf > now.saturating_add(LEEWAY_SECS) {
                 return Err(IapError::NotYetValid);
             }
         }
-        if let Some(iat) = numeric(&c.iat)? {
+        if let Some(iat) = numeric(&iat)? {
             if iat > now.saturating_add(LEEWAY_SECS) {
                 return Err(IapError::IssuedInFuture);
             }
@@ -308,47 +354,97 @@ impl IapVerifier {
 
     /// Public key bytes (uncompressed P-256 point) for `kid`, fetching the
     /// key set when it is stale or does not know `kid`, within the refresh
-    /// rate limit.
+    /// budgets:
+    /// - stale or missing set: one refresh as soon as it goes stale, then
+    ///   retries at most once per `min_refresh` while they fail;
+    /// - fresh set without `kid`: at most one refresh per `min_refresh`, and
+    ///   none for a `kid` the last refresh already showed missing.
     async fn key_for(&self, kid: &str) -> Option<Vec<u8>> {
-        if let Some(k) = self.cached(kid, true) {
+        if let Some(k) = self.lookup(kid, true) {
             return Some(k);
         }
         let _guard = self.fetch_lock.lock().await;
         // Another request may have fetched while this one waited.
-        if let Some(k) = self.cached(kid, true) {
+        if let Some(k) = self.lookup(kid, true) {
             return Some(k);
         }
-        if !self.may_fetch() {
-            return self.cached(kid, false);
+        if !self.claim_refresh(kid) {
+            return self.lookup(kid, false);
         }
         match self.fetch().await {
             Ok(keys) => {
                 let mut c = self.cache.lock().expect("iap cache poisoned");
+                let now = Instant::now();
                 c.keys = keys;
-                c.fetched_at = Some(Instant::now());
+                c.fetched_at = Some(now);
+                c.expired_logged = false;
+                c.missing.retain(|_, seen| seen.elapsed() < NEGATIVE_KID_TTL);
+                if !c.keys.contains_key(kid) {
+                    if c.missing.len() >= MAX_NEGATIVE_KIDS {
+                        c.missing.clear();
+                    }
+                    c.missing.insert(kid.to_string(), now);
+                }
             }
             Err(e) => eprintln!("iap: key fetch failed: {e}"),
         }
-        self.cached(kid, false)
+        self.lookup(kid, false)
     }
 
-    /// Cached key for `kid`; with `fresh_only`, only while the set is within its TTL.
-    fn cached(&self, kid: &str, fresh_only: bool) -> Option<Vec<u8>> {
-        let c = self.cache.lock().expect("iap cache poisoned");
-        let fresh = c.fetched_at.is_some_and(|t| t.elapsed() < self.cfg.ttl);
-        if fresh_only && !fresh {
+    /// Key for `kid`. `fresh_only`: only while the set is within its TTL;
+    /// otherwise also while stale, up to `max_stale` past the TTL. Past that
+    /// cap nothing verifies and the server logs it once per set.
+    fn lookup(&self, kid: &str, fresh_only: bool) -> Option<Vec<u8>> {
+        let mut c = self.cache.lock().expect("iap cache poisoned");
+        let age = c.fetched_at?.elapsed();
+        if age < self.cfg.ttl {
+            return c.keys.get(kid).cloned();
+        }
+        if fresh_only {
+            return None;
+        }
+        if age >= self.cfg.ttl.saturating_add(self.cfg.max_stale) {
+            if !c.expired_logged {
+                c.expired_logged = true;
+                eprintln!(
+                    "error: iap: the IAP key set is {}s old and every refresh failed; \
+                     refusing all preview tokens until a refresh succeeds",
+                    age.as_secs()
+                );
+            }
             return None;
         }
         c.keys.get(kid).cloned()
     }
 
-    /// Claim a fetch slot: true at most once per `min_refresh`.
-    fn may_fetch(&self) -> bool {
+    /// Claim a refresh for `kid` under the budget that applies (see
+    /// [`Self::key_for`]); records the attempt when granted.
+    fn claim_refresh(&self, kid: &str) -> bool {
         let mut c = self.cache.lock().expect("iap cache poisoned");
-        if c.last_attempt.is_some_and(|t| t.elapsed() < self.cfg.min_refresh) {
+        let now = Instant::now();
+        let fresh = c.fetched_at.is_some_and(|t| t.elapsed() < self.cfg.ttl);
+        let within = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < self.cfg.min_refresh);
+        if fresh {
+            if c.missing.get(kid).is_some_and(|seen| seen.elapsed() < NEGATIVE_KID_TTL) {
+                return false;
+            }
+            if within(c.last_kid_refresh) {
+                return false;
+            }
+            c.last_kid_refresh = Some(now);
+            return true;
+        }
+        // Stale or never fetched: the first attempt since the last success
+        // always runs; failed retries are spaced by min_refresh.
+        let first_since_success = match (c.last_stale_refresh, c.fetched_at) {
+            (None, _) => true,
+            (Some(a), Some(f)) => a < f,
+            (Some(_), None) => false,
+        };
+        if !first_since_success && within(c.last_stale_refresh) {
             return false;
         }
-        c.last_attempt = Some(Instant::now());
+        c.last_stale_refresh = Some(now);
         true
     }
 
@@ -420,13 +516,15 @@ fn decode_json<T: serde::de::DeserializeOwned>(seg: &str) -> Result<T, IapError>
     serde_json::from_slice(&raw).map_err(|_| IapError::Malformed("segment json"))
 }
 
-/// A NumericDate claim: a non-negative integer (a fraction is truncated).
+/// A NumericDate claim: an integer from 1 to [`MAX_NUMERIC_DATE`]. Floats
+/// (including `1e300` and `1800000000.0`), strings, negatives and null are
+/// malformed. Absent is `None`.
 fn numeric(v: &Option<serde_json::Value>) -> Result<Option<u64>, IapError> {
     match v {
-        None | Some(serde_json::Value::Null) => Ok(None),
+        None => Ok(None),
         Some(serde_json::Value::Number(n)) => n
             .as_u64()
-            .or_else(|| n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
+            .filter(|t| (1..=MAX_NUMERIC_DATE).contains(t))
             .map(Some)
             .ok_or(IapError::Malformed("bad time claim")),
         Some(_) => Err(IapError::Malformed("bad time claim")),
@@ -584,6 +682,7 @@ mod tests {
             keys: KeySource::Fixed(fetch),
             min_refresh,
             ttl: KEYS_TTL,
+            max_stale: MAX_STALE,
         };
         (IapVerifier::new(cfg).unwrap(), count)
     }
@@ -755,7 +854,8 @@ mod tests {
         for t in tasks {
             assert_eq!(t.await.unwrap(), Err(IapError::UnknownKey));
         }
-        assert_eq!(n.load(Ordering::SeqCst), 1, "rate limit blocks refetches");
+        // The first forged kid spends the one unknown-kid refresh; the rest wait.
+        assert_eq!(n.load(Ordering::SeqCst), 2, "rate limit blocks refetches");
         // The known key still verifies from cache.
         assert!(v.verify_at(&k1.token(&claims()), NOW).await.is_ok());
     }
@@ -772,6 +872,7 @@ mod tests {
             })),
             min_refresh: Duration::from_secs(3600),
             ttl: KEYS_TTL,
+            max_stale: MAX_STALE,
         };
         let v = IapVerifier::new(cfg).unwrap();
         let k = TestKey::new("k1");
@@ -779,6 +880,120 @@ mod tests {
             assert_eq!(v.verify_at(&k.token(&claims()), NOW).await, Err(IapError::UnknownKey));
         }
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A verifier with explicit timings over a fetch that can be switched off.
+    fn timed_verifier(
+        body: Arc<Mutex<Vec<u8>>>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+        min_refresh: Duration,
+        ttl: Duration,
+        max_stale: Duration,
+    ) -> (IapVerifier, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let fetch = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            if failing.load(Ordering::SeqCst) {
+                return Err("offline".to_string());
+            }
+            Ok(body.lock().unwrap().clone())
+        });
+        let cfg = IapConfig { audience: AUD.into(), keys: KeySource::Fixed(fetch), min_refresh, ttl, max_stale };
+        (IapVerifier::new(cfg).unwrap(), count)
+    }
+
+    /// Stale keys are used only up to max_stale past the TTL while refreshes
+    /// fail; then every token is refused until a refresh succeeds.
+    #[tokio::test]
+    async fn stale_keys_have_an_upper_bound() {
+        let k = TestKey::new("k1");
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (v, n) = timed_verifier(
+            Arc::new(Mutex::new(jwks(&[&k]))),
+            failing.clone(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        v.verify_at(&k.token(&claims()), NOW).await.unwrap();
+        failing.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Stale, refresh fails, still inside the cap: the cached key serves.
+        assert!(v.verify_at(&k.token(&claims()), NOW).await.is_ok());
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Past ttl + max_stale: refused.
+        assert_eq!(v.verify_at(&k.token(&claims()), NOW).await, Err(IapError::UnknownKey));
+        // A successful refresh brings it back.
+        failing.store(false, Ordering::SeqCst);
+        assert!(v.verify_at(&k.token(&claims()), NOW).await.is_ok());
+    }
+
+    /// Forged kids spend only the unknown-kid budget: once the set goes
+    /// stale, a rotated-in key still refreshes at once.
+    #[tokio::test]
+    async fn forged_kids_cannot_block_the_stale_refresh() {
+        let k1 = TestKey::new("k1");
+        let k2 = TestKey::new("k2");
+        let body = Arc::new(Mutex::new(jwks(&[&k1])));
+        let (v, n) = timed_verifier(
+            body.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Duration::from_secs(3600),
+            Duration::from_millis(150),
+            MAX_STALE,
+        );
+        v.verify_at(&k1.token(&claims()), NOW).await.unwrap();
+        for i in 0..20 {
+            let t = TestKey::new(&format!("forged-{i}")).token(&claims());
+            assert_eq!(v.verify_at(&t, NOW).await, Err(IapError::UnknownKey));
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+        *body.lock().unwrap() = jwks(&[&k1, &k2]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(v.verify_at(&k2.token(&claims()), NOW).await.is_ok());
+        assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    /// A kid the last refresh showed missing does not spend the budget again.
+    #[tokio::test]
+    async fn missing_kid_is_remembered() {
+        let k1 = TestKey::new("k1");
+        let (v, n) = verifier_with(Arc::new(Mutex::new(jwks(&[&k1]))), Duration::ZERO);
+        v.verify_at(&k1.token(&claims()), NOW).await.unwrap();
+        let forged = TestKey::new("forged").token(&claims());
+        for _ in 0..10 {
+            assert_eq!(v.verify_at(&forged, NOW).await, Err(IapError::UnknownKey));
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 2, "one refresh for the forged kid, then remembered");
+    }
+
+    #[tokio::test]
+    async fn crit_header_is_refused() {
+        let (k, v, _) = one_key();
+        for crit in [json!(["exp"]), json!([]), json!("b64"), json!(null)] {
+            let t = k.sign(&json!({"alg": "ES256", "kid": "k1", "crit": crit}), &claims());
+            assert_eq!(v.verify_at(&t, NOW).await, Err(IapError::Malformed("crit header")), "{crit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn time_claims_must_be_sane_integers() {
+        let (k, v, _) = one_key();
+        let bad = [json!(1e300), json!(1_800_000_600.0), json!(1.5), json!("1800000600"), json!(-1),
+            json!(0), json!(MAX_NUMERIC_DATE + 1), json!(u64::MAX), json!(null), json!(true)];
+        for claim in ["exp", "nbf", "iat"] {
+            for value in &bad {
+                let mut c = claims();
+                c[claim] = value.clone();
+                assert_eq!(
+                    v.verify_at(&k.token(&c), NOW).await,
+                    Err(IapError::Malformed("bad time claim")),
+                    "{claim}={value}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -886,5 +1101,11 @@ mod tests {
             .is_err());
         assert!(IapConfig::from_env(env(&[("IAP_AUDIENCE", AUD), ("IAP_JWKS_URL", "file:///etc/passwd")]))
             .is_err());
+        assert_eq!(c.max_stale, MAX_STALE);
+        let c = IapConfig::from_env(env(&[("IAP_AUDIENCE", AUD), ("IAP_JWKS_MAX_STALE_SECS", "600")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.max_stale, Duration::from_secs(600));
+        assert!(IapConfig::from_env(env(&[("IAP_AUDIENCE", AUD), ("IAP_JWKS_MAX_STALE_SECS", "1d")])).is_err());
     }
 }

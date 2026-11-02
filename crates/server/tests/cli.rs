@@ -613,6 +613,42 @@ mod iap_e2e {
         assert!(!has_header(&r, "cache-control: private, no-store"), "{r}");
     }
 
+    /// Every /preview response carries the draft headers, including the
+    /// router's 405 for other methods; public paths are unchanged.
+    #[test]
+    fn other_methods_on_preview_keep_the_draft_headers() {
+        let site = preview_site("iap-methods");
+        let k = key();
+        let (url, _hits) = jwks_server(jwks("k1", &k));
+        let mut cmd = server();
+        cmd.env("IAP_AUDIENCE", AUD).env("IAP_JWKS_URL", &url).env("IAP_JWKS_ALLOW_HTTP", "1");
+        let (_srv, addr, _lines, _rest) = start_cmd(cmd, site.path());
+        let t = token("k1", &k);
+        for method in ["POST", "OPTIONS", "PUT", "DELETE"] {
+            for path in ["/preview/drafts/", "/preview"] {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+                write!(
+                    s,
+                    "{method} {path} HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: {t}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut r = String::new();
+                s.read_to_string(&mut r).unwrap();
+                assert!(!r.starts_with("HTTP/1.1 2"), "{method} {path}: {r}");
+                assert!(has_header(&r, "cache-control: private, no-store"), "{method} {path}: {r}");
+                assert!(has_header(&r, "x-robots-tag: noindex, nofollow"), "{method} {path}: {r}");
+                assert!(!r.contains("secret draft"));
+            }
+        }
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "POST /about/ HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        assert!(!r.to_ascii_lowercase().contains("x-robots-tag"), "{r}");
+    }
+
     #[test]
     fn unset_audience_warns_once_and_serves_no_preview() {
         let site = preview_site("iap-off");

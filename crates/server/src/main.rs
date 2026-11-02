@@ -252,6 +252,9 @@ fn main() -> anyhow::Result<()> {
         .route("/mcp", axum::routing::post(mcp_endpoint))
         // Everything else (pages, posts, feeds) is a file under dist/.
         .fallback(get(serve_path))
+        // Draft headers on every /preview response, including the 405 the
+        // router sends for POST or OPTIONS.
+        .layer(axum::middleware::from_fn(preview_response_headers))
         .with_state(state);
 
     let addr = SocketAddr::new(host, port);
@@ -963,6 +966,18 @@ fn preview_headers(mut resp: Response) -> Response {
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(PREVIEW_CACHE_CONTROL));
     h.insert(HeaderName::from_static("x-robots-tag"), HeaderValue::from_static(PREVIEW_ROBOTS));
     resp
+}
+
+/// Router layer: any response to a /preview path gets the draft headers,
+/// whatever produced it (method errors included).
+async fn preview_response_headers(req: Request, next: axum::middleware::Next) -> Response {
+    let preview = is_preview_path(req.uri().path());
+    let resp = next.run(req).await;
+    if preview {
+        preview_headers(resp)
+    } else {
+        resp
+    }
 }
 
 /// /preview/: served only after the IAP assertion verifies against `v`.
@@ -1921,6 +1936,7 @@ headers:
             keys: iap::KeySource::Fixed(std::sync::Arc::new(move || Ok(body.clone()))),
             min_refresh: std::time::Duration::ZERO,
             ttl: iap::KEYS_TTL,
+            max_stale: iap::MAX_STALE,
         })
         .unwrap()
     }
