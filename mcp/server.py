@@ -19,7 +19,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -220,6 +219,9 @@ TOOLS = [
                 "slug": {"type": "string", "description": "Slug of the proposed item (or use slugs for a batch)."},
                 "slugs": {"type": "array", "items": {"type": "string"},
                           "description": "Batch of low-risk proposals to approve in one action (one build+deploy)."},
+                "reviewed_head": {"type": "string", "description": "Required: the head sha you reviewed (list_proposals `head`). The merge is pinned to it and refused if the proposal moved."},
+                "reviewed_heads": {"type": "object", "additionalProperties": {"type": "string"},
+                                   "description": "For a batch: {slug: reviewed head sha} for every slug."},
                 "approver_name": {"type": "string", "description": "Optional; must match the gh session identity."},
                 "approver_email": {"type": "string", "description": "Optional; must match the gh session identity."},
                 "deploy": {"type": "boolean", "description": "Build+deploy+purge after merge (default true)."},
@@ -471,28 +473,79 @@ def _forge_ok(fn, *args, **kwargs) -> bool:
         return False
 
 
-# ---- change ledger: the id and head the server created --------------------
+# ---- change records: the id and head the server created -------------------
 #
 # Every change this server opens (or revises) is recorded as branch -> {id,
 # head}: the PR/MR number the forge returned and the commit the server
 # pushed. Merges go to that id, pinned to that head, never to whatever a
-# branch-name lookup or the forge reports now. Kept in the git dir, never in
-# the tree. E54's approval ledger can take over these two functions.
-
-_LEDGER_LOCK = threading.Lock()
-
-
-def _ledger_path() -> Path:
-    res = _git("rev-parse", "--git-common-dir")
-    d = Path(res.stdout.strip() or ".git")
-    if not d.is_absolute():
-        d = ROOT / d
-    return d / "pcms-changes.json"
+# branch-name lookup or the forge reports now.
+#
+# Location: $PCMS_STATE_DIR/changes.json (default <repo>/.tenants/.state,
+# gitignored), the same state dir as the proposals ledger. The dir must be
+# a real directory owned by the server user, mode 0700; PCMS_STATE_DIR must
+# be absolute and outside the repo, and is required over HTTP. Writes take
+# an flock on changes.lock (across processes) and replace the file
+# atomically through an O_EXCL|O_NOFOLLOW temp file.
 
 
-def _ledger_load(path: Path) -> dict[str, Any]:
+def _state_dir(create: bool) -> Path | None:
+    """The server state dir; None when missing and not `create`."""
+    import stat as st_mod
+    base = os.environ.get("PCMS_STATE_DIR")
+    if base:
+        d = Path(base)
+        if not d.is_absolute():
+            raise ValueError("PCMS_STATE_DIR must be an absolute path")
+        if d.resolve() == ROOT.resolve() or ROOT.resolve() in d.resolve().parents:
+            raise ValueError("PCMS_STATE_DIR must be outside the repository")
+    elif os.environ.get("PCMS_TRANSPORT") == "http":
+        raise ValueError("PCMS_STATE_DIR is required over HTTP (an absolute "
+                         "path outside the repository, mode 0700)")
+    else:
+        d = ROOT / ".tenants" / ".state"
     try:
-        data = json.loads(path.read_text())
+        st = os.lstat(d)
+    except FileNotFoundError:
+        if not create:
+            return None
+        d.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(d, 0o700)
+        st = os.lstat(d)
+    if st_mod.S_ISLNK(st.st_mode) or not st_mod.S_ISDIR(st.st_mode):
+        raise ValueError(f"state dir {d} is not a real directory")
+    if st.st_uid != os.getuid():
+        raise ValueError(f"state dir {d} is not owned by the server user")
+    if st.st_mode & 0o077:
+        raise ValueError(f"state dir {d} must be mode 0700 (is {oct(st.st_mode & 0o777)})")
+    return d
+
+
+class _ChangesLock:
+    """flock on <state>/changes.lock: shared to read, exclusive to write."""
+
+    def __init__(self, d: Path, exclusive: bool) -> None:
+        self.path = d / "changes.lock"
+        self.exclusive = exclusive
+        self.fd = -1
+
+    def __enter__(self) -> "_ChangesLock":
+        import fcntl
+        self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        os.close(self.fd)  # closing the fd releases the lock
+
+
+def _changes_load(path: Path) -> dict[str, Any]:
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -502,25 +555,42 @@ def _record_change(branch: str, change_id: int, head: str) -> None:
     if not isinstance(change_id, int) or not re.fullmatch(r"[0-9a-f]{40,64}", head or ""):
         return
     forge_name = (os.environ.get("FORGE") or "github").strip().lower()
-    with _LEDGER_LOCK:
-        path = _ledger_path()
-        data = _ledger_load(path)
+    d = _state_dir(create=True)
+    assert d is not None
+    with _ChangesLock(d, exclusive=True):
+        path = d / "changes.json"
+        data = _changes_load(path)
         data.setdefault(forge_name, {})[branch] = {"id": change_id, "head": head}
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        tmp = d / f"changes.json.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 def _recorded_change(branch: str) -> dict[str, Any] | None:
     """{id, head} the server recorded for `branch`, or None."""
     forge_name = (os.environ.get("FORGE") or "github").strip().lower()
-    with _LEDGER_LOCK:
-        rec = _ledger_load(_ledger_path()).get(forge_name, {}).get(branch)
+    d = _state_dir(create=False)
+    if d is None:
+        return None
+    with _ChangesLock(d, exclusive=False):
+        rec = _changes_load(d / "changes.json").get(forge_name, {}).get(branch)
     if isinstance(rec, dict) and isinstance(rec.get("id"), int) and \
             isinstance(rec.get("head"), str):
         return rec
     return None
+
+
+def _recorded_head(branch: str) -> str | None:
+    rec = _recorded_change(branch)
+    return rec["head"] if rec else None
 
 
 def _change_id_from(ch: forge_mod.Change) -> int | None:
@@ -530,17 +600,21 @@ def _change_id_from(ch: forge_mod.Change) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _merge_recorded(f: forge_mod.Forge, branch: str, *, cwd: Path | None = None,
-                    reviewed_head: str | None = None) -> forge_mod.Change:
+def _merge_recorded(f: forge_mod.Forge, branch: str, *, reviewed_head: str,
+                    cwd: Path | None = None) -> forge_mod.Change:
     """Merge the change the server recorded for `branch`, pinned to the
-    head it recorded. A caller-supplied reviewed head must equal it."""
+    head it recorded, which must equal the head the approver reviewed."""
     rec = _recorded_change(branch)
     if rec is None:
         raise forge_mod.ForgeError(
             f"no change recorded by this server for {branch}: it was not opened or "
             "revised here, so there is no reviewed head to pin a merge to. Run "
             "revise_proposal to record one, review it, then approve.")
-    if reviewed_head and reviewed_head != rec["head"]:
+    if not reviewed_head:
+        raise forge_mod.ForgeError(
+            f"{branch}: reviewed_head is required: pass the head sha shown by "
+            "list_proposals or the proposal result")
+    if reviewed_head != rec["head"]:
         raise forge_mod.ForgeError(
             f"{branch}: the reviewed head {reviewed_head[:12]} is not the head this "
             f"server recorded ({rec['head'][:12]}); refusing to merge", 409)
@@ -556,7 +630,9 @@ def _merge_now(branch: str, wt: Path, note: str, deploy_note: str,
     result["approval_recorded"] = _forge_ok(
         f.comment, rec["id"] if rec else branch, note, cwd=wt)
     try:
-        _merge_recorded(f, branch, cwd=wt)
+        # merge=true: the head under review is the one this same call just
+        # created and pushed (no window for anyone else's commit).
+        _merge_recorded(f, branch, reviewed_head=rec["head"] if rec else "", cwd=wt)
     except forge_mod.ForgeError as e:
         result["merged"] = False
         result["merge_error"] = str(e)[:300]
@@ -716,6 +792,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
             "existed": existed,
             "tenant": tenant or None,
             "pr_url": pr_or_err if ok else None,
+            "head": _recorded_head(branch) if ok else None,
             "preview_command": preview_cmd,
         }
         if ok:
@@ -942,6 +1019,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             "tenant": tenant or None,
             "summary": summary,
             "pr_url": pr_or_err if ok else None,
+            "head": _recorded_head(branch) if ok else None,
             "preview_command": preview_cmd,
         }
         if ok:
@@ -1209,6 +1287,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             "risk": "tracking",
             "tenant": tenant or None,
             "pr_url": pr_or_err if ok else None,
+            "head": _recorded_head(branch) if ok else None,
         }
         if ok and rendered_artifact:
             # The rendered page (plugin injected at its mount) travels in the
@@ -1324,6 +1403,13 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
     collection = (args.get("collection") or "posts").strip()
     if "/" in collection or ".." in collection:
         raise ValueError("invalid collection")
+    # Only a change this server opened can be revised, and only from the
+    # head it recorded: never adopt a branch (or commits) from elsewhere.
+    rec = _recorded_change(branch)
+    if rec is None:
+        raise ValueError(
+            f"{branch} has no change recorded by this server, so it cannot be "
+            "revised here; open a new proposal with propose_change")
 
     tmp = ROOT / ".tenants" / f"revise-{slug}-{int(time.time() * 1000)}"
     tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -1333,7 +1419,14 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
                 f"+refs/heads/{branch}:refs/remotes/origin/{branch}", worktree=ROOT)
     if fres.returncode != 0:
         raise ValueError(f"git fetch failed: {fres.stderr.strip()[:300]}")
-    res = _git("worktree", "add", "--detach", str(tmp), f"origin/{branch}")
+    tip = _git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}^{{commit}}")
+    if tip.returncode != 0 or tip.stdout.strip() != rec["head"]:
+        raise ValueError(
+            f"{branch} moved outside the server: origin is at "
+            f"{(tip.stdout.strip() or '?')[:12]}, the server recorded "
+            f"{rec['head'][:12]}. Refusing to revise on top of commits it did not "
+            "make; open a new proposal instead.")
+    res = _git("worktree", "add", "--detach", str(tmp), rec["head"])
     if res.returncode != 0:
         raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
     try:
@@ -1363,19 +1456,21 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         if res.returncode != 0 and "nothing to commit" not in (res.stdout + res.stderr):
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
         committed = res.returncode == 0
-        push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
-        if push.returncode != 0:
-            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+        head = rec["head"]
         if committed:
-            # The new head is the one the server created: record it as the
-            # head to pin approval to. A revise with nothing to commit keeps
-            # the old record (it never adopts a head someone else pushed).
-            rec = _recorded_change(branch)
-            change_id = rec["id"] if rec else _open_change_id(_forge(), branch)
+            # Lease on the recorded head: a push that landed since the check
+            # makes this push fail instead of being built upon.
+            push = _git("push", f"--force-with-lease=refs/heads/{branch}:{rec['head']}",
+                        "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
+            if push.returncode != 0:
+                raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
             pushed = _git("rev-parse", "HEAD", worktree=tmp)
-            if change_id is not None and pushed.returncode == 0:
-                _record_change(branch, change_id, pushed.stdout.strip())
-        return {"revised": True, "branch": branch,
+            if pushed.returncode != 0:
+                raise ValueError("could not read the revised head")
+            head = pushed.stdout.strip()
+            # The new head is the one the server created: approval pins to it.
+            _record_change(branch, rec["id"], head)
+        return {"revised": committed, "branch": branch, "head": head,
                 "pr_url": _open_pr_for_branch(branch),
                 "preview_artifact": _artifact_payload(
                     _render_preview_artifact(tmp, collection, slug)),
@@ -1412,6 +1507,12 @@ def tool_list_proposals(args: dict[str, Any]) -> dict[str, Any]:
         body = p.body
         m = re.search(r"^risk:\s*(\S+)", body, re.MULTILINE)
         entry["risk"] = m.group(1) if m else "unknown"
+        rec = _recorded_change(head)
+        # The head to review and pass as approve_proposal(reviewed_head=...);
+        # None when this server did not open the change (not approvable here).
+        entry["head"] = rec["head"] if rec and rec["id"] == p.id else None
+        entry["forge_head"] = p.head_sha
+        entry["moved"] = bool(entry["head"] and p.head_sha and p.head_sha != entry["head"])
         entry["field_diff"] = _proposal_field_diff(head)
         proposals.append(entry)
     result: dict[str, Any] = {"proposals": proposals, "count": len(proposals)}
@@ -1638,7 +1739,7 @@ def _approve_one(slug: str, approver_name: str, approver_email: str,
         f"Approved by {approver_name} <{approver_email}> via approve_proposal "
         f"[identity: {identity_source}]")
     try:
-        _merge_recorded(f, branch, reviewed_head=head)
+        _merge_recorded(f, branch, reviewed_head=head or "")
     except forge_mod.ForgeError as e:
         raise ValueError(f"merge failed for {slug}: {str(e)[:300]}")
     out["merged"] = True
@@ -1653,6 +1754,26 @@ def _open_change_id(f: forge_mod.Forge, branch: str) -> int | None:
     except forge_mod.ForgeError:
         return None
     return ch.id if ch else None
+
+
+def _reviewed_heads(args: dict[str, Any], slugs: list[str]) -> dict[str, str]:
+    """The head sha the approver reviewed, per slug: `reviewed_head` for a
+    single slug, `reviewed_heads` {slug: sha} for a batch. Every slug needs
+    one; it must equal the head the server recorded (checked at merge)."""
+    heads: dict[str, str] = {}
+    many = args.get("reviewed_heads")
+    if many is not None and not isinstance(many, dict):
+        raise ValueError("reviewed_heads must be an object {slug: head sha}")
+    one = (args.get("reviewed_head") or "").strip()
+    for s in slugs:
+        h = str((many or {}).get(s) or (one if len(slugs) == 1 else "")).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", h):
+            raise ValueError(
+                f"reviewed_head is required for {s!r}: the full head sha shown by "
+                "list_proposals (or the propose/revise result) that you reviewed; "
+                "approval merges exactly that commit")
+        heads[s] = h
+    return heads
 
 
 def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
@@ -1686,6 +1807,7 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(slugs, list) or not all(isinstance(s, str) and s.strip() for s in slugs):
         raise ValueError("slugs must be a list of proposal slugs")
     slugs = [s.strip() for s in slugs]
+    reviewed = _reviewed_heads(args, slugs)
     if distinct:
         # Multi-human deployments: an approver cannot approve their own
         # proposal. Off by default on this single-identity machine (every
@@ -1707,7 +1829,8 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     try:
         for s in slugs:
-            merged.append(_approve_one(s, approver_name, approver_email, identity_source))
+            merged.append(_approve_one(s, approver_name, approver_email, identity_source,
+                                       reviewed[s]))
     finally:
         result["approved"] = merged
         result["count"] = len(merged)
@@ -1875,7 +1998,7 @@ def _revert_via_mr(f: forge_mod.Forge, slug: str, approver_name: str,
         out["deploy"] = "skipped (revert merge request open, not merged)"
         return out
     try:
-        merged = _merge_recorded(f, rev.branch)
+        merged = _merge_recorded(f, rev.branch, reviewed_head=rev.head_sha)
     except forge_mod.ForgeError as e:
         raise ValueError(f"revert merge request {rev.url or rev.id} is open but was "
                          f"not merged: {e}")

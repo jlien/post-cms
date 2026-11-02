@@ -682,7 +682,8 @@ REPO = {("gh", "repo", "view"): (0, json.dumps({"name": "site", "owner": {"login
 
 def pr_json(number: int, head: str, **override) -> dict:
     p = {"number": number, "url": f"https://github.com/acme/site/pull/{number}",
-         "headRefName": "agent/a", "headRefOid": head, "state": "OPEN",
+         "headRefName": "agent/a", "headRefOid": head, "baseRefName": "main",
+         "state": "OPEN",
          "isCrossRepository": False, "headRepository": {"name": "site"},
          "headRepositoryOwner": {"login": "acme"}}
     p.update(override)
@@ -795,7 +796,7 @@ class GitHubForgeTest(unittest.TestCase):
         self.assertEqual([r.id for r in rows], [5])  # the fork PR is dropped
         self.assertEqual(fake.calls[-1], [
             "gh", "pr", "list", "--state", "open", "--json",
-            "number,title,headRefName,url,author,createdAt,body,isCrossRepository"])
+            "number,title,headRefName,headRefOid,url,author,createdAt,body,isCrossRepository"])
 
     def test_server_defaults_to_github_and_reject_uses_gh(self):
         fake = FakeGh({("gh", "pr", "list", "--head"): (0, json.dumps([pr_json(8, SHA(3))])),
@@ -817,7 +818,7 @@ class GitHubForgeTest(unittest.TestCase):
         with self.run_with(fake), \
                 mock.patch.object(srv, "_recorded_change", return_value=rec), \
                 mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
-            out = srv._approve_one("a", "Bob", "bob@example.com", "test")
+            out = srv._approve_one("a", "Bob", "bob@example.com", "test", SHA(3))
         self.assertTrue(out["merged"])
         self.assertEqual(fake.calls[-1], ["gh", "pr", "merge", "8", "--merge",
                                           "--delete-branch", "--match-head-commit", SHA(3)])
@@ -835,11 +836,11 @@ def _no_gh(cmd, *a, **kw):
 class ServerGitLabModeTest(_StubCase):
     def setUp(self) -> None:
         super().setUp()
-        ledger = Path(tempfile.mkdtemp(prefix="pcms-ledger-")) / "pcms-changes.json"
-        self.addCleanup(shutil.rmtree, ledger.parent, True)
+        self.state = Path(tempfile.mkdtemp(prefix="pcms-state-"))
+        self.addCleanup(shutil.rmtree, self.state, True)
         for p in (mock.patch.object(subprocess, "run", _no_gh),
+                  mock.patch.dict(os.environ, {"PCMS_STATE_DIR": str(self.state)}),
                   mock.patch.object(srv, "_GH_IDENTITY_CACHE", None),
-                  mock.patch.object(srv, "_ledger_path", return_value=ledger),
                   mock.patch.object(srv, "_proposal_field_diff", return_value=[])):
             p.start()
             self.addCleanup(p.stop)
@@ -853,7 +854,7 @@ class ServerGitLabModeTest(_StubCase):
         mr = self.stub.add_mr(3, "agent/a")
         srv._record_change("agent/a", 3, mr["sha"])
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
-            out = srv._approve_one("a", "Bob", "bob@example.com", "test")
+            out = srv._approve_one("a", "Bob", "bob@example.com", "test", mr["sha"])
         self.assertEqual((out["pr"], out["merged"], out["approval_recorded"]), (3, True, True))
         self.assertEqual(self.stub.mrs[3]["state"], "merged")
         self.assertIn("Approved by Bob", self.stub.notes[3][0]["body"])
@@ -864,17 +865,18 @@ class ServerGitLabModeTest(_StubCase):
         self.stub.add_mr(3, "agent/a")
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
                 self.assertRaises(ValueError) as cm:
-            srv._approve_one("a", "Bob", "bob@example.com", "test")
+            srv._approve_one("a", "Bob", "bob@example.com", "test", SHA(3))
         self.assertIn("no change recorded", str(cm.exception))
         self.assertEqual(self.stub.mrs[3]["state"], "opened")
 
     def test_approve_refuses_when_mr_head_moved_since_record(self):
         mr = self.stub.add_mr(3, "agent/a")
         srv._record_change("agent/a", 3, mr["sha"])
+        reviewed = mr["sha"]
         mr["sha"] = SHA(77)  # someone pushed after the server's head
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
                 self.assertRaises(ValueError) as cm:
-            srv._approve_one("a", "Bob", "bob@example.com", "test")
+            srv._approve_one("a", "Bob", "bob@example.com", "test", reviewed)
         self.assertIn("head moved", str(cm.exception))
         self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
 
@@ -891,7 +893,7 @@ class ServerGitLabModeTest(_StubCase):
         srv._record_change("agent/a", 9, fork["sha"])
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
                 self.assertRaises(ValueError) as cm:
-            srv._approve_one("a", "Bob", "bob@example.com", "test")
+            srv._approve_one("a", "Bob", "bob@example.com", "test", fork["sha"])
         self.assertIn("fork", str(cm.exception))
         self.assertEqual(self.stub.mrs[9]["state"], "opened")
 
@@ -983,10 +985,219 @@ class ServerGitLabModeTest(_StubCase):
         for r in self.stub.requests:
             self.assertNotIn("alice.private@example.com", r["body"])
 
+    # -- round 3: reviewed head bound to the merge
+
+    def test_approve_proposal_requires_reviewed_head_from_list(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
+            for bad in ({}, {"reviewed_head": SHA(55)}, {"reviewed_head": mr["sha"][:12]}):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    srv.tool_approve_proposal({"slug": "a", "deploy": False, **bad})
+            self.assertEqual(self.stub.mrs[3]["state"], "opened")
+            listed = srv.tool_list_proposals({})["proposals"][0]
+            self.assertEqual((listed["head"], listed["moved"]), (mr["sha"], False))
+            out = srv.tool_approve_proposal({"slug": "a", "deploy": False,
+                                             "reviewed_head": listed["head"]})
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(self.stub.mrs[3]["state"], "merged")
+
+    def test_batch_needs_a_head_per_slug(self):
+        a = self.stub.add_mr(3, "agent/a")
+        b = self.stub.add_mr(4, "agent/b")
+        srv._record_change("agent/a", 3, a["sha"])
+        srv._record_change("agent/b", 4, b["sha"])
+        with mock.patch.object(srv, "_proposal_branch", side_effect=lambda s: f"agent/{s}"):
+            with self.assertRaises(ValueError):
+                srv.tool_approve_proposal({"slugs": ["a", "b"], "deploy": False,
+                                           "reviewed_head": a["sha"]})
+            out = srv.tool_approve_proposal({"slugs": ["a", "b"], "deploy": False,
+                                             "reviewed_heads": {"a": a["sha"], "b": b["sha"]}})
+        self.assertEqual(out["count"], 2)
+
+    def test_list_flags_moved_and_unrecorded(self):
+        a = self.stub.add_mr(3, "agent/a")
+        self.stub.add_mr(4, "agent/b")
+        srv._record_change("agent/a", 3, a["sha"])
+        a["sha"] = SHA(88)
+        rows = {p["branch"]: p for p in srv.tool_list_proposals({})["proposals"]}
+        self.assertTrue(rows["agent/a"]["moved"])
+        self.assertIsNone(rows["agent/b"]["head"])
+
+    def test_retargeted_mr_is_refused(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
+        mr["target_branch"] = "release"
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
+                self.assertRaises(ValueError) as cm:
+            srv._approve_one("a", "Bob", "bob@example.com", "test", mr["sha"])
+        self.assertIn("targets 'release'", str(cm.exception))
+        self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
+
+    def test_records_live_in_state_dir_not_git_dir(self):
+        srv._record_change("agent/z", 3, SHA(9))
+        self.assertTrue((self.state / "changes.json").is_file())
+        self.assertEqual(oct((self.state / "changes.json").stat().st_mode & 0o777), "0o600")
+        self.assertEqual(srv._recorded_change("agent/z"), {"id": 3, "head": SHA(9)})
+        self.assertFalse(list(Path(srv.ROOT, ".git").glob("pcms-changes*"))
+                         if Path(srv.ROOT, ".git").is_dir() else [])
+
     def test_revert_unknown_slug(self):
         with self.assertRaises(ValueError) as cm:
             srv.tool_revert_proposal({"slug": "nope", "deploy": False})
         self.assertIn("no merged merge request", str(cm.exception))
+
+
+class StateDirTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = Path(tempfile.mkdtemp(prefix="pcms-state-"))
+        self.addCleanup(shutil.rmtree, self.state, True)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PCMS_STATE_DIR", "PCMS_TRANSPORT", "FORGE")}
+        env["PCMS_STATE_DIR"] = str(self.state)
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_state_dir_rules(self):
+        with mock.patch.dict(os.environ, {"PCMS_STATE_DIR": "relative/dir"}), \
+                self.assertRaises(ValueError):
+            srv._state_dir(create=False)
+        with mock.patch.dict(os.environ, {"PCMS_STATE_DIR": str(srv.ROOT / "x")}), \
+                self.assertRaises(ValueError):
+            srv._state_dir(create=False)
+        env = {k: v for k, v in os.environ.items() if k != "PCMS_STATE_DIR"}
+        env["PCMS_TRANSPORT"] = "http"
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            srv._state_dir(create=False)
+        os.chmod(self.state, 0o755)
+        with self.assertRaises(ValueError):
+            srv._state_dir(create=False)
+
+    def test_symlinked_record_file_is_not_followed(self):
+        victim = self.state.parent / f"victim-{os.getpid()}.txt"
+        victim.write_text("keep")
+        self.addCleanup(victim.unlink, True)
+        (self.state / "changes.json").symlink_to(victim)
+        self.assertIsNone(srv._recorded_change("agent/a"))
+        srv._record_change("agent/a", 1, SHA(1))
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse((self.state / "changes.json").is_symlink())
+
+    def test_concurrent_processes_lose_no_records(self):
+        code = (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location('s', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "n = int(sys.argv[2])\n"
+            "for i in range(40):\n"
+            "    m._record_change(f'agent/p{n}-{i}', i + 1, format(n * 1000 + i, '040x'))\n")
+        server = str(Path(__file__).with_name("server.py"))
+        procs = [subprocess.Popen([sys.executable, "-c", code, server, str(n)])
+                 for n in range(4)]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=60), 0)
+        data = json.loads((self.state / "changes.json").read_text())
+        self.assertEqual(len(data["github"]), 160)
+        self.assertFalse(list(self.state.glob("*.tmp")))
+
+
+class ReviseTest(unittest.TestCase):
+    """revise_proposal against a real local git origin (no forge calls)."""
+
+    def git(self, cwd, *args, env=None):
+        res = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                             env={**os.environ, **(env or {})})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.strip()
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="pcms-revise-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        who = {"GIT_AUTHOR_NAME": "Alice", "GIT_AUTHOR_EMAIL": "alice@example.com",
+               "GIT_COMMITTER_NAME": "Alice", "GIT_COMMITTER_EMAIL": "alice@example.com"}
+        env = {k: v for k, v in os.environ.items() if k not in ("PCMS_STATE_DIR", "FORGE")}
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                    "PCMS_STATE_DIR": str(self.tmp / "state"), **who})
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.mkdir(self.tmp / "state", 0o700)
+        origin, work = self.tmp / "origin.git", self.tmp / "work"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True,
+                       capture_output=True)
+        item = work / "content" / "posts" / "hello"
+        item.mkdir(parents=True)
+        (item / "meta.yaml").write_text('title: "Hello"\nslug: "hello"\npublished: false\n')
+        self.git(work, "add", ".")
+        self.git(work, "commit", "-qm", "init")
+        self.git(work, "push", "-q", "origin", "HEAD:main")
+        self.git(work, "switch", "-qc", "agent/hello")
+        (item / "index.mdx").write_text("v1\n")
+        self.git(work, "add", ".")
+        self.git(work, "commit", "-qm", "propose")
+        self.git(work, "push", "-q", "origin", "agent/hello")
+        self.git(work, "switch", "-q", "main")
+        self.head = self.git(work, "rev-parse", "agent/hello")
+        self.origin, self.work = origin, work
+        ident = {"login": "alice", "name": "Alice", "email": "alice@example.com",
+                 "source": "test"}
+        for p in (mock.patch.object(srv, "ROOT", work),
+                  mock.patch.object(srv, "_gh_identity", return_value=ident),
+                  mock.patch.object(srv, "_render_preview_artifact", return_value=None),
+                  mock.patch.object(srv, "_open_pr_for_branch", return_value="u")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_revise_requires_a_record(self):
+        with self.assertRaises(ValueError) as cm:
+            srv.tool_revise_proposal({"slug": "hello", "body": "v2"})
+        self.assertIn("no change recorded", str(cm.exception))
+        self.assertIsNone(srv._recorded_change("agent/hello"))
+
+    def test_revise_from_recorded_head_records_new_head(self):
+        srv._record_change("agent/hello", 5, self.head)
+        out = srv.tool_revise_proposal({"slug": "hello", "body": "v2"})
+        tip = self.git(self.origin, "rev-parse", "agent/hello")
+        self.assertNotEqual(tip, self.head)
+        self.assertEqual(out["head"], tip)
+        self.assertEqual(srv._recorded_change("agent/hello"), {"id": 5, "head": tip})
+
+    def test_revise_refuses_branch_moved_outside_server(self):
+        srv._record_change("agent/hello", 5, self.head)
+        other = self.tmp / "other"
+        subprocess.run(["git", "clone", "-q", "-b", "agent/hello", str(self.origin),
+                        str(other)], check=True, capture_output=True)
+        (other / "content" / "posts" / "hello" / "index.mdx").write_text("sneaky\n")
+        self.git(other, "commit", "-qam", "outside push")
+        self.git(other, "push", "-q", "origin", "agent/hello")
+        with self.assertRaises(ValueError) as cm:
+            srv.tool_revise_proposal({"slug": "hello", "body": "v2"})
+        self.assertIn("moved outside the server", str(cm.exception))
+        self.assertEqual(srv._recorded_change("agent/hello"), {"id": 5, "head": self.head})
+
+
+class JsonDepthTest(unittest.TestCase):
+    def test_depth_scan_is_correct_and_linear(self):
+        ok = forge._json_depth_ok
+        self.assertFalse(ok("[[1]]", 1))
+        self.assertTrue(ok('["[[[\\"[["]', 1))
+        self.assertFalse(ok('{"a\\\\":[[1]]}', 2))
+        start = time.monotonic()
+        ok('"' + '\\"' * 2_000_000, 64)   # hostile: unterminated escaped string
+        ok('"' * 4_000_000, 64)
+        self.assertLess(time.monotonic() - start, 5)
+
+
+class GitHubTargetTest(unittest.TestCase):
+    def test_retargeted_pr_is_refused(self):
+        f = forge.GitHubForge(Path("."))
+        fake = FakeGh({**gh_pr(5, SHA(3), baseRefName="release"), **REPO})
+        with mock.patch.object(subprocess, "run", fake), self.assertRaises(forge.ForgeError) as cm:
+            f.merge_change(5, sha_pin=SHA(3))
+        self.assertIn("targets 'release'", str(cm.exception))
+        self.assertFalse([c for c in fake.calls if c[:3] == ["gh", "pr", "merge"]])
 
 
 if __name__ == "__main__":

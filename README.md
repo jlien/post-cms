@@ -323,7 +323,9 @@ through `mcp/forge.py`.
 
 Both forges:
 
-- Every change the server opens or revises is recorded as branch, change id and the head commit the server pushed, in `pcms-changes.json` in the git directory (never in the tree). Approve and `merge=true` merge that recorded id only, pinned to that recorded head: a change the server did not open or revise, or whose head has moved since, is refused. Run `revise_proposal` to record a new head, review it, and approve again.
+- Every change the server opens or revises is recorded as branch, change id and the head commit the server pushed, in `changes.json` in the server state dir: `$PCMS_STATE_DIR` (an absolute path outside the repository, mode 0700, required over HTTP), default `.tenants/.state` (gitignored). Writes hold an `flock` on `changes.lock` and replace the file through an `O_EXCL|O_NOFOLLOW` temp file.
+- `approve_proposal` needs `reviewed_head` (or `reviewed_heads` `{slug: sha}` for a batch): the `head` that `list_proposals` and the propose and revise results show. It merges the recorded change id only, pinned to that head, and refuses when the head is missing, differs from the recorded head, or the change moved, was retargeted away from `main`, or was not opened or revised by this server. `list_proposals` also returns `forge_head` and `moved`. `merge=true` on a propose tool pins to the head that same call pushed.
+- `revise_proposal` only revises a change the server recorded, starting from the recorded head: if `origin/<branch>` has moved (someone else pushed), it refuses. Its push leases on the recorded head.
 - Changes from forks are refused everywhere (look up, merge, close, the queue, revert): a GitHub PR must have `isCrossRepository` false and its head repository and owner equal to the base repository; a GitLab MR must have source and target project equal to `GITLAB_PROJECT`. Branch lookups match the exact head ref.
 - `revert_proposal` takes the same gate as every merge (`MCP_ALLOW_APPROVE`). On GitLab, when merging is not allowed, the revert merge request still opens and is left for a person to merge.
 

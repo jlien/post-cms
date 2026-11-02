@@ -140,7 +140,11 @@ def _check_sha(sha: str) -> str:
     return sha
 
 
-def _check_mergeable(ch: Change, ref: Any, sha_pin: str, expect_branch: str | None) -> None:
+def _check_mergeable(ch: Change, ref: Any, sha_pin: str, expect_branch: str | None,
+                     target: str) -> None:
+    if ch.target != target:
+        raise ForgeError(f"change {ref!r} targets {ch.target or '?'!r}, not {target!r}; "
+                         "refusing to merge (retargeted after review?)")
     if expect_branch is not None and ch.branch != expect_branch:
         raise ForgeError(f"change {ref!r} is on {ch.branch!r}, not {expect_branch!r}; "
                          "refusing to merge")
@@ -163,11 +167,13 @@ class GitHubForge(Forge):
 
     name = "github"
 
-    _PR_FIELDS = ("number,url,headRefName,headRefOid,state,isCrossRepository,"
+    _PR_FIELDS = ("number,url,headRefName,headRefOid,baseRefName,state,isCrossRepository,"
                   "headRepository,headRepositoryOwner")
 
-    def __init__(self, root: Path, git: Callable[..., subprocess.CompletedProcess] | None = None):
+    def __init__(self, root: Path, git: Callable[..., subprocess.CompletedProcess] | None = None,
+                 target: str = "main"):
         self.root = root
+        self.target = target
         self._git = git
         self._base: tuple[str, str] | None = None
 
@@ -212,6 +218,7 @@ class GitHubForge(Forge):
         return Change(
             id=p.get("number"), url=p.get("url") or "",
             branch=str(p.get("headRefName") or ""),
+            target=str(p.get("baseRefName") or ""),
             title=p.get("title") or "", body=p.get("body") or "",
             state={"open": "open", "merged": "merged", "closed": "closed"}.get(state, state),
             head_sha=p.get("headRefOid"),
@@ -280,7 +287,7 @@ class GitHubForge(Forge):
         ch = self.get_change(ref, cwd=cwd)  # refuses fork PRs
         if ch is None or ch.id is None:
             raise ForgeError(f"no open PR for {ref!r}")
-        _check_mergeable(ch, ref, sha_pin, expect_branch)
+        _check_mergeable(ch, ref, sha_pin, expect_branch, self.target)
         cmd = ["pr", "merge", str(ch.id), "--merge"]
         if delete_branch:
             cmd.append("--delete-branch")
@@ -331,7 +338,7 @@ class GitHubForge(Forge):
         return Change(state="merged", target="main")
 
     _LIST_FIELDS = {
-        "open": "number,title,headRefName,url,author,createdAt,body,isCrossRepository",
+        "open": "number,title,headRefName,headRefOid,url,author,createdAt,body,isCrossRepository",
         "closed": "number,title,headRefName,url,closedAt,isCrossRepository",
         "merged": "number,title,headRefName,url,closedAt,isCrossRepository",
     }
@@ -427,19 +434,33 @@ def gitlab_project_id(raw: str) -> str:
     return urllib.parse.quote(path, safe="")
 
 
-_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[\[\]{}]')
+_JSON_SPECIAL_RE = re.compile(r'["\\\[\]{}]')
 
 
 def _json_depth_ok(text: str, limit: int) -> bool:
-    """True when the JSON nests no deeper than `limit` (strings skipped)."""
+    """True when the JSON nests no deeper than `limit`. One linear pass over
+    the structural characters (string contents and escapes skipped); an
+    unterminated string just ends the scan and json.loads rejects it."""
     depth = 0
-    for m in _JSON_TOKEN_RE.finditer(text):
-        t = m.group(0)
-        if t in "[{":
+    in_str = False
+    skip = -1
+    for m in _JSON_SPECIAL_RE.finditer(text):
+        i = m.start()
+        if i == skip:
+            continue
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                skip = i + 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in "[{":
             depth += 1
             if depth > limit:
                 return False
-        elif t in "]}":
+        elif c in "]}":
             depth -= 1
     return True
 
@@ -735,7 +756,7 @@ class GitLabForge(Forge):
         # One read checks the project, branch, state and head, and gives
         # the fast-forward status.
         mr = self._checked_mr(iid, {"include_diverged_commits_count": "true"})
-        _check_mergeable(self._to_change(mr), ref, sha_pin, expect_branch)
+        _check_mergeable(self._to_change(mr), ref, sha_pin, expect_branch, self.target)
         method = str(self.project_info().get("merge_method") or "merge")
         if method in ("ff", "rebase_merge"):
             # The project only accepts a branch that sits on top of the
