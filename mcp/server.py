@@ -538,9 +538,11 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
     # distinct approver) BEFORE any side effect, so a refused merge
     # leaves no pushed branch or open PR behind.
     apn = ape = apn_src = ""
+    apn_i: dict[str, Any] = {}
     if args.get("merge"):
-        apn, ape, apn_src = _merge_now_gate(args, "propose_template", author_i,
-                                            author_name, author_email)
+        apn, ape, apn_src, apn_i = _merge_now_gate(args, "propose_template", author_i,
+                                                   author_name, author_email)
+    _stable_id(author_i)  # the ledger needs it; fail before any side effect
     name = (args.get("name") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
         raise ValueError("template name must match [A-Za-z0-9][A-Za-z0-9_-]*")
@@ -578,6 +580,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
         }
         verb = "update" if existed else "add"
         res = _git("add", str(tpl_rel), worktree=wt)
+        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
         res = _git("commit", "-m", f"propose: {verb} template {name}", env_extra=commit_env,
                    worktree=wt)
         if res.returncode != 0:
@@ -585,6 +588,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
                 _reset_worktree(wt, [] if existed else [tpl_path])
                 raise ValueError("template content unchanged — nothing to propose")
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        _ledger_record_commit("propose_template", branch, wt, before, author_i)
         push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
             _reset_worktree(wt, [] if existed else [tpl_path])
@@ -631,6 +635,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                _ledger_record_merge("propose_template", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_change does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
         _reset_worktree(wt, [])
@@ -678,9 +683,11 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     # distinct approver) BEFORE any side effect, so a refused merge
     # leaves no pushed branch or open PR behind.
     apn = ape = apn_src = ""
+    apn_i: dict[str, Any] = {}
     if args.get("merge"):
-        apn, ape, apn_src = _merge_now_gate(args, "propose_change", author_i,
-                                            author_name, author_email)
+        apn, ape, apn_src, apn_i = _merge_now_gate(args, "propose_change", author_i,
+                                                   author_name, author_email)
+    _stable_id(author_i)  # the ledger needs it; fail before any side effect
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required (existing post slug or new draft slug)")
@@ -782,6 +789,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
+        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
         res = _git("commit", "-m", summary, env_extra=commit_env, worktree=wt)
         if res.returncode != 0:
             if "nothing to commit" in (res.stdout + res.stderr):
@@ -789,6 +797,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
                     "nothing to commit — for updates pass body/description; "
                     "if the item already has this content, no MR is needed")
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        _ledger_record_commit("propose_change", branch, wt, before, author_i)
 
         push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
@@ -857,6 +866,7 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                _ledger_record_merge("propose_change", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_template does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
         # Reset the worktree to the default branch head: it must be clean for
@@ -986,12 +996,14 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
     require_consent = bool(args.get("require_consent"))
     tenant = (args.get("tenant") or "").strip()
     apn = ape = apn_src = ""  # bound when merge=true (gate below); Pyright-narrowing aid
+    apn_i: dict[str, Any] = {}
     if args.get("merge"):
         # Full publish gate BEFORE any side effect (MCP_ALLOW_APPROVE,
         # approver rights, distinct approver against this session as the
         # author); a refused merge leaves no pushed branch or open PR.
-        apn, ape, apn_src = _merge_now_gate(args, "propose_plugin", author_i,
-                                            author_name, author_email)
+        apn, ape, apn_src, apn_i = _merge_now_gate(args, "propose_plugin", author_i,
+                                                   author_name, author_email)
+    _stable_id(author_i)  # the ledger needs it; fail before any side effect
 
     # A throwaway worktree on origin/main — the shared tree is never touched,
     # so a failed proposal cannot leave uncommitted writes behind (and a
@@ -1064,12 +1076,14 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
+        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
         res = _git("commit", "-m", f"propose: {verb} plugin {name}", env_extra=commit_env,
                    worktree=wt)
         if res.returncode != 0:
             if "nothing to commit" in (res.stdout + res.stderr):
                 raise ValueError("plugin unchanged — nothing to propose")
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        _ledger_record_commit("propose_plugin", branch, wt, before, author_i)
         if tmp is not None:
             push = _git("push", "origin", f"HEAD:refs/heads/{branch}",
                         "--force-with-lease", worktree=wt)
@@ -1118,6 +1132,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                _ledger_record_merge("propose_plugin", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_plugin does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
         if wt != ROOT:
@@ -1261,10 +1276,15 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         _git("add", str(item_dir.relative_to(tmp)), worktree=tmp)
         env = {"GIT_AUTHOR_NAME": author_name, "GIT_AUTHOR_EMAIL": author_email,
                "GIT_COMMITTER_NAME": author_name, "GIT_COMMITTER_EMAIL": author_email}
+        before = _git("rev-parse", "HEAD", worktree=tmp).stdout.strip()
         res = _git("commit", "-m", f"revise: {collection}/{slug} from review feedback",
                    env_extra=env, worktree=tmp)
         if res.returncode != 0 and "nothing to commit" not in (res.stdout + res.stderr):
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        if res.returncode == 0:
+            # Only the commit made here is recorded, never the branch head
+            # it started from (which may hold commits made outside).
+            _ledger_record_commit("revise_proposal", branch, tmp, before, author_i)
         push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
@@ -1456,6 +1476,9 @@ def _gh_identity() -> dict[str, Any]:
         "login": u.get("login") or "",
         "name": u.get("name") or "",
         "email": u.get("email") or "",
+        # Stable id: the numeric GitHub user id, which survives login,
+        # name and email changes. Approvals and the ledger key on this.
+        "id": f"github:{u['id']}" if u.get("id") else "",
         "source": f"github:{u.get('login')} via gh session",
     }
     return _GH_IDENTITY_CACHE
@@ -1501,65 +1524,206 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
     return ident
 
 
-def _branch_people(branch: str) -> tuple[list[tuple[str, str]], str | None]:
-    """Every author AND committer on `branch` since its merge base with
-    main, plus the branch head the PR will merge. A proposal is "authored
-    by" everyone who put a commit on it: an approver who adds one commit to
-    someone else's branch becomes an author, and the original author stays
-    one after someone else commits. Reads the remote branch (fetched first,
-    best effort: it is what the PR merges) and the local one, so commits
-    that exist on either side count. Fails closed when history is
-    unreadable."""
-    _git("fetch", "--quiet", "origin",
-         f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
-    base = "origin/main"
-    if _git("rev-parse", "--verify", "--quiet", base).returncode != 0:
-        base = "main"
-    people: list[tuple[str, str]] = []
-    head: str | None = None
-    seen_ref = False
-    for ref in (f"origin/{branch}", branch):
-        rev = _git("rev-parse", "--verify", "--quiet", ref)
-        if rev.returncode != 0:
-            continue
-        seen_ref = True
-        if head is None:
-            head = rev.stdout.strip() or None
-        log = _git("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce", f"{base}..{ref}")
-        if log.returncode != 0:
-            raise ValueError(f"cannot read the history of {branch}: "
-                             f"{log.stderr.strip()[:200]}")
-        for line in log.stdout.splitlines():
-            parts = line.split("\x1f")
-            if len(parts) != 4:
-                continue
-            for pair in ((parts[0], parts[1]), (parts[2], parts[3])):
-                if pair not in people:
-                    people.append(pair)
-    if not seen_ref:
-        raise ValueError(f"branch {branch!r} not found locally or on origin")
-    return people, head
+# ---- proposals ledger: who made each commit, recorded by the server ---------
+#
+# Git author and committer fields are free text: an author can change them
+# and anyone with push access can forge them. So the server keeps its own
+# append-only record of every commit it makes on a proposal branch, keyed by
+# the caller's stable id (GitHub numeric user id, or OIDC issuer + subject),
+# and of every merge it performs. Approve, merge=true and revert read the
+# ledger; git identities are only a secondary check.
+#
+# Location: $PCMS_STATE_DIR/.proposals-ledger.jsonl, default
+# <repo>/.tenants/.proposals-ledger.jsonl (gitignored; tenant names cannot
+# start with "."). One JSON object per line:
+#   {"v": 1, "event": "commit", "tool": "propose_change", "branch": "agent/x",
+#    "sha": "<40 hex>", "actor": "github:123", "email": "...", "time": "..."}
+#   {"v": 1, "event": "merge", "tool": "approve_proposal", "branch": "agent/x",
+#    "pr": 7, "sha": "<merge sha or null>", "actor": "github:456", ...}
+# The file is opened O_APPEND, locked, fsynced; a failed write fails the
+# operation. A malformed line makes every gate that reads it refuse.
+
+_SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 
 
-def _change_people(merge_sha: str) -> list[tuple[str, str]]:
-    """Authors and committers of the commits a merge commit brought in
-    (first parent .. second parent). The merge commit itself is the
-    approver's (or the forge's), not the change author's, so it is left
-    out. Fails closed: a merge whose branch side cannot be read raises."""
-    log = _git("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce",
-               f"{merge_sha}^1..{merge_sha}^2")
+def _ledger_path() -> Path:
+    base = os.environ.get("PCMS_STATE_DIR")
+    return (Path(base) if base else ROOT / ".tenants") / ".proposals-ledger.jsonl"
+
+
+def _stable_id(ident: dict[str, Any]) -> str:
+    """The identity's stable id. Never a name, email or login alone: those
+    can change or be claimed by someone else."""
+    sid = str(ident.get("id") or "").strip()
+    if not sid:
+        raise ValueError(
+            "the signed-in identity has no stable id (GitHub numeric user id "
+            "or OIDC issuer + subject); approvals and the proposals ledger "
+            "need one")
+    return sid
+
+
+def _ledger_append(entry: dict[str, Any]) -> None:
+    import fcntl
+    path = _ledger_path()
+    record = {"v": 1, "time": datetime.now(timezone.utc).isoformat(), **entry}
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, line.encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise ValueError(f"proposals ledger write failed ({path}): {exc}") from exc
+
+
+def _ledger_entries() -> list[dict[str, Any]]:
+    path = _ledger_path()
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                e = None
+            if (not isinstance(e, dict) or e.get("v") != 1
+                    or e.get("event") not in ("commit", "merge")
+                    or not isinstance(e.get("branch"), str)
+                    or not isinstance(e.get("actor"), str) or not e["actor"]
+                    or (e["event"] == "commit"
+                        and not _SHA_RE.fullmatch(str(e.get("sha") or "")))):
+                raise ValueError(f"proposals ledger {path} line {n} is malformed; "
+                                 "refusing to trust it")
+            out.append(e)
+    return out
+
+
+def _ledger_record_commit(tool: str, branch: str, wt: Path, before: str,
+                          ident: dict[str, Any]) -> str:
+    """Record the commit the server just made in `wt` (HEAD, whose parent
+    must be `before`). Raises when no new commit exists or the write fails."""
+    head = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
+    parent = _git("rev-parse", "HEAD^", worktree=wt).stdout.strip()
+    if not _SHA_RE.fullmatch(head) or head == before or parent != before:
+        raise ValueError("ledger: could not identify the commit the server just made")
+    _ledger_append({"event": "commit", "tool": tool, "branch": branch, "sha": head,
+                    "actor": _stable_id(ident), "email": ident.get("email") or ""})
+    return head
+
+
+def _ledger_record_merge(tool: str, branch: str, pr: Any, cwd: Path,
+                         ident: dict[str, Any]) -> None:
+    """Record a merge with the forge's merge commit sha (null when the forge
+    does not report it; revert then falls back to the exact branch name)."""
+    view = subprocess.run(
+        ["gh", "pr", "view", str(pr), "--json", "mergeCommit",
+         "--jq", ".mergeCommit.oid"], cwd=str(cwd), capture_output=True, text=True)
+    sha = view.stdout.strip() if view.returncode == 0 else ""
+    _ledger_append({"event": "merge", "tool": tool, "branch": branch,
+                    "pr": pr if isinstance(pr, int) else None,
+                    "sha": sha if _SHA_RE.fullmatch(sha) else None,
+                    "actor": _stable_id(ident), "email": ident.get("email") or ""})
+
+
+def _commits(rev_range: str) -> list[tuple[str, str, str, str, str]]:
+    """(sha, author name, author email, committer name, committer email) for
+    every commit in rev_range. NUL-separated (git identities cannot contain
+    NUL), and any malformed record raises: fail closed."""
+    log = _git("log", "-z", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce", rev_range)
     if log.returncode != 0:
-        raise ValueError(f"cannot read the commits merged by {merge_sha[:12]}: "
-                         f"{log.stderr.strip()[:200]}")
+        raise ValueError(f"cannot read history {rev_range}: {log.stderr.strip()[:200]}")
+    raw = log.stdout
+    if not raw:
+        return []
+    fields = raw.split("\x00")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 5:
+        raise ValueError(f"unparseable git history for {rev_range}; refusing")
+    out = []
+    for i in range(0, len(fields), 5):
+        rec = tuple(fields[i:i + 5])
+        if not _SHA_RE.fullmatch(rec[0]):
+            raise ValueError(f"unparseable git history for {rev_range}; refusing")
+        out.append(rec)  # type: ignore[arg-type]
+    return out
+
+
+def _fetch_origin_main() -> None:
+    """Fetch origin/main explicitly. Never fall back to a local main: a
+    local main that already contains the branch hides its commits."""
+    res = _git("fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    if res.returncode != 0 or _git("rev-parse", "--verify", "--quiet",
+                                   "origin/main").returncode != 0:
+        raise ValueError("cannot fetch origin/main; refusing to check authorship "
+                         "without it")
+
+
+def _people_of(commits: list[tuple[str, str, str, str, str]]) -> list[tuple[str, str]]:
     people: list[tuple[str, str]] = []
-    for line in log.stdout.splitlines():
-        parts = line.split("\x1f")
-        if len(parts) != 4:
-            continue
-        for pair in ((parts[0], parts[1]), (parts[2], parts[3])):
+    for _sha, an, ae, cn, ce in commits:
+        for pair in ((an, ae), (cn, ce)):
             if pair not in people:
                 people.append(pair)
     return people
+
+
+def _ledger_actors(commits: list[tuple[str, str, str, str, str]],
+                   what: str) -> set[str]:
+    """Stable ids of whoever made `commits` through the server. Every commit
+    must be in the ledger; a commit made outside the server (pushed
+    directly, forged identity) has no trustworthy author, so it refuses."""
+    if not commits:
+        raise ValueError(f"{what}: no commits to check; refusing")
+    by_sha: dict[str, set[str]] = {}
+    for e in _ledger_entries():
+        if e["event"] == "commit":
+            by_sha.setdefault(e["sha"], set()).add(e["actor"])
+    missing = [c[0][:12] for c in commits if c[0] not in by_sha]
+    if missing:
+        raise ValueError(f"{what}: the branch has commits not made through the "
+                         f"server ({', '.join(missing[:5])}); refusing")
+    actors: set[str] = set()
+    for c in commits:
+        actors |= by_sha[c[0]]
+    if not actors:
+        raise ValueError(f"{what}: empty author set; refusing")
+    return actors
+
+
+def _branch_review(branch: str, what: str) -> dict[str, Any]:
+    """Everything the distinct-approver check needs for an open proposal:
+    the commits on origin/<branch> since its merge base with origin/main,
+    their ledger actors (stable ids), their git people (secondary), and the
+    head the merge will be pinned to."""
+    head, commits = _branch_head_and_commits(branch, what)
+    return {"head": head, "actors": _ledger_actors(commits, what),
+            "people": _people_of(commits)}
+
+
+def _branch_head_and_commits(branch: str, what: str
+                             ) -> tuple[str, list[tuple[str, str, str, str, str]]]:
+    """The head the PR will merge and every commit on it since the merge
+    base with origin/main. The one place the commit list comes from, so a
+    forge API (which lists the change's commits itself) can replace it."""
+    _fetch_origin_main()
+    _git("fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    rev = _git("rev-parse", "--verify", "--quiet", f"origin/{branch}")
+    if rev.returncode != 0:
+        raise ValueError(f"{what}: branch {branch!r} not found on origin")
+    return rev.stdout.strip(), _commits(f"origin/main..origin/{branch}")
+
+
+def _merge_review(merge_sha: str, what: str) -> dict[str, Any]:
+    """Same, for the commits a merge brought in (first parent .. second)."""
+    commits = _commits(f"{merge_sha}^1..{merge_sha}^2")
+    return {"actors": _ledger_actors(commits, what), "people": _people_of(commits)}
 
 
 def _is_self_approval(author_name: str, author_email: str, ident: dict[str, Any]) -> bool:
@@ -1586,55 +1750,48 @@ def _is_self_approval(author_name: str, author_email: str, ident: dict[str, Any]
 # propose_change / propose_template / propose_plugin with merge=true, and
 # revert_proposal. In order:
 #   1. _approval_allowed(): MCP_ALLOW_APPROVE (off over HTTP by default).
-#   2. approver rights: an authenticated identity (OAuth token over HTTP,
-#      gh session on stdio); when MCP_APPROVERS is set, its login or email
-#      must be on that list.
-#   3. distinct approver: the approver is not among the authors and
-#      committers of the change (see _branch_people / _change_people).
+#   2. approver rights: the caller's stable id is in MCP_APPROVERS. Over
+#      HTTP an unset list refuses; on stdio it allows the local user.
+#   3. distinct approver (always over HTTP; on stdio with
+#      REQUIRE_DISTINCT_APPROVER=1): every commit in the change is in the
+#      proposals ledger, and the caller's stable id is not among its actors.
+#      Git author and committer names and emails are a secondary check.
 
 
 def _distinct_required() -> bool:
-    """Distinct approver for approve and merge=true: on over HTTP (many
-    principals), off on stdio (one local human; every commit carries the
-    same identity, so enforcing it would block all publishing). Explicit
-    REQUIRE_DISTINCT_APPROVER=0|1 wins."""
-    if "REQUIRE_DISTINCT_APPROVER" in os.environ:
-        return os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
-    return os.environ.get("PCMS_TRANSPORT") == "http"
-
-
-def _revert_self_check_required() -> bool:
-    """Revert-by-author check: always on over HTTP, on stdio only with
-    REQUIRE_DISTINCT_APPROVER=1. REQUIRE_DISTINCT_APPROVER=0 does not relax
-    it over HTTP; the only override is the MCP_ALLOW_SELF_REVERT break-glass,
-    which revert_proposal logs."""
+    """Always over HTTP (many principals). On stdio (one local human; every
+    commit carries the same identity) only with REQUIRE_DISTINCT_APPROVER=1."""
     if os.environ.get("PCMS_TRANSPORT") == "http":
         return True
     return os.environ.get("REQUIRE_DISTINCT_APPROVER") == "1"
 
 
 def _require_approver(ident: dict[str, Any]) -> None:
-    """Approver rights. With MCP_APPROVERS unset, any authenticated identity
-    may approve once the transport allows it. With it set (comma-separated
-    logins or emails), only those identities may approve, merge or revert.
-    Display names are never matched: they are not unique."""
-    raw = os.environ.get("MCP_APPROVERS", "")
-    allowed = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    """Approver rights, by stable id only (MCP_APPROVERS: comma-separated
+    ids such as github:12345 or oidc:https://issuer.example#subject). Over
+    HTTP no list means nobody may approve, reject or revert. On stdio an
+    unset list allows the local user."""
+    allowed = {x.strip() for x in os.environ.get("MCP_APPROVERS", "").split(",")
+               if x.strip()}
     if not allowed:
+        if os.environ.get("PCMS_TRANSPORT") == "http":
+            raise ValueError(
+                "no approver is configured (MCP_APPROVERS); over HTTP, approve, "
+                "merge, reject and revert are refused until one is")
         return
-    forms = {f.lower() for f in (
-        ident.get("login") or "",
-        ident.get("email") or "",
-        f"{ident['login']}@users.noreply.github.com" if ident.get("login") else "",
-    ) if f}
-    if not forms & allowed:
+    if _stable_id(ident) not in allowed:
         raise ValueError(
-            f"{ident.get('login') or ident.get('email')!r} is not an approver "
-            "(MCP_APPROVERS). Approve, merge and revert need approver rights.")
+            f"{ident.get('login') or ident.get('email') or _stable_id(ident)!r} is not "
+            "an approver (MCP_APPROVERS lists approver stable ids)")
 
 
-def _refuse_if_author(ident: dict[str, Any], people: list[tuple[str, str]],
-                      what: str, hint: str) -> None:
+def _refuse_if_author(ident: dict[str, Any], actors: set[str],
+                      people: list[tuple[str, str]], what: str, hint: str) -> None:
+    sid = _stable_id(ident)
+    if sid in actors:
+        raise ValueError(
+            f"{what}: {sid} made commits in this change through the server and "
+            f"is now publishing it; a change cannot approve itself ({hint})")
     for n, e in people:
         if _is_self_approval(n, e, ident):
             raise ValueError(
@@ -1643,38 +1800,43 @@ def _refuse_if_author(ident: dict[str, Any], people: list[tuple[str, str]],
                 f"itself ({hint})")
 
 
-def _publish_gate(ident: dict[str, Any], people: list[tuple[str, str]],
-                  what: str) -> None:
-    """Gate for approve_proposal and merge=true (steps 1-3 above)."""
-    _approval_allowed()
-    _require_approver(ident)
-    if _distinct_required():
-        _refuse_if_author(ident, people, what,
-                          "distinct approver is on by default over HTTP; "
-                          "REQUIRE_DISTINCT_APPROVER=0 disables it")
-
-
 def _merge_now_gate(args: dict[str, Any], tool: str, author_i: dict[str, Any],
-                    author_name: str, author_email: str) -> tuple[str, str, str]:
+                    author_name: str, author_email: str
+                    ) -> tuple[str, str, str, dict[str, Any]]:
     """merge=true on a propose_* tool is an approval of a change the same
-    session just authored, so it runs the full publish gate with the
-    author on the change. Called before any side effect: a refused merge
-    leaves no pushed branch or open PR behind. Returns the approver's
-    (name, email, identity source)."""
+    session is about to author, so it runs the full publish gate with that
+    session as the only actor. Called before any side effect: a refused
+    merge leaves no pushed branch or open PR behind. Returns the approver's
+    (name, email, identity source, identity)."""
     apn_i = _check_declared_identity(
         (args.get("approver_name") or "").strip(),
         (args.get("approver_email") or "").strip())
-    people = [(author_name, author_email)]
-    if author_i.get("login"):
-        people.append((author_i["login"], ""))
-    _publish_gate(apn_i, people, f"{tool}(merge=true) refused")
+    _approval_allowed()
+    _require_approver(apn_i)
+    if _distinct_required():
+        people = [(author_name, author_email)]
+        if author_i.get("login"):
+            people.append((author_i["login"], ""))
+        _refuse_if_author(apn_i, {_stable_id(author_i)}, people,
+                          f"{tool}(merge=true) refused",
+                          "another approver must approve it with approve_proposal")
     apn = apn_i["name"] or apn_i["login"]
     ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-    return apn, ape, apn_i["source"]
+    return apn, ape, apn_i["source"], apn_i
+
+
+def _merge_pinned(pr: Any, head: str | None) -> subprocess.CompletedProcess:
+    """Merge a PR, pinned to `head` when given (the forge refuses the merge
+    if the branch moved after the author check)."""
+    cmd = ["gh", "pr", "merge", str(pr), "--merge", "--delete-branch"]
+    if head:
+        cmd += ["--match-head-commit", head]
+    return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
 
 
 def _approve_one(slug: str, approver_name: str, approver_email: str,
-                 identity_source: str, head: str | None = None) -> dict[str, Any]:
+                 identity_source: str, head: str | None = None,
+                 ident: dict[str, Any] | None = None) -> dict[str, Any]:
     """Merge one proposal PR with the approver's identity on the record.
     `head` pins the merge to the commit the author check read, so a commit
     pushed between the check and the merge makes the merge fail."""
@@ -1701,13 +1863,12 @@ def _approve_one(slug: str, approver_name: str, approver_email: str,
          f"[identity: {identity_source}]"],
         cwd=str(ROOT), capture_output=True, text=True)
     out["approval_recorded"] = comment.returncode == 0
-    merge_cmd = ["gh", "pr", "merge", str(pr_number), "--merge", "--delete-branch"]
-    if head:
-        merge_cmd += ["--match-head-commit", head]
-    merge = subprocess.run(merge_cmd, cwd=str(ROOT), capture_output=True, text=True)
+    merge = _merge_pinned(pr_number, head)
     if merge.returncode != 0:
         raise ValueError(f"merge failed for {slug}: {merge.stderr.strip()[:300]}")
     out["merged"] = True
+    _ledger_record_merge("approve_proposal", branch, pr_number, ROOT,
+                         ident if ident is not None else _gh_identity())
     return out
 
 
@@ -1738,22 +1899,25 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     # one commit to someone else's branch makes you an author of it, and
     # the original author stays one. Distinct approver: on over HTTP, off
     # on stdio (one local human); REQUIRE_DISTINCT_APPROVER wins.
+    _require_approver(ident)
     heads: dict[str, str | None] = {}
     for s in slugs:
-        people: list[tuple[str, str]] = []
         if _distinct_required():
+            what = f"approve_proposal refused for {s!r}"
             branch = _proposal_branch(s)
             if branch is None:
                 raise ValueError(f"no proposal branch for slug {s!r}")
-            people, heads[s] = _branch_people(branch)
-        _publish_gate(ident, people, f"approve_proposal refused for {s!r}")
+            review = _branch_review(branch, what)
+            _refuse_if_author(ident, review["actors"], review["people"], what,
+                              "another approver must approve it")
+            heads[s] = review["head"]
 
     merged: list[dict[str, Any]] = []
     result: dict[str, Any] = {}
     try:
         for s in slugs:
             merged.append(_approve_one(s, approver_name, approver_email, identity_source,
-                                       heads.get(s)))
+                                       heads.get(s), ident))
     finally:
         result["approved"] = merged
         result["count"] = len(merged)
@@ -1780,6 +1944,9 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     ident = _check_declared_identity(
         (args.get("reviewer_name") or "").strip(),
         (args.get("reviewer_email") or "").strip())
+    # Rejecting closes someone's proposal: approver rights, by stable id
+    # (over HTTP an unset MCP_APPROVERS refuses).
+    _require_approver(ident)
     reviewer_name = ident["name"] or ident["login"]
     reviewer_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
     identity_source = ident["source"]
@@ -1820,6 +1987,44 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _find_shipped_merge(slug: str) -> tuple[str, int | None, str]:
+    """The exact merge commit that shipped proposal `slug` on origin/main:
+    (merge sha, PR number, branch). Branch names match exactly
+    (agent/<slug> or agent/<slug>-rN, plus the plugin-/template- kinds),
+    never as a substring. The ledger's merge record wins; a merge done in
+    the forge UI is found by its merge subject. Either way the commit must
+    be a two-parent merge reachable from origin/main."""
+    cands = [slug]
+    if not slug.startswith(("plugin-", "template-")):
+        cands += [f"plugin-{slug}", f"template-{slug}"]
+    pat = re.compile(r"agent/(?:%s)(?:-r\d+)?" % "|".join(re.escape(c) for c in cands))
+
+    def shipped(sha: str) -> bool:
+        if not _SHA_RE.fullmatch(sha):
+            return False
+        if _git("merge-base", "--is-ancestor", sha, "origin/main").returncode != 0:
+            return False
+        parents = _git("rev-list", "--parents", "-n", "1", sha).stdout.split()
+        return len(parents) == 3
+
+    for e in reversed(_ledger_entries()):
+        if e["event"] == "merge" and pat.fullmatch(e["branch"]) and e.get("sha") \
+                and shipped(e["sha"]):
+            pr = e.get("pr") if isinstance(e.get("pr"), int) else None
+            return e["sha"], pr, e["branch"]
+    log = _git("log", "origin/main", "--merges", "-z", "--format=%H%x00%s", "--")
+    if log.returncode != 0:
+        raise ValueError(f"cannot read origin/main: {log.stderr.strip()[:200]}")
+    fields = log.stdout.split("\x00")
+    subj = re.compile(r"Merge pull request #(\d+) from [^/\s]+/(\S+)")
+    for i in range(0, len(fields) - 1, 2):
+        sha, subject = fields[i].strip(), fields[i + 1]
+        m = subj.fullmatch(subject.strip())
+        if m and pat.fullmatch(m.group(2)) and shipped(sha):
+            return sha, int(m.group(1)), m.group(2)
+    raise ValueError(f"no merge commit found for proposal {slug!r} on main")
+
+
 def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     """One-action undo: revert the merge commit that shipped a proposal,
     rebuild, redeploy, purge. The revert itself is a commit — the ledger keeps
@@ -1827,12 +2032,12 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     authenticated session; free-text args must match it.
 
     A revert publishes to main, so it runs the publish gate: approval must
-    be allowed (MCP_ALLOW_APPROVE), the caller needs approver rights, and
-    the caller must not be an author or committer of the change being
-    reverted (always over HTTP; on stdio only with
-    REQUIRE_DISTINCT_APPROVER=1). MCP_ALLOW_SELF_REVERT=1 is the operator's
-    break-glass for the author check alone; every use is logged to stderr,
-    on the PR and in the result."""
+    be allowed (MCP_ALLOW_APPROVE), the caller needs approver rights (stable
+    id in MCP_APPROVERS), every reverted commit must be in the proposals
+    ledger, and the caller must not be one of their actors (always over
+    HTTP; on stdio only with REQUIRE_DISTINCT_APPROVER=1).
+    MCP_ALLOW_SELF_REVERT=1 is the operator's break-glass for the author
+    check alone; every use is logged to stderr, on the PR and in the result."""
     _approval_allowed()
     ident = _check_declared_identity(
         (args.get("approver_name") or "").strip(),
@@ -1843,30 +2048,18 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     slug = (args.get("slug") or "").strip()
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
-    _git("fetch", "origin")
-    log = _git("log", "origin/main", "--merges", "--format=%H %s", "--")
-    # The branch name in the merge subject may carry a kind prefix
-    # (agent/plugin-<name>, agent/template-<name>) — accept the bare ID too.
-    needles = [f"agent/{slug}"]
-    if not slug.startswith(("plugin-", "template-")):
-        needles += [f"agent/plugin-{slug}", f"agent/template-{slug}"]
-    merge_sha = None
-    merge_pr = None
-    for line in log.stdout.splitlines():
-        sha, _, subject = line.partition(" ")
-        if any(n in subject for n in needles):
-            m = re.search(r"#(\d+)", subject)
-            merge_pr = int(m.group(1)) if m else None
-            merge_sha = sha
-            break
-    if merge_sha is None:
-        raise ValueError(f"no merge commit found for proposal {slug!r} on main")
     _require_approver(ident)
+    _git("fetch", "origin")
+    _fetch_origin_main()
+    merge_sha, merge_pr, branch = _find_shipped_merge(slug)
     break_glass = False
-    if _revert_self_check_required():
-        people = _change_people(merge_sha)
+    if _distinct_required():
+        what = "revert_proposal refused"
+        # The ledger must account for every commit the merge brought in;
+        # the break-glass below never skips that, only the author check.
+        review = _merge_review(merge_sha, what)
         try:
-            _refuse_if_author(ident, people, "revert_proposal refused",
+            _refuse_if_author(ident, review["actors"], review["people"], what,
                               "a different approver must revert it; the operator "
                               "break-glass is MCP_ALLOW_SELF_REVERT=1")
         except ValueError:
@@ -1874,10 +2067,11 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
                 raise
             break_glass = True
             print(f"post-cms-mcp: BREAK-GLASS MCP_ALLOW_SELF_REVERT=1: "
-                  f"{ident.get('login') or ident.get('email')} reverted their own "
-                  f"change {slug!r} (merge {merge_sha[:12]})",
-                  file=sys.stderr, flush=True)
-    out: dict[str, Any] = {"slug": slug, "merge_commit": merge_sha, "pr": merge_pr}
+                  f"{_stable_id(ident)} ({ident.get('login') or ident.get('email')}) "
+                  f"reverted their own change {slug!r} ({branch}, merge "
+                  f"{merge_sha[:12]})", file=sys.stderr, flush=True)
+    out: dict[str, Any] = {"slug": slug, "branch": branch, "merge_commit": merge_sha,
+                           "pr": merge_pr}
     if break_glass:
         out["break_glass"] = "MCP_ALLOW_SELF_REVERT"
     if merge_pr is not None:

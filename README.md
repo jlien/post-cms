@@ -312,41 +312,68 @@ python3 -m unittest discover -s mcp -p 'test_*.py'
 
 Every MCP action that lands a change on main goes through one gate:
 `approve_proposal`, `merge: true` on `propose_change`, `propose_template` and
-`propose_plugin`, and `revert_proposal`. In order:
+`propose_plugin`, and `revert_proposal`. `reject_proposal` needs approver
+rights too. In order:
 
 1. **Approval allowed.** `MCP_ALLOW_APPROVE=0` refuses everywhere. Over HTTP
    (`mcp/http_server.py`) publishing is off unless `MCP_ALLOW_APPROVE=1`.
-2. **Approver rights.** The identity comes from the login (the OAuth token
-   over HTTP, the `gh` session on stdio), never from typed names. With
-   `MCP_APPROVERS` set (comma-separated logins or emails), only those
-   identities may approve, merge or revert. Unset, any authenticated identity
-   may, once step 1 allows it.
-3. **Distinct approver.** The approver must not be an author or committer of
-   any commit on the proposal branch since its merge base with main. Adding a
-   commit to someone else's branch makes you one of its authors. Before
-   merging, `approve_proposal` pins the merge to the head it checked
-   (`gh pr merge --match-head-commit`), so a commit pushed after the check
-   fails the merge. `merge: true` is an approval of a change the same session
-   just authored, so wherever this check applies it is refused before
-   anything is pushed.
+2. **Approver rights, by stable id.** The caller's identity comes from the
+   login: the OAuth token over HTTP, the `gh` session on stdio. Its stable id
+   is `github:<numeric user id>` or `oidc:<issuer>#<subject>`, never a name,
+   email or login. `MCP_APPROVERS` lists approver stable ids, comma-separated
+   (for example `github:12345,oidc:https://idp.example.com#u-1`). Over HTTP,
+   an unset list refuses approve, merge, reject and revert. On stdio, an
+   unset list allows the local user. (A roles file will replace this list.)
+3. **Distinct approver, from the proposals ledger.** Every commit on the
+   change since its merge base with `origin/main` must be one the server
+   recorded in its ledger, and the approver's stable id must not be among
+   the ledger actors of those commits. A commit pushed outside the server
+   refuses the approval ("branch has commits not made through the server"),
+   since its git name and email prove nothing. Git authors and committers
+   are a second check on top. `origin/main` is fetched explicitly; if it is
+   missing, or the ledger or author set is empty, the gate refuses.
+   `approve_proposal` pins the merge to the head it checked
+   (`gh pr merge --match-head-commit`). `merge: true` is an approval of a
+   change the same session authors, so wherever this check applies it is
+   refused before anything is pushed.
 
-| Setting | Over HTTP | On stdio |
+| Rule | Over HTTP | On stdio |
 | --- | --- | --- |
 | `MCP_ALLOW_APPROVE` | off unless `1` | on unless `0` |
-| Distinct approver for approve and `merge: true` | on; `REQUIRE_DISTINCT_APPROVER=0` turns it off | off; `REQUIRE_DISTINCT_APPROVER=1` turns it on |
-| Reverter must not be an author of the reverted change | always on | off; `REQUIRE_DISTINCT_APPROVER=1` turns it on |
+| `MCP_APPROVERS` unset | refuses | allows the local user |
+| Distinct approver (approve, `merge: true`, revert) | always | only with `REQUIRE_DISTINCT_APPROVER=1` |
 
 stdio is a single local user: every commit carries that user's identity, so
-the author checks would block all publishing there. They apply on stdio only
-when `REQUIRE_DISTINCT_APPROVER=1`.
+the author checks would block all publishing there.
+
+**Proposals ledger.** `$PCMS_STATE_DIR/.proposals-ledger.jsonl`, default
+`.tenants/.proposals-ledger.jsonl` (gitignored), mode 0600, append-only and
+written only by the server. One JSON object per line:
+
+```json
+{"v": 1, "event": "commit", "tool": "propose_change", "branch": "agent/x", "sha": "<40 hex>", "actor": "github:123", "email": "a@example.com", "time": "2026-11-02T18:00:00+00:00"}
+{"v": 1, "event": "merge", "tool": "approve_proposal", "branch": "agent/x", "pr": 7, "sha": "<merge sha or null>", "actor": "github:456", "email": "", "time": "..."}
+```
+
+`propose_change`, `propose_template`, `propose_plugin` and
+`revise_proposal` append a `commit` line for the commit they create, before
+pushing; approvals append a `merge` line. A failed write fails the tool, and
+a malformed line makes every gate refuse. Back the file up with the server's
+state; losing it means open proposals must be re-proposed.
+
+**Reverts.** `revert_proposal` finds the exact merge: the ledger's merge
+record for the branch, else a merge commit on `origin/main` whose subject
+names the exact branch (`agent/<slug>` or `agent/<slug>-rN`, never a
+substring). The commits it brought in must all be in the ledger, and the
+reverter must not be one of their actors.
 
 **Break-glass for reverts.** `MCP_ALLOW_SELF_REVERT=1` lets the author of a
 change revert it when no other approver is available. It skips only the
-author check (steps 1 and 2 still apply) and defaults to off. Every use is
-logged: a `BREAK-GLASS` line on the server's stderr, a note on the PR, and
+author check (approval allowed, approver rights and the ledger check still
+apply) and defaults to off. Every use is logged: a `BREAK-GLASS` line with
+the stable id on the server's stderr, a note on the PR, and
 `"break_glass": "MCP_ALLOW_SELF_REVERT"` in the tool result. Unset it once
-the incident is over. `REQUIRE_DISTINCT_APPROVER=0` does not relax the
-revert check over HTTP.
+the incident is over.
 
 ## Deploy + CDN purge
 

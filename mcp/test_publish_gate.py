@@ -1,9 +1,10 @@
 """Publish gate tests for the MCP server: approve_proposal, merge=true on the
-propose_* tools, and revert_proposal share one gate (MCP_ALLOW_APPROVE,
-approver rights, distinct approver over the full branch author set).
+propose_* tools, reject_proposal and revert_proposal share one gate
+(MCP_ALLOW_APPROVE, approver rights by stable id, distinct approver checked
+against the server's proposals ledger, git identities as a secondary check).
 
 Standard library only, no network: git runs against a local bare origin in
-a temp dir, and every `gh` (forge) call is stubbed and recorded.
+a temp dir, and every `gh` (forge) and `cargo` call is stubbed.
 
     python3 -m unittest discover -s mcp -p 'test_*.py'
 """
@@ -15,13 +16,15 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-_spec = importlib.util.spec_from_file_location(
-    "pcms_server_under_test", Path(__file__).with_name("server.py"))
+_HERE = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("pcms_server_under_test", _HERE / "server.py")
 assert _spec is not None and _spec.loader is not None
 srv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(srv)
@@ -30,27 +33,33 @@ _REAL_RUN = subprocess.run
 
 PEOPLE = {
     login: {"login": login, "name": login.capitalize(),
-            "email": f"{login}@example.com", "source": f"test:{login}"}
-    for login in ("alice", "bob", "carol", "dave")
+            "email": f"{login}@example.com", "id": f"github:{n}",
+            "source": f"test:{login}"}
+    for n, login in enumerate(("alice", "bob", "carol", "dave"), 1)
 }
+APPROVERS = "github:1,github:2,github:3"  # alice, bob, carol; dave is not one
 
 GATE_ENV = ("MCP_ALLOW_APPROVE", "PCMS_TRANSPORT", "REQUIRE_DISTINCT_APPROVER",
-            "MCP_APPROVERS", "MCP_ALLOW_SELF_REVERT")
+            "MCP_APPROVERS", "MCP_ALLOW_SELF_REVERT", "PCMS_STATE_DIR")
+
+
+def _git_env(name: str, email: str) -> dict[str, str]:
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
 
 
 def _who(login: str) -> dict[str, str]:
-    p = PEOPLE[login]
-    return {"GIT_AUTHOR_NAME": p["name"], "GIT_AUTHOR_EMAIL": p["email"],
-            "GIT_COMMITTER_NAME": p["name"], "GIT_COMMITTER_EMAIL": p["email"]}
+    return _git_env(PEOPLE[login]["name"], PEOPLE[login]["email"])
 
 
-class PublishGateTest(unittest.TestCase):
+class GateCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="pcms-gate-test-"))
         self.addCleanup(lambda: _REAL_RUN(["rm", "-rf", str(self.tmp)]))
         # Isolated git: no user or system config, hooks or signing.
         base_env = {k: v for k, v in os.environ.items() if k not in GATE_ENV}
-        base_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        base_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                         "PCMS_STATE_DIR": str(self.tmp / "state")})
         env_patch = mock.patch.dict(os.environ, base_env, clear=True)
         env_patch.start()
         self.addCleanup(env_patch.stop)
@@ -74,10 +83,14 @@ class PublishGateTest(unittest.TestCase):
         def fake_run(cmd, *a, **kw):
             if isinstance(cmd, list) and cmd and cmd[0] == "gh":
                 self.gh_calls.append(list(cmd))
-                out = json.dumps([{"number": 7}]) if cmd[1:3] == ["pr", "list"] else ""
+                out = ""
+                if cmd[1:3] == ["pr", "list"]:
+                    out = json.dumps([{"number": 7}])
+                elif cmd[1:3] == ["pr", "create"]:
+                    out = "https://forge.example.com/pr/7\n"
                 return subprocess.CompletedProcess(cmd, 0, out, "")
             if isinstance(cmd, list) and cmd[:1] == ["cargo"]:
-                raise AssertionError("a gated call must not reach the build")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             return _REAL_RUN(cmd, *a, **kw)
 
         run_patch = mock.patch.object(srv.subprocess, "run", fake_run)
@@ -86,35 +99,54 @@ class PublishGateTest(unittest.TestCase):
 
     # ---- helpers -------------------------------------------------------
 
-    def git(self, cwd: Path | None, *args: str, who: str | None = None) -> str:
-        env = {**os.environ, **(_who(who) if who else {})}
+    def git(self, cwd: Path | None, *args: str, who: str | None = None,
+            env: dict[str, str] | None = None) -> str:
+        full = {**os.environ, **(_who(who) if who else {}), **(env or {})}
         cmd = ["git", *(["-C", str(cwd)] if cwd else []), *args]
-        res = _REAL_RUN(cmd, capture_output=True, text=True, env=env)
+        res = _REAL_RUN(cmd, capture_output=True, text=True, env=full)
         if res.returncode != 0:
             raise AssertionError(f"{cmd}: {res.stderr}")
         return res.stdout.strip()
 
-    def commit_on(self, branch: str, who: str, name: str) -> None:
-        self.git(self.work, "switch", "-q", branch)
-        (self.work / name).write_text(f"{name} by {who}\n")
-        self.git(self.work, "add", name)
-        self.git(self.work, "commit", "-q", "-m", f"{name}", who=who)
-        self.git(self.work, "push", "-q", "-u", "origin", branch)
-        self.git(self.work, "switch", "-q", "main")
-
-    def proposal(self, slug: str, *authors: str) -> str:
+    def branch(self, slug: str) -> str:
         branch = f"agent/{slug}"
         self.git(self.work, "switch", "-q", "-c", branch, "main")
         self.git(self.work, "switch", "-q", "main")
+        return branch
+
+    def commit_on(self, branch: str, who: str, name: str, *, server: bool = True,
+                  git_ident: dict[str, str] | None = None,
+                  actor: str | None = None) -> str:
+        """One commit on `branch`, pushed. server=True records it in the
+        ledger the way the server's propose/revise tools do; server=False is
+        a commit pushed directly, outside the server."""
+        self.git(self.work, "switch", "-q", branch)
+        (self.work / name).write_text(f"{name} by {who}\n")
+        self.git(self.work, "add", name)
+        self.git(self.work, "commit", "-q", "-m", name,
+                 env=git_ident if git_ident is not None else _who(who))
+        sha = self.git(self.work, "rev-parse", "HEAD")
+        self.git(self.work, "push", "-q", "-u", "origin", branch)
+        self.git(self.work, "switch", "-q", "main")
+        if server:
+            srv._ledger_append({"event": "commit", "tool": "propose_change",
+                                "branch": branch, "sha": sha,
+                                "actor": actor or PEOPLE[who]["id"],
+                                "email": PEOPLE[who]["email"]})
+        return sha
+
+    def proposal(self, slug: str, *authors: str) -> str:
+        branch = self.branch(slug)
         for i, who in enumerate(authors):
             self.commit_on(branch, who, f"{slug}-{i}.md")
         return branch
 
-    def shipped(self, slug: str, *authors: str, merger: str = "carol") -> str:
+    def shipped(self, slug: str, *authors: str, merger: str = "carol",
+                subject: str | None = None) -> str:
         """A proposal merged into main the way the forge merges a PR."""
         branch = self.proposal(slug, *authors)
-        self.git(self.work, "merge", "-q", "--no-ff", branch,
-                 "-m", f"Merge pull request #7 from example/{branch}", who=merger)
+        self.git(self.work, "merge", "-q", "--no-ff", branch, "-m",
+                 subject or f"Merge pull request #7 from example/{branch}", who=merger)
         self.git(self.work, "push", "-q", "origin", "main")
         return self.origin_main()
 
@@ -122,27 +154,35 @@ class PublishGateTest(unittest.TestCase):
         return self.git(None, "--git-dir", str(self.origin), "rev-parse", "main")
 
     @contextlib.contextmanager
-    def as_user(self, login: str, transport: str = "http", **env: str):
-        overrides = {k: v for k, v in env.items()}
+    def as_user(self, who: str | dict, transport: str = "http", **env: str):
+        ident = dict(PEOPLE[who]) if isinstance(who, str) else dict(who)
+        overrides = dict(env)
         if transport == "http":
             overrides["PCMS_TRANSPORT"] = "http"
+            overrides.setdefault("MCP_APPROVERS", APPROVERS)
         with mock.patch.dict(os.environ, overrides):
             if transport == "http":
-                token = srv._HTTP_IDENTITY.set(dict(PEOPLE[login]))
+                token = srv._HTTP_IDENTITY.set(ident)
                 try:
                     yield
                 finally:
                     srv._HTTP_IDENTITY.reset(token)
             else:
                 # stdio: identity comes from the cached gh session.
-                with mock.patch.object(srv, "_GH_IDENTITY_CACHE", dict(PEOPLE[login])):
+                with mock.patch.object(srv, "_GH_IDENTITY_CACHE", ident):
                     yield
 
     def merges(self) -> list[list[str]]:
         return [c for c in self.gh_calls if c[1:3] == ["pr", "merge"]]
 
-    # ---- merge=true on the propose_* tools ----------------------------
+    def approve(self, slug: str) -> dict:
+        return srv.tool_approve_proposal({"slug": slug, "deploy": False})
 
+    def revert(self, slug: str) -> dict:
+        return srv.tool_revert_proposal({"slug": slug, "deploy": False})
+
+
+class MergeTrueTest(GateCase):
     def test_author_cannot_self_merge_via_merge_true(self) -> None:
         calls = {
             "propose_change": {"slug": "hello", "title": "Hello", "body": "hi"},
@@ -167,72 +207,185 @@ class PublishGateTest(unittest.TestCase):
                 srv.tool_propose_change({"slug": "hello", "body": "hi", "merge": True})
         self.assertEqual(self.gh_calls, [])
 
-    # ---- approve_proposal: full branch author set ---------------------
 
+class LedgerTest(GateCase):
+    def test_server_commit_is_recorded_and_gates_approval(self) -> None:
+        with self.as_user("alice"):
+            out = srv.tool_propose_change({"slug": "hello", "title": "Hello", "body": "hi"})
+        branch = out["branch"]
+        head = self.git(None, "--git-dir", str(self.origin), "rev-parse", branch)
+        entries = srv._ledger_entries()
+        self.assertEqual([(e["event"], e["branch"], e["sha"], e["actor"]) for e in entries],
+                         [("commit", branch, head, "github:1")])
+        with self.as_user("alice", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "cannot approve itself"):
+                self.approve("hello")
+        with self.as_user("bob", MCP_ALLOW_APPROVE="1"):
+            self.assertEqual(self.approve("hello")["count"], 1)
+        merges = [e for e in srv._ledger_entries() if e["event"] == "merge"]
+        self.assertEqual([(e["branch"], e["pr"], e["actor"]) for e in merges],
+                         [(branch, 7, "github:2")])
+
+    def test_ledger_write_failure_fails_the_proposal(self) -> None:
+        blocker = self.tmp / "not-a-dir"
+        blocker.write_text("")
+        with self.as_user("alice", PCMS_STATE_DIR=str(blocker)):
+            with self.assertRaisesRegex(ValueError, "ledger write failed"):
+                srv.tool_propose_change({"slug": "hello", "body": "hi"})
+        heads = self.git(None, "--git-dir", str(self.origin), "branch", "--list", "agent/*")
+        self.assertEqual(heads, "", "nothing is pushed when the ledger cannot record it")
+
+    def test_tamper_non_server_commit_is_refused(self) -> None:
+        branch = self.proposal("post-a", "alice")
+        self.commit_on(branch, "dave", "extra.md", server=False)
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "not made through the server"):
+                self.approve("post-a")
+        self.assertEqual(self.merges(), [])
+
+    def test_no_ledger_is_refused(self) -> None:
+        self.commit_on(self.branch("bare"), "alice", "a.md", server=False)
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "not made through the server"):
+                self.approve("bare")
+
+    def test_malformed_ledger_is_refused(self) -> None:
+        self.proposal("post-a", "alice")
+        with open(srv._ledger_path(), "a") as fh:
+            fh.write("{not json\n")
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                self.approve("post-a")
+
+
+class ApproveTest(GateCase):
     def test_author_cannot_approve_after_another_person_commits(self) -> None:
         self.proposal("post-a", "alice", "bob")  # bob's commit is the latest
         for who in ("alice", "bob"):
             with self.subTest(approver=who), self.as_user(who, MCP_ALLOW_APPROVE="1"):
                 with self.assertRaisesRegex(ValueError, "cannot approve itself"):
-                    srv.tool_approve_proposal({"slug": "post-a", "deploy": False})
+                    self.approve("post-a")
         self.assertEqual(self.merges(), [])
 
     def test_committer_counts_as_author(self) -> None:
-        branch = self.proposal("post-b", "alice")
-        self.git(self.work, "switch", "-q", branch)
-        (self.work / "x.md").write_text("x\n")
-        self.git(self.work, "add", "x.md")
-        env = {**_who("alice"), "GIT_COMMITTER_NAME": "Bob",
-               "GIT_COMMITTER_EMAIL": "bob@example.com"}
-        _REAL_RUN(["git", "-C", str(self.work), "commit", "-q", "-m", "x"],
-                  env={**os.environ, **env}, check=True)
-        self.git(self.work, "push", "-q", "origin", branch)
-        self.git(self.work, "switch", "-q", "main")
+        ident = {**_who("alice"), "GIT_COMMITTER_NAME": "Bob",
+                 "GIT_COMMITTER_EMAIL": "bob@example.com"}
+        self.commit_on(self.branch("post-b"), "alice", "x.md", git_ident=ident)
         with self.as_user("bob", MCP_ALLOW_APPROVE="1"):
             with self.assertRaisesRegex(ValueError, "cannot approve itself"):
-                srv.tool_approve_proposal({"slug": "post-b", "deploy": False})
+                self.approve("post-b")
+
+    def test_p1_author_changes_profile_then_approves(self) -> None:
+        """P1: the author clears their display name and email (and even
+        renames the login); the stable id still matches the ledger."""
+        self.commit_on(self.branch("p1"), "alice", "p1.md",
+                       git_ident=_git_env("Alice Smith", "alice.smith@corp.example"))
+        drifted = {"login": "alice-renamed", "name": "", "email": "",
+                   "id": "github:1", "source": "test"}
+        with self.as_user(drifted, MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "cannot approve itself"):
+                self.approve("p1")
+        self.assertEqual(self.merges(), [])
+
+    def test_p2_forged_git_author_is_refused(self) -> None:
+        """P2: someone with push access commits as "Alice" and approves."""
+        self.commit_on(self.branch("p2"), "bob", "p2.md", server=False,
+                       git_ident=_git_env("Alice", "alice@example.com"))
+        with self.as_user("bob", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "not made through the server"):
+                self.approve("p2")
+        self.assertEqual(self.merges(), [])
+
+    def test_p12_unit_separator_in_name_does_not_hide_a_commit(self) -> None:
+        """P12: a git name containing 0x1f used to drop the commit from the
+        author set. Parsing is NUL-separated and fails closed now."""
+        eve = {"login": "eve", "name": "E\x1fve", "email": "eve@example.com",
+               "id": "github:5", "source": "test"}
+        branch = self.branch("p12")
+        self.commit_on(branch, "alice", "p12.md", actor="github:5",
+                       git_ident=_git_env("E\x1fve", "eve@example.com"))
+        people = srv._people_of(srv._commits(f"main..{branch}"))
+        self.assertIn(("E\x1fve", "eve@example.com"), people)
+        with self.as_user(eve, MCP_ALLOW_APPROVE="1", MCP_APPROVERS="github:5"):
+            with self.assertRaisesRegex(ValueError, "cannot approve itself"):
+                self.approve("p12")
+        self.assertEqual(self.merges(), [])
+
+    def test_p7_missing_origin_main_is_refused(self) -> None:
+        """P7: with origin/main gone, a local main that already contains
+        the branch must not yield an empty author set and a pass."""
+        branch = self.proposal("p7", "alice")
+        self.git(self.work, "merge", "-q", "--ff-only", branch)
+        self.git(self.work, "update-ref", "-d", "refs/remotes/origin/main")
+        self.git(self.work, "remote", "set-url", "origin", str(self.tmp / "gone.git"))
+        with self.as_user("alice", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "origin/main"):
+                self.approve("p7")
+        self.assertEqual(self.merges(), [])
 
     def test_valid_approver_approves_pinned_to_checked_head(self) -> None:
         branch = self.proposal("post-a", "alice", "bob")
         head = self.git(self.work, "rev-parse", branch)
-        with self.as_user("carol", MCP_ALLOW_APPROVE="1", MCP_APPROVERS="carol"):
-            out = srv.tool_approve_proposal({"slug": "post-a", "deploy": False})
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            out = self.approve("post-a")
         self.assertEqual(out["count"], 1)
         self.assertEqual(len(self.merges()), 1)
         self.assertIn("--match-head-commit", self.merges()[0])
         self.assertIn(head, self.merges()[0])
 
-    def test_non_approver_cannot_approve(self) -> None:
+    def test_approvers_match_stable_ids_only(self) -> None:
         self.proposal("post-a", "alice")
-        with self.as_user("dave", MCP_ALLOW_APPROVE="1", MCP_APPROVERS="carol,bob@example.com"):
+        for listed in ("carol", "carol@example.com", "Carol"):
+            with self.subTest(listed=listed), \
+                    self.as_user("carol", MCP_ALLOW_APPROVE="1", MCP_APPROVERS=listed):
+                with self.assertRaisesRegex(ValueError, "not an approver"):
+                    self.approve("post-a")
+        with self.as_user("dave", MCP_ALLOW_APPROVE="1"):
             with self.assertRaisesRegex(ValueError, "not an approver"):
-                srv.tool_approve_proposal({"slug": "post-a", "deploy": False})
+                self.approve("post-a")
         self.assertEqual(self.merges(), [])
+
+    def test_http_without_approvers_refuses_approve_reject_revert(self) -> None:
+        self.proposal("post-a", "alice")
+        self.shipped("post-b", "alice")
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1", MCP_APPROVERS=""):
+            with self.assertRaisesRegex(ValueError, "no approver is configured"):
+                self.approve("post-a")
+            with self.assertRaisesRegex(ValueError, "no approver is configured"):
+                srv.tool_reject_proposal({"slug": "post-a", "reason": "no"})
+            with self.assertRaisesRegex(ValueError, "no approver is configured"):
+                self.revert("post-b")
+        self.assertEqual(self.gh_calls, [])
+
+    def test_require_distinct_off_does_not_relax_http(self) -> None:
+        self.proposal("post-a", "alice")
+        with self.as_user("alice", MCP_ALLOW_APPROVE="1", REQUIRE_DISTINCT_APPROVER="0"):
+            with self.assertRaisesRegex(ValueError, "cannot approve itself"):
+                self.approve("post-a")
 
     def test_stdio_single_user_may_approve_own_proposal(self) -> None:
         self.proposal("post-a", "alice")
         with self.as_user("alice", transport="stdio"):
-            out = srv.tool_approve_proposal({"slug": "post-a", "deploy": False})
-        self.assertEqual(out["count"], 1)
+            self.assertEqual(self.approve("post-a")["count"], 1)
         with self.as_user("alice", transport="stdio", REQUIRE_DISTINCT_APPROVER="1"):
             with self.assertRaisesRegex(ValueError, "cannot approve itself"):
-                srv.tool_approve_proposal({"slug": "post-a", "deploy": False})
+                self.approve("post-a")
 
-    # ---- revert_proposal ----------------------------------------------
 
+class RevertTest(GateCase):
     def test_approval_off_blocks_revert(self) -> None:
         before = self.shipped("post-a", "alice")
         for env in ({}, {"MCP_ALLOW_APPROVE": "0"}):
             with self.subTest(env=env), self.as_user("carol", **env):
                 with self.assertRaisesRegex(ValueError, "merging is disabled"):
-                    srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+                    self.revert("post-a")
         self.assertEqual(self.origin_main(), before)
 
     def test_revert_by_non_approver_is_refused(self) -> None:
         before = self.shipped("post-a", "alice")
-        with self.as_user("dave", MCP_ALLOW_APPROVE="1", MCP_APPROVERS="carol"):
+        with self.as_user("dave", MCP_ALLOW_APPROVE="1"):
             with self.assertRaisesRegex(ValueError, "not an approver"):
-                srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+                self.revert("post-a")
         self.assertEqual(self.origin_main(), before)
         self.assertEqual(self.gh_calls, [])
 
@@ -243,36 +396,112 @@ class PublishGateTest(unittest.TestCase):
                 with self.subTest(who=who, env=env), \
                         self.as_user(who, MCP_ALLOW_APPROVE="1", **env):
                     with self.assertRaisesRegex(ValueError, "MCP_ALLOW_SELF_REVERT"):
-                        srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+                        self.revert("post-a")
+        self.assertEqual(self.origin_main(), before)
+
+    def test_revert_of_change_with_non_server_commits_is_refused(self) -> None:
+        branch = self.proposal("post-a", "alice")
+        self.commit_on(branch, "carol", "raw.md", server=False)
+        self.git(self.work, "merge", "-q", "--no-ff", branch,
+                 "-m", f"Merge pull request #7 from example/{branch}", who="bob")
+        self.git(self.work, "push", "-q", "origin", "main")
+        before = self.origin_main()
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1", MCP_ALLOW_SELF_REVERT="1"):
+            with self.assertRaisesRegex(ValueError, "not made through the server"):
+                self.revert("post-a")
         self.assertEqual(self.origin_main(), before)
 
     def test_valid_approver_reverts(self) -> None:
         before = self.shipped("post-a", "alice", merger="bob")
-        with self.as_user("carol", MCP_ALLOW_APPROVE="1", MCP_APPROVERS="carol"):
-            out = srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            out = self.revert("post-a")
         self.assertTrue(out["reverted"])
         self.assertNotIn("break_glass", out)
         self.assertEqual(self.git(None, "--git-dir", str(self.origin),
                                   "rev-parse", "main~1"), before)
+
+    def test_p6_slug_never_matches_as_substring(self) -> None:
+        """P6: slug "p6" used to revert the merge of agent/p6-other."""
+        before = self.shipped("p6-other", "alice", merger="dave")
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            with self.assertRaisesRegex(ValueError, "no merge commit found"):
+                self.revert("p6")
+        self.assertEqual(self.origin_main(), before)
+
+    def test_revert_finds_merge_by_ledger_record(self) -> None:
+        before = self.shipped("post-a", "alice", subject="Merge branch work")
+        srv._ledger_append({"event": "merge", "tool": "approve_proposal",
+                            "branch": "agent/post-a", "pr": 9, "sha": before,
+                            "actor": "github:2", "email": ""})
+        with self.as_user("carol", MCP_ALLOW_APPROVE="1"):
+            out = self.revert("post-a")
+        self.assertEqual((out["merge_commit"], out["pr"], out["branch"]),
+                         (before, 9, "agent/post-a"))
 
     def test_break_glass_self_revert_is_logged(self) -> None:
         self.shipped("post-a", "alice")
         err = io.StringIO()
         with self.as_user("alice", MCP_ALLOW_APPROVE="1", MCP_ALLOW_SELF_REVERT="1"), \
                 contextlib.redirect_stderr(err):
-            out = srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+            out = self.revert("post-a")
         self.assertTrue(out["reverted"])
         self.assertEqual(out["break_glass"], "MCP_ALLOW_SELF_REVERT")
         self.assertIn("BREAK-GLASS", err.getvalue())
+        self.assertIn("github:1", err.getvalue())
         comments = [c for c in self.gh_calls if c[1:3] == ["pr", "comment"]]
         self.assertTrue(any("Break-glass" in " ".join(c) for c in comments))
 
     def test_stdio_single_user_may_revert_own_change(self) -> None:
         self.shipped("post-a", "alice")
         with self.as_user("alice", transport="stdio"):
-            out = srv.tool_revert_proposal({"slug": "post-a", "deploy": False})
+            out = self.revert("post-a")
         self.assertTrue(out["reverted"])
         self.assertNotIn("break_glass", out)
+
+
+class HttpIdentityTest(unittest.TestCase):
+    """Stable ids from the HTTP connectors; OIDC email only when verified."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        with mock.patch.dict(os.environ, {}):  # http_server sets PCMS_TRANSPORT
+            spec = importlib.util.spec_from_file_location(
+                "pcms_http_under_test", _HERE / "http_server.py")
+            assert spec is not None and spec.loader is not None
+            cls.http = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.http)
+
+    def test_github_identity_uses_numeric_id(self) -> None:
+        with mock.patch.object(self.http, "_http_json",
+                               return_value={"login": "alice", "id": 42, "email": ""}):
+            ident = self.http._identity_github("t")
+        self.assertEqual(ident["id"], "github:42")
+
+    def oidc(self, claims: dict) -> dict:
+        fake = types.ModuleType("jwt")
+        fake.PyJWTError = Exception  # type: ignore[attr-defined]
+        fake.decode = lambda *a, **k: claims  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"jwt": fake}), \
+                mock.patch.object(self.http, "OAUTH_ISSUER", "https://idp.example.com"), \
+                mock.patch.object(self.http, "OAUTH_AUDIENCE", "post-cms"), \
+                mock.patch.object(self.http, "_jwks_client", return_value=mock.Mock()):
+            return self.http._identity_oidc("t")
+
+    def test_oidc_identity_is_issuer_and_subject(self) -> None:
+        ident = self.oidc({"iss": "https://idp.example.com", "sub": "u-1",
+                           "preferred_username": "carol", "email": "carol@example.com",
+                           "email_verified": True})
+        self.assertEqual(ident["id"], "oidc:https://idp.example.com#u-1")
+        self.assertEqual(ident["email"], "carol@example.com")
+
+    def test_oidc_unverified_email_is_dropped(self) -> None:
+        for verified in (False, None, "true"):
+            claims = {"iss": "https://idp.example.com", "sub": "u-2",
+                      "preferred_username": "carol", "email": "carol@example.com"}
+            if verified is not None:
+                claims["email_verified"] = verified
+            with self.subTest(email_verified=verified):
+                self.assertEqual(self.oidc(claims)["email"], "")
 
 
 if __name__ == "__main__":

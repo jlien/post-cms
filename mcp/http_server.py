@@ -15,7 +15,8 @@ The validated principal is bound into the request context; approve / reject
 / revert take the approver's identity from that login — the same structural
 gate as the local gh session, minus the shared machine. Over HTTP, approve,
 merge=true and revert are off unless MCP_ALLOW_APPROVE=1, and the caller may
-not publish a change they authored or committed (see README "Publish gate").
+not publish a change whose commits they made; approvers are matched by
+stable id (github:<numeric id> or oidc:<iss>#<sub>), see README "Publish gate".
 
 Endpoints:
     POST /mcp                                          JSON-RPC (MCP), auth required
@@ -97,10 +98,15 @@ def _identity_github(token: str) -> dict:
     login = u.get("login") or ""
     if not login:
         raise AuthError("github token introspection returned no login")
+    uid = u.get("id")
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        raise AuthError("github token introspection returned no numeric user id")
     return {
         "login": login,
         "name": u.get("name") or "",
         "email": u.get("email") or "",
+        # Stable id: the numeric user id survives login and email changes.
+        "id": f"github:{uid}",
         "source": f"github:{login} via oauth token",
     }
 
@@ -120,14 +126,23 @@ def _identity_oidc(token: str) -> dict:
                             audience=OAUTH_AUDIENCE, issuer=OAUTH_ISSUER)
     except jwt.PyJWTError as exc:
         raise AuthError(f"invalid token: {exc}") from exc
-    login = claims.get("preferred_username") or claims.get("sub") or ""
-    if not login:
-        raise AuthError("token has no principal (preferred_username/sub)")
+    sub = claims.get("sub") or ""
+    iss = claims.get("iss") or ""
+    if not isinstance(sub, str) or not sub or not isinstance(iss, str) or not iss:
+        raise AuthError("token has no principal (iss + sub)")
+    # preferred_username is a display label only: users can often edit it.
+    login = claims.get("preferred_username") or sub
+    # An unverified email is not the user's: drop it, so it can neither
+    # match an approver nor stand in for an author.
+    email = claims.get("email") if claims.get("email_verified") is True else ""
     return {
         "login": login,
         "name": claims.get("name") or "",
-        "email": claims.get("email") or "",
-        "source": f"oidc:{login} via oauth token",
+        "email": email or "",
+        # Stable id: issuer + subject, the only claim pair OIDC promises
+        # is unique and never reassigned.
+        "id": f"oidc:{iss}#{sub}",
+        "source": f"oidc:{iss}#{sub} via oauth token",
     }
 
 
