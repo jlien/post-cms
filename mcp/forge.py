@@ -69,6 +69,10 @@ class Change:
     # {sha, author_name, author_email, committer_name, committer_email}.
     commits: list[dict[str, str]] = field(default_factory=list)
 
+    # True only when the change's source is the target repository itself;
+    # changes from forks are never looked up, merged, closed or listed.
+    same_repo: bool | None = None
+
     @property
     def people(self) -> list[tuple[str, str]]:
         """Every (name, email) that authored or committed a commit on the
@@ -98,7 +102,13 @@ class Forge:
         raise NotImplementedError
 
     def merge_change(self, ref: int | str, *, sha_pin: str | None = None,
-                     delete_branch: bool = True, cwd: Path | None = None) -> Change:
+                     expect_branch: str | None = None, delete_branch: bool = True,
+                     cwd: Path | None = None) -> Change:
+        """Merge only when the change is open, comes from this repository,
+        is on `expect_branch` (when given) and its head is exactly
+        `sha_pin`, the head that was reviewed. The pin also goes to the
+        forge, so a push between the check and the merge fails too.
+        `sha_pin` is required."""
         raise NotImplementedError
 
     def close_change(self, ref: int | str, *, delete_branch: bool = True,
@@ -130,6 +140,19 @@ def _check_sha(sha: str) -> str:
     return sha
 
 
+def _check_mergeable(ch: Change, ref: Any, sha_pin: str, expect_branch: str | None) -> None:
+    if expect_branch is not None and ch.branch != expect_branch:
+        raise ForgeError(f"change {ref!r} is on {ch.branch!r}, not {expect_branch!r}; "
+                         "refusing to merge")
+    if ch.state != "open":
+        raise ForgeError(f"change {ref!r} is {ch.state or 'not open'}; nothing to merge", 405)
+    if (ch.head_sha or "") != sha_pin:
+        raise ForgeError(
+            f"merge refused, the head moved: change {ref!r} is at "
+            f"{(ch.head_sha or '?')[:12]}, not the reviewed {sha_pin[:12]}. Review the "
+            "new commits and approve again.", 409)
+
+
 # ---------------------------------------------------------------- GitHub
 
 
@@ -140,9 +163,34 @@ class GitHubForge(Forge):
 
     name = "github"
 
+    _PR_FIELDS = ("number,url,headRefName,headRefOid,state,isCrossRepository,"
+                  "headRepository,headRepositoryOwner")
+
     def __init__(self, root: Path, git: Callable[..., subprocess.CompletedProcess] | None = None):
         self.root = root
         self._git = git
+        self._base: tuple[str, str] | None = None
+
+    def _base_repo(self, cwd: Path | None = None) -> tuple[str, str]:
+        if self._base is None:
+            res = self._gh(["repo", "view", "--json", "name,owner"], cwd)
+            if res.returncode != 0:
+                raise ForgeError(f"gh repo view failed: {res.stderr.strip()[:300]}")
+            try:
+                j = json.loads(res.stdout or "{}")
+                self._base = (str(j["owner"]["login"]).lower(), str(j["name"]).lower())
+            except (ValueError, KeyError, TypeError):
+                raise ForgeError("gh repo view returned unexpected JSON")
+        return self._base
+
+    def _same_repo(self, p: dict[str, Any], cwd: Path | None = None) -> bool:
+        """The PR's head lives in the base repository (not a fork). Fails
+        closed: a missing field counts as cross-repository."""
+        if p.get("isCrossRepository") is not False:
+            return False
+        owner = str((p.get("headRepositoryOwner") or {}).get("login") or "").lower()
+        name = str((p.get("headRepository") or {}).get("name") or "").lower()
+        return (owner, name) == self._base_repo(cwd)
 
     def _gh(self, args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(["gh", *args], cwd=str(cwd or self.root),
@@ -172,28 +220,35 @@ class GitHubForge(Forge):
 
     def get_change(self, ref, *, state="open", with_commits=False, cwd=None):
         if isinstance(ref, int):
-            res = self._gh(["pr", "view", str(ref), "--json",
-                            "number,url,headRefName,headRefOid,state"], cwd)
+            res = self._gh(["pr", "view", str(ref), "--json", self._PR_FIELDS], cwd)
             if res.returncode != 0:
                 raise ForgeError(f"gh pr view failed: {res.stderr.strip()[:300]}")
             try:
-                ch = self._from_json(json.loads(res.stdout or "{}"))
+                p = json.loads(res.stdout or "{}")
             except ValueError:
                 raise ForgeError("gh pr view returned non-JSON")
+            if not isinstance(p, dict) or not self._same_repo(p, cwd):
+                raise ForgeError(f"PR #{ref} comes from another repository (a fork); "
+                                 "refusing to act on it")
+            ch = self._from_json(p)
         else:
             res = self._gh(["pr", "list", "--head", ref, "--state", state,
-                            "--json", "number,url,headRefName,headRefOid,state",
-                            "--limit", "1"], cwd)
+                            "--json", self._PR_FIELDS, "--limit", "20"], cwd)
             if res.returncode != 0:
                 raise ForgeError(f"gh pr list failed: {res.stderr.strip()[:300]}")
             try:
                 prs = json.loads(res.stdout or "[]")
             except ValueError:
                 raise ForgeError("gh pr list returned non-JSON")
-            if not prs:
+            exact = [p for p in prs if isinstance(p, dict) and p.get("headRefName") == ref]
+            same = [p for p in exact if self._same_repo(p, cwd)]
+            if not same:
+                if exact:
+                    raise ForgeError(f"the only PR on {ref!r} comes from another "
+                                     "repository (a fork); refusing to act on it")
                 return None
-            ch = self._from_json(prs[0])
-            ch.branch = ch.branch or ref
+            ch = self._from_json(same[0])
+        ch.same_repo = True
         if with_commits and ch.id is not None:
             ch.commits = self._commits(ch.id, cwd)
         return ch
@@ -217,18 +272,24 @@ class GitHubForge(Forge):
         out.reverse()  # the API lists oldest first; Change.commits is newest first
         return out
 
-    def merge_change(self, ref, *, sha_pin=None, delete_branch=True, cwd=None):
-        cmd = ["pr", "merge", str(ref), "--merge"]
+    def merge_change(self, ref, *, sha_pin=None, expect_branch=None, delete_branch=True,
+                     cwd=None):
+        if not sha_pin:
+            raise ForgeError("merge refused: no reviewed head sha to pin to")
+        _check_sha(sha_pin)
+        ch = self.get_change(ref, cwd=cwd)  # refuses fork PRs
+        if ch is None or ch.id is None:
+            raise ForgeError(f"no open PR for {ref!r}")
+        _check_mergeable(ch, ref, sha_pin, expect_branch)
+        cmd = ["pr", "merge", str(ch.id), "--merge"]
         if delete_branch:
             cmd.append("--delete-branch")
-        if sha_pin:
-            cmd += ["--match-head-commit", _check_sha(sha_pin)]
+        cmd += ["--match-head-commit", sha_pin]
         res = self._gh(cmd, cwd)
         if res.returncode != 0:
             raise ForgeError(res.stderr.strip()[:300])
-        return Change(id=ref if isinstance(ref, int) else None,
-                      branch=ref if isinstance(ref, str) else "", state="merged",
-                      head_sha=sha_pin)
+        ch.state = "merged"
+        return ch
 
     def close_change(self, ref, *, delete_branch=True, cwd=None):
         cmd = ["pr", "close", str(ref)]
@@ -270,14 +331,14 @@ class GitHubForge(Forge):
         return Change(state="merged", target="main")
 
     _LIST_FIELDS = {
-        "open": "number,title,headRefName,url,author,createdAt,body",
-        "closed": "number,title,headRefName,url,closedAt",
-        "merged": "number,title,headRefName,url,closedAt",
+        "open": "number,title,headRefName,url,author,createdAt,body,isCrossRepository",
+        "closed": "number,title,headRefName,url,closedAt,isCrossRepository",
+        "merged": "number,title,headRefName,url,closedAt,isCrossRepository",
     }
 
     def list_changes(self, state, *, limit=None):
         cmd = ["pr", "list", "--state", state, "--json", self._LIST_FIELDS.get(
-            state, "number,title,headRefName,url")]
+            state, "number,title,headRefName,url,isCrossRepository")]
         if limit is not None:
             cmd += ["--limit", str(limit)]
         res = self._gh(cmd)
@@ -287,7 +348,9 @@ class GitHubForge(Forge):
             prs = json.loads(res.stdout or "[]")
         except ValueError:
             raise ForgeError(f"gh pr list returned non-JSON: {res.stdout[:200]}")
-        return [self._from_json(p) for p in prs]
+        # Fork PRs never enter the queue, rejections or revert lookups.
+        return [self._from_json(p) for p in prs
+                if isinstance(p, dict) and p.get("isCrossRepository") is False]
 
     def last_comment(self, ref):
         res = self._gh(["pr", "view", str(ref), "--json", "comments",
@@ -364,17 +427,36 @@ def gitlab_project_id(raw: str) -> str:
     return urllib.parse.quote(path, safe="")
 
 
+_JSON_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[\[\]{}]')
+
+
+def _json_depth_ok(text: str, limit: int) -> bool:
+    """True when the JSON nests no deeper than `limit` (strings skipped)."""
+    depth = 0
+    for m in _JSON_TOKEN_RE.finditer(text):
+        t = m.group(0)
+        if t in "[{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif t in "]}":
+            depth -= 1
+    return True
+
+
 class GitLabForge(Forge):
     """GitLab REST API v4. Every request carries the token in the
-    PRIVATE-TOKEN header, has a timeout and a response size cap, and
-    refuses redirects."""
+    PRIVATE-TOKEN header, has a socket timeout, an overall deadline and a
+    response size cap, ignores proxy settings and refuses redirects. Only
+    merge requests whose source and target are this project are ever
+    looked up, listed, merged or closed; fork merge requests are refused."""
 
     name = "gitlab"
 
     def __init__(self, base_url: str, project: str, token: str, *,
-                 target: str = "main", timeout: float = 20.0,
-                 max_bytes: int = 4 * 1024 * 1024, max_pages: int = 50,
-                 merge_poll: float = 1.0) -> None:
+                 target: str = "main", timeout: float = 20.0, deadline: float = 60.0,
+                 max_bytes: int = 4 * 1024 * 1024, max_total_bytes: int = 16 * 1024 * 1024,
+                 max_pages: int = 50, max_depth: int = 64, merge_poll: float = 1.0) -> None:
         if not token or any(c in token for c in "\r\n\0"):
             raise ForgeError("GITLAB_TOKEN is not set or is malformed")
         self.base = base_url
@@ -382,11 +464,17 @@ class GitLabForge(Forge):
         self.__token = token
         self.target = target
         self.timeout = timeout
+        self.deadline = deadline
         self.max_bytes = max_bytes
+        self.max_total_bytes = max_total_bytes
         self.max_pages = max_pages
+        self.max_depth = max_depth
         self.merge_poll = merge_poll
         self._project_info: dict[str, Any] | None = None
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        # No proxies: the token must never go to a proxy (in clear over the
+        # http loopback test override), and the API host is fixed config.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                   _NoRedirect)
 
     def __repr__(self) -> str:
         return f"GitLabForge(base={self.base!r}, project={self.project!r})"
@@ -398,6 +486,11 @@ class GitLabForge(Forge):
 
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
                  body: dict[str, Any] | None = None, op: str = "") -> tuple[Any, Any]:
+        data, headers, _ = self._request_n(method, path, params=params, body=body, op=op)
+        return data, headers
+
+    def _request_n(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+                   body: dict[str, Any] | None = None, op: str = "") -> tuple[Any, Any, int]:
         url = f"{self.base}/api/v4{path}"
         if params:
             url += "?" + urllib.parse.urlencode(
@@ -412,10 +505,26 @@ class GitLabForge(Forge):
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         op = op or f"{method} {path.split('?')[0]}"
+        end = time.monotonic() + self.deadline
+        chunks: list[bytes] = []
+        total = 0
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                raw = resp.read(self.max_bytes + 1)
                 resp_headers = resp.headers
+                while True:
+                    if time.monotonic() > end:
+                        raise ForgeError(f"GitLab {op}: no complete response within "
+                                         f"{self.deadline:g}s")
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        raise ForgeError(
+                            f"GitLab {op}: response larger than {self.max_bytes} bytes")
+                    chunks.append(chunk)
+        except ForgeError:
+            raise
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read(2048).decode("utf-8", "replace")
@@ -433,13 +542,15 @@ class GitLabForge(Forge):
             raise ForgeError(self._scrub(f"GitLab {op}: unreachable ({reason})")) from None
         except OSError as e:
             raise ForgeError(self._scrub(f"GitLab {op}: connection failed ({e})")) from None
-        if len(raw) > self.max_bytes:
-            raise ForgeError(f"GitLab {op}: response larger than {self.max_bytes} bytes")
+        raw = b"".join(chunks)
         if not raw.strip():
-            return None, resp_headers
+            return None, resp_headers, total
+        text = raw.decode("utf-8", "replace")
+        if not _json_depth_ok(text, self.max_depth):
+            raise ForgeError(f"GitLab {op}: response nests deeper than {self.max_depth}")
         try:
-            return json.loads(raw), resp_headers
-        except ValueError:
+            return json.loads(text), resp_headers, total
+        except (ValueError, RecursionError):
             raise ForgeError(f"GitLab {op}: response is not JSON") from None
 
     def _http_error(self, status: int, detail: str, op: str) -> ForgeError:
@@ -448,7 +559,7 @@ class GitLabForge(Forge):
             j = json.loads(detail)
             m = j.get("message") or j.get("error") if isinstance(j, dict) else None
             msg = m if isinstance(m, str) else json.dumps(m) if m else ""
-        except ValueError:
+        except (ValueError, RecursionError):
             msg = ""
         msg = self._scrub(msg)[:200]
         tail = f": {msg}" if msg else ""
@@ -481,18 +592,24 @@ class GitLabForge(Forge):
         return ForgeError(text, status)
 
     def _paged(self, path: str, params: dict[str, Any] | None = None, *,
-               limit: int | None = None, op: str = "") -> list[Any]:
+               limit: int | None = None, op: str = "", max_pages: int | None = None) -> list[Any]:
         out: list[Any] = []
         page: str | None = "1"
         pages = 0
+        total = 0
+        cap = max_pages or self.max_pages
         per_page = 100 if limit is None else max(1, min(100, limit))
         while page:
             pages += 1
-            if pages > self.max_pages:
-                raise ForgeError(f"GitLab {op or path}: more than {self.max_pages} pages")
-            data, headers = self._request(
+            if pages > cap:
+                raise ForgeError(f"GitLab {op or path}: more than {cap} pages")
+            data, headers, n = self._request_n(
                 "GET", path, params={**(params or {}), "per_page": per_page, "page": page},
                 op=op)
+            total += n
+            if total > self.max_total_bytes:
+                raise ForgeError(f"GitLab {op or path}: more than {self.max_total_bytes} "
+                                 "bytes across pages")
             if not isinstance(data, list):
                 raise ForgeError(f"GitLab {op or path}: expected a list")
             out.extend(data)
@@ -517,6 +634,23 @@ class GitLabForge(Forge):
         return {"open": "opened", "merged": "merged", "closed": "closed",
                 "all": "all"}.get(state, state)
 
+    def project_info(self) -> dict[str, Any]:
+        if self._project_info is None:
+            data, _ = self._request("GET", self._p(), op="read project")
+            self._project_info = data if isinstance(data, dict) else {}
+        return self._project_info
+
+    def _project_num(self) -> str:
+        pid = self.project_info().get("id")
+        if not isinstance(pid, int):
+            raise ForgeError("GitLab read project: no numeric project id")
+        return str(pid)
+
+    def _same(self, mr: dict[str, Any]) -> bool:
+        """Source and target are both this project: never a fork MR."""
+        pid = self._project_num()
+        return str(mr.get("source_project_id")) == pid == str(mr.get("target_project_id"))
+
     def _to_change(self, mr: dict[str, Any]) -> Change:
         return Change(
             id=mr.get("iid"), url=mr.get("web_url") or "",
@@ -527,7 +661,16 @@ class GitLabForge(Forge):
             merge_sha=mr.get("merge_commit_sha") or mr.get("squash_commit_sha"),
             author=((mr.get("author") or {}).get("name") or ""),
             created_at=mr.get("created_at"),
-            closed_at=mr.get("merged_at") or mr.get("closed_at"))
+            closed_at=mr.get("merged_at") or mr.get("closed_at"),
+            same_repo=self._same(mr))
+
+    def _checked_mr(self, iid: int, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        mr, _ = self._request("GET", self._p(f"/merge_requests/{int(iid)}"), params=params,
+                              op="read merge request")
+        if not isinstance(mr, dict) or not self._same(mr):
+            raise ForgeError(f"merge request !{iid} comes from another project (a fork); "
+                             "refusing to act on it")
+        return mr
 
     def _iid(self, ref: int | str, state: str = "open") -> int:
         if isinstance(ref, int):
@@ -541,14 +684,15 @@ class GitLabForge(Forge):
         mrs = self._paged(self._p("/merge_requests"), {
             "source_branch": branch, "target_branch": self.target,
             "state": self._gl_state(state), "order_by": "updated_at", "sort": "desc"},
-            limit=1, op="find merge request")
-        return self._to_change(mrs[0]) if mrs else None
-
-    def project_info(self) -> dict[str, Any]:
-        if self._project_info is None:
-            data, _ = self._request("GET", self._p(), op="read project")
-            self._project_info = data if isinstance(data, dict) else {}
-        return self._project_info
+            limit=20, max_pages=1, op="find merge request")
+        exact = [m for m in mrs if isinstance(m, dict) and m.get("source_branch") == branch]
+        same = [m for m in exact if self._same(m)]
+        if not same:
+            if exact:
+                raise ForgeError(f"the only merge request on {branch!r} comes from another "
+                                 "project (a fork); refusing to act on it")
+            return None
+        return self._to_change(same[0])
 
     # -- interface
 
@@ -561,9 +705,7 @@ class GitLabForge(Forge):
 
     def get_change(self, ref, *, state="open", with_commits=False, cwd=None):
         if isinstance(ref, int):
-            data, _ = self._request("GET", self._p(f"/merge_requests/{ref}"),
-                                    op="read merge request")
-            ch = self._to_change(data or {})
+            ch = self._to_change(self._checked_mr(ref))
         else:
             ch = self._find_by_branch(ref, state)
             if ch is None:
@@ -584,19 +726,21 @@ class GitLabForge(Forge):
                  "committer_email": str(c.get("committer_email") or "")}
                 for c in rows if isinstance(c, dict)]
 
-    def merge_change(self, ref, *, sha_pin=None, delete_branch=True, cwd=None):
+    def merge_change(self, ref, *, sha_pin=None, expect_branch=None, delete_branch=True,
+                     cwd=None):
+        if not sha_pin:
+            raise ForgeError("merge refused: no reviewed head sha to pin to")
+        _check_sha(sha_pin)
         iid = self._iid(ref)
-        if sha_pin:
-            _check_sha(sha_pin)
+        # One read checks the project, branch, state and head, and gives
+        # the fast-forward status.
+        mr = self._checked_mr(iid, {"include_diverged_commits_count": "true"})
+        _check_mergeable(self._to_change(mr), ref, sha_pin, expect_branch)
         method = str(self.project_info().get("merge_method") or "merge")
         if method in ("ff", "rebase_merge"):
             # The project only accepts a branch that sits on top of the
             # target. The server never rebases for the approver: a rebase
             # makes a new head sha, which is not the one that was approved.
-            mr, _ = self._request("GET", self._p(f"/merge_requests/{iid}"),
-                                  params={"include_diverged_commits_count": "true"},
-                                  op="read merge request")
-            mr = mr or {}
             behind = int(mr.get("diverged_commits_count") or 0)
             if behind > 0 or mr.get("detailed_merge_status") == "need_rebase" \
                     or mr.get("merge_status") == "cannot_be_merged_rebase":
@@ -611,7 +755,7 @@ class GitLabForge(Forge):
                 "sha": sha_pin, "should_remove_source_branch": delete_branch,
             }, op="merge")
         except ForgeError as e:
-            if e.status == 409 and sha_pin:
+            if e.status == 409:
                 raise ForgeError(
                     f"GitLab merge: refused, the head moved: merge request !{iid} is no "
                     f"longer at {sha_pin[:12]}. Review the new commits and approve "
@@ -644,9 +788,10 @@ class GitLabForge(Forge):
 
     def close_change(self, ref, *, delete_branch=True, cwd=None):
         iid = self._iid(ref)
-        data, _ = self._request("PUT", self._p(f"/merge_requests/{iid}"),
-                                body={"state_event": "close"}, op="close merge request")
-        branch = (data or {}).get("source_branch") or (ref if isinstance(ref, str) else "")
+        mr = self._checked_mr(iid)  # a fork MR's branch name is not ours to delete
+        self._request("PUT", self._p(f"/merge_requests/{iid}"),
+                      body={"state_event": "close"}, op="close merge request")
+        branch = mr.get("source_branch") or ""
         if delete_branch and branch:
             self._delete_branch(branch)
 
@@ -671,7 +816,9 @@ class GitLabForge(Forge):
         there for each commit the change landed, and an MR the caller
         merges pinned to the revert head. Nothing is pushed to the target
         directly, so protected-branch rules, pipelines and approval rules
-        apply to the revert like any change."""
+        apply to the revert like any change. The returned head is the
+        revert commit the server created; an MR reporting another head is
+        refused."""
         if change.state and change.state != "merged":
             raise ForgeError(f"merge request !{change.id} is not merged; nothing to revert")
         if change.merge_sha:
@@ -689,12 +836,13 @@ class GitLabForge(Forge):
         branch = f"revert/{src}-{int(time.time() * 1000)}"
         self._request("POST", self._p("/repository/branches"),
                       body={"branch": branch, "ref": target}, op="create revert branch")
-        head = None
+        head: str | None = None
         try:
             for s in shas:
                 data, _ = self._request("POST", self._p(f"/repository/commits/{s}/revert"),
                                         body={"branch": branch}, op="revert commit")
-                head = (data or {}).get("id") or head
+                head = str((data or {}).get("id") or "")
+                _check_sha(head)
             data, _ = self._request("POST", self._p("/merge_requests"), body={
                 "source_branch": branch, "target_branch": target,
                 "title": title or f"Revert {change.branch or f'!{change.id}'}",
@@ -708,26 +856,40 @@ class GitLabForge(Forge):
                 pass
             raise
         ch = self._to_change(data or {})
-        ch.head_sha = ch.head_sha or head
+        if ch.head_sha and ch.head_sha != head:
+            raise ForgeError(
+                f"revert merge request !{ch.id} reports head {ch.head_sha[:12]}, not the "
+                f"revert commit {head[:12] if head else '?'} the server created; not "
+                "merging it", 409)
+        ch.head_sha = head
         return ch
 
     def list_changes(self, state, *, limit=None):
         rows = self._paged(self._p("/merge_requests"), {
             "state": self._gl_state(state), "target_branch": self.target,
             "order_by": "updated_at", "sort": "desc"}, limit=limit,
-            op="list merge requests")
-        return [self._to_change(r) for r in rows if isinstance(r, dict)]
+            max_pages=10, op="list merge requests")
+        # Fork MRs never enter the queue, rejections or revert lookups.
+        return [c for c in (self._to_change(r) for r in rows if isinstance(r, dict))
+                if c.same_repo]
 
     def current_user(self):
+        """Identity of the token's user. The email is the public one or
+        GitLab's noreply form (<id>-<username>@users.noreply.<host>), never
+        the private primary address, since it is posted in MR notes."""
         u, _ = self._request("GET", "/user", op="read user")
         u = u or {}
         login = str(u.get("username") or "")
         if not login:
             raise ForgeError("GitLab read user: no username in the response")
+        uid = u.get("id")
+        host = urllib.parse.urlsplit(self.base).hostname or "gitlab"
+        noreply = f"{uid}-{login}@users.noreply.{host}" if isinstance(uid, int) \
+            else f"{login}@users.noreply.{host}"
         return {"login": login, "name": str(u.get("name") or ""),
-                "email": str(u.get("commit_email") or u.get("email")
-                             or u.get("public_email") or ""),
+                "email": str(u.get("public_email") or noreply),
                 "source": f"gitlab:{login} via GITLAB_TOKEN"}
+
 
 
 # ---------------------------------------------------------------- factory

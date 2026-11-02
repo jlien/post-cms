@@ -14,6 +14,8 @@ import io
 import json
 import logging
 import os
+import shutil
+import tempfile
 import subprocess
 import sys
 import threading
@@ -50,6 +52,12 @@ class StubGitLab:
         self.merge_method = "merge"
         self.force: dict[str, tuple[int, dict]] = {}  # "METHOD path" -> (status, body)
         self.big = False
+        self.raw: bytes | None = None      # serve these bytes for every 200
+        self.drip = 0.0                    # seconds between 1-byte writes
+        self.race = False                  # head moves just before a merge
+        self.mr_head_lie = False           # created MRs report a wrong head
+        self.user = {"id": 7, "username": "alice", "name": "Alice",
+                     "email": "alice.private@example.com"}
         self.redirect_to: str | None = None
         self.sleep = 0.0
         self.next_sha = 1000
@@ -89,7 +97,8 @@ class StubGitLab:
               "web_url": f"{self.url}/group/site/-/merge_requests/{iid}",
               "author": {"name": "Alice"}, "merge_commit_sha": None,
               "squash_commit_sha": None, "created_at": "2026-01-01T00:00:00Z",
-              "diverged_commits_count": 0, "detailed_merge_status": "mergeable"}
+              "diverged_commits_count": 0, "detailed_merge_status": "mergeable",
+              "source_project_id": 1, "target_project_id": 1}
         mr.update(extra)
         self.mrs[iid] = mr
         self.notes.setdefault(iid, [])
@@ -106,6 +115,8 @@ class StubGitLab:
                 raw = json.dumps(body).encode() if body is not None else b""
                 if stub.big:
                     raw = b"[" + b" " * (5 * 1024 * 1024) + b"]"
+                if stub.raw is not None and status == 200:
+                    raw = stub.raw
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 for k, v in (headers or {}).items():
@@ -113,7 +124,13 @@ class StubGitLab:
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 try:
-                    self.wfile.write(raw)
+                    if stub.drip:
+                        for i in range(len(raw)):
+                            self.wfile.write(raw[i:i + 1])
+                            self.wfile.flush()
+                            time.sleep(stub.drip)
+                    else:
+                        self.wfile.write(raw)
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # the client stopped reading at its size cap
 
@@ -146,8 +163,7 @@ class StubGitLab:
                 if path.startswith(p2):
                     path = p + path[len(p2):]
                 if path == "/api/v4/user":
-                    return self._send(200, {"username": "alice", "name": "Alice",
-                                            "email": "alice@example.com"})
+                    return self._send(200, stub.user)
                 if path == p:
                     return self._send(200, {"id": 1, "merge_method": stub.merge_method})
                 if path == p + "/merge_requests" and method == "GET":
@@ -167,8 +183,11 @@ class StubGitLab:
                            for m in stub.mrs.values()):
                         return self._send(409, {"message": ["Another open merge request already exists for this source branch"]})
                     iid = max(stub.mrs, default=0) + 1
-                    mr = stub.add_mr(iid, src, commits=0 or 1)
-                    mr["sha"] = stub.branches[src]
+                    head = stub.branches[src]
+                    mr = stub.add_mr(iid, src, commits=1)
+                    stub.branches[src] = head
+                    stub.mr_commits[iid][0]["id"] = head
+                    mr["sha"] = SHA(4242) if stub.mr_head_lie else head
                     mr["title"], mr["description"] = body["title"], body["description"]
                     return self._send(201, mr)
                 parts = path[len(p):].split("/")
@@ -194,6 +213,8 @@ class StubGitLab:
                     if rest == ["notes"] and method == "GET":
                         return self._paginate(list(reversed(stub.notes[iid])), q)
                     if rest == ["merge"] and method == "PUT":
+                        if stub.race:
+                            mr["sha"] = stub.new_sha()
                         if mr["state"] != "opened":
                             return self._send(405, {"message": "405 Method Not Allowed"})
                         if body.get("sha") and body["sha"] != mr["sha"]:
@@ -327,6 +348,26 @@ class GitLabForgeTest(_StubCase):
         self.assertEqual(cm.exception.status, 409)
         self.assertIn("head moved", str(cm.exception))
         self.assertEqual(self.stub.mrs[2]["state"], "opened")
+        self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
+
+    def test_merge_head_moves_after_check_gitlab_refuses(self):
+        mr = self.stub.add_mr(2, "agent/a")
+        self.stub.race = True
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.merge_change(2, sha_pin=mr["sha"])
+        self.assertEqual(cm.exception.status, 409)
+        self.assertIn("head moved", str(cm.exception))
+        self.assertEqual(self.stub.mrs[2]["state"], "opened")
+
+    def test_merge_requires_pin_and_branch(self):
+        mr = self.stub.add_mr(2, "agent/a")
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.merge_change(2)
+        self.assertIn("no reviewed head", str(cm.exception))
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.merge_change(2, sha_pin=mr["sha"], expect_branch="agent/other")
+        self.assertIn("not 'agent/other'", str(cm.exception))
+        self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
 
     def test_merge_rejects_bad_sha(self):
         self.stub.add_mr(2, "agent/a")
@@ -424,11 +465,109 @@ class GitLabForgeTest(_StubCase):
         self.assertNotIn("wrong-token", str(cm.exception))
 
     def test_merge_405_is_clear(self):
-        self.stub.add_mr(1, "agent/closed", state="closed")
+        mr = self.stub.add_mr(1, "agent/draft", title="Draft: x")
+        self.stub.force = {"PUT /api/v4/projects/group%2Fsite/merge_requests/1/merge": (
+            405, {"message": "405 Method Not Allowed"})}
         with self.assertRaises(forge.ForgeError) as cm:
-            self.f.merge_change(1)
+            self.f.merge_change(1, sha_pin=mr["sha"])
         self.assertEqual(cm.exception.status, 405)
         self.assertIn("draft, closed", str(cm.exception))
+
+    def test_merge_closed_is_refused_before_merge_call(self):
+        mr = self.stub.add_mr(1, "agent/closed", state="closed")
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.merge_change(1, sha_pin=mr["sha"])
+        self.assertEqual(cm.exception.status, 405)
+        self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
+
+    # -- fork merge requests (review round 1, High)
+
+    def test_fork_mr_with_same_branch_is_refused(self):
+        fork = self.stub.add_mr(9, "agent/a", source_project_id=666)
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.get_change("agent/a")
+        self.assertIn("fork", str(cm.exception))
+        for call in (lambda: self.f.merge_change(9, sha_pin=fork["sha"]),
+                     lambda: self.f.merge_change("agent/a", sha_pin=fork["sha"]),
+                     lambda: self.f.close_change(9),
+                     lambda: self.f.get_change(9)):
+            with self.subTest(), self.assertRaises(forge.ForgeError) as cm:
+                call()
+            self.assertIn("fork", str(cm.exception))
+        self.assertEqual(self.stub.mrs[9]["state"], "opened")
+        self.assertIn("agent/a", self.stub.branches)
+        self.assertFalse([r for r in self.stub.requests if r["method"] in ("PUT", "DELETE")])
+
+    def test_fork_mr_targeting_another_project_is_refused(self):
+        mr = self.stub.add_mr(9, "agent/a", target_project_id=666)
+        with self.assertRaises(forge.ForgeError):
+            self.f.merge_change(9, sha_pin=mr["sha"])
+
+    def test_same_project_mr_wins_over_newer_fork_mr(self):
+        self.stub.add_mr(3, "agent/a")
+        self.stub.add_mr(9, "agent/a", source_project_id=666)
+        ch = self.f.get_change("agent/a")
+        assert ch is not None
+        self.assertEqual(ch.id, 3)
+
+    def test_list_changes_drops_fork_mrs(self):
+        self.stub.add_mr(3, "agent/a")
+        self.stub.add_mr(9, "agent/b", source_project_id=666)
+        self.assertEqual([c.id for c in self.f.list_changes("open")], [3])
+
+    def test_revert_mr_reporting_another_head_is_refused(self):
+        mr = self.stub.add_mr(7, "agent/r")
+        merged = self.f.merge_change(7, sha_pin=mr["sha"])
+        self.stub.mr_head_lie = True
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.revert_change(merged)
+        self.assertIn("not the revert commit", str(cm.exception))
+
+    # -- transport limits (review round 1, Lows)
+
+    def test_proxy_settings_are_ignored(self):
+        proxy = StubGitLab()
+        self.addCleanup(proxy.stop)
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": proxy.url, "http_proxy": proxy.url,
+                                          "ALL_PROXY": proxy.url}):
+            f = forge.from_env(Path("."))
+            self.assertEqual(f.current_user()["login"], "alice")
+        self.assertEqual(proxy.requests, [])
+
+    def test_deeply_nested_json_is_a_forge_error(self):
+        self.stub.raw = b"[" * 100000 + b"]" * 100000
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.current_user()
+        self.assertIn("deeper", str(cm.exception))
+        self.stub.raw = b'{"a":' * 70 + b"1" + b"}" * 70
+        with self.assertRaises(forge.ForgeError):
+            self.f.current_user()
+
+    def test_slow_drip_hits_the_deadline(self):
+        self.f.timeout = 1.0
+        self.f.deadline = 0.5
+        self.stub.drip = 0.05
+        start = time.monotonic()
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.current_user()
+        self.assertIn("no complete response", str(cm.exception))
+        self.assertLess(time.monotonic() - start, 3)
+
+    def test_total_bytes_across_pages_capped(self):
+        for i in range(1, 251):
+            self.stub.add_mr(i, f"agent/p{i}", state="merged")
+        self.f.max_total_bytes = 50_000
+        with self.assertRaises(forge.ForgeError) as cm:
+            self.f.list_changes("merged")
+        self.assertIn("bytes across pages", str(cm.exception))
+
+    def test_identity_never_uses_private_email(self):
+        ident = self.f.current_user()
+        self.assertEqual(ident["email"], "7-alice@users.noreply.127.0.0.1")
+        self.stub.user["public_email"] = "alice@example.org"
+        self.assertEqual(self.f.current_user()["email"], "alice@example.org")
+        self.stub.user["commit_email"] = "alice.private@example.com"
+        self.assertNotIn("private", json.dumps(self.f.current_user()))
 
     def test_response_size_cap(self):
         self.stub.big = True
@@ -538,6 +677,22 @@ class FakeGh:
         raise AssertionError(f"unexpected command {cmd!r}")
 
 
+REPO = {("gh", "repo", "view"): (0, json.dumps({"name": "site", "owner": {"login": "acme"}}))}
+
+
+def pr_json(number: int, head: str, **override) -> dict:
+    p = {"number": number, "url": f"https://github.com/acme/site/pull/{number}",
+         "headRefName": "agent/a", "headRefOid": head, "state": "OPEN",
+         "isCrossRepository": False, "headRepository": {"name": "site"},
+         "headRepositoryOwner": {"login": "acme"}}
+    p.update(override)
+    return p
+
+
+def gh_pr(number: int, head: str, **override) -> dict:
+    return {("gh", "pr", "view", str(number)): (0, json.dumps(pr_json(number, head, **override)))}
+
+
 class GitHubForgeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.f = forge.GitHubForge(Path("."))
@@ -554,34 +709,78 @@ class GitHubForgeTest(unittest.TestCase):
                                        "--head", "agent/a"]])
 
     def test_merge_comment_close_commands(self):
-        fake = FakeGh()
+        fake = FakeGh({**gh_pr(5, SHA(3)), **REPO})
         with self.run_with(fake):
             self.f.comment(5, "ok")
-            self.f.merge_change(5)
-            self.f.merge_change(5, sha_pin=SHA(3))
+            self.f.merge_change(5, sha_pin=SHA(3), expect_branch="agent/a")
             self.f.close_change(5)
         self.assertEqual(fake.calls, [
             ["gh", "pr", "comment", "5", "--body", "ok"],
-            ["gh", "pr", "merge", "5", "--merge", "--delete-branch"],
+            ["gh", "pr", "view", "5", "--json", forge.GitHubForge._PR_FIELDS],
+            ["gh", "repo", "view", "--json", "name,owner"],
             ["gh", "pr", "merge", "5", "--merge", "--delete-branch",
              "--match-head-commit", SHA(3)],
             ["gh", "pr", "close", "5", "--delete-branch"],
         ])
 
+    def test_merge_refuses_without_pin_or_with_moved_head(self):
+        fake = FakeGh({**gh_pr(5, SHA(3)), **REPO})
+        with self.run_with(fake):
+            with self.assertRaises(forge.ForgeError):
+                self.f.merge_change(5)
+            with self.assertRaises(forge.ForgeError) as cm:
+                self.f.merge_change(5, sha_pin=SHA(4))
+        self.assertIn("head moved", str(cm.exception))
+        self.assertFalse([c for c in fake.calls if c[:3] == ["gh", "pr", "merge"]])
+
     def test_failures_raise_with_stderr(self):
-        fake = FakeGh({("gh", "pr", "merge"): (1, "")})
+        fake = FakeGh({("gh", "pr", "merge"): (1, ""), **gh_pr(5, SHA(3)), **REPO})
         with self.run_with(fake), self.assertRaises(forge.ForgeError) as cm:
-            self.f.merge_change(5)
+            self.f.merge_change(5, sha_pin=SHA(3))
         self.assertEqual(str(cm.exception), "boom")
+
+    def test_fork_pr_is_refused(self):
+        cases = {
+            "cross-repo flag": {"isCrossRepository": True},
+            "other owner": {"headRepositoryOwner": {"login": "mallory"}},
+            "other repo": {"headRepository": {"name": "site-fork"}},
+            "flag missing": {"isCrossRepository": None},
+        }
+        for label, override in cases.items():
+            with self.subTest(label):
+                f = forge.GitHubForge(Path("."))
+                fake = FakeGh({**gh_pr(9, SHA(3), **override), **REPO,
+                               ("gh", "pr", "list", "--head"): (0, json.dumps(
+                                   [pr_json(9, SHA(3), **override)]))})
+                with self.run_with(fake):
+                    for call in (lambda: f.get_change("agent/a"),
+                                 lambda: f.get_change(9),
+                                 lambda: f.merge_change(9, sha_pin=SHA(3))):
+                        with self.assertRaises(forge.ForgeError) as cm:
+                            call()
+                        self.assertIn("fork", str(cm.exception))
+                self.assertFalse([c for c in fake.calls if c[:3] == ["gh", "pr", "merge"]])
+
+    def test_branch_lookup_is_exact_and_prefers_same_repo(self):
+        rows = [pr_json(9, SHA(5), isCrossRepository=True),
+                pr_json(4, SHA(6), headRefName="agent/a-r2"),
+                pr_json(3, SHA(3))]
+        fake = FakeGh({("gh", "pr", "list", "--head"): (0, json.dumps(rows)), **REPO})
+        with self.run_with(fake):
+            ch = self.f.get_change("agent/a")
+        assert ch is not None
+        self.assertEqual(ch.id, 3)
 
     def test_get_change_and_list(self):
         fake = FakeGh({
-            ("gh", "pr", "list", "--head"): (0, json.dumps([{
-                "number": 5, "url": "u", "headRefName": "agent/a",
-                "headRefOid": SHA(4), "state": "OPEN"}])),
+            ("gh", "pr", "list", "--head"): (0, json.dumps([pr_json(5, SHA(4))])),
             ("gh", "pr", "list", "--state", "open"): (0, json.dumps([{
                 "number": 5, "title": "T", "headRefName": "agent/a", "url": "u",
-                "author": {"name": "Alice"}, "body": "risk: copy"}])),
+                "author": {"name": "Alice"}, "body": "risk: copy",
+                "isCrossRepository": False}, {
+                "number": 6, "title": "F", "headRefName": "agent/b", "url": "u2",
+                "isCrossRepository": True}])),
+            **REPO,
             ("gh", "api", "--paginate"): (0, json.dumps({
                 "sha": SHA(4), "author_name": "Alice", "author_email": "a@example.com",
                 "committer_name": "Bob", "committer_email": "b@example.com"}) + "\n"),
@@ -593,20 +792,35 @@ class GitHubForgeTest(unittest.TestCase):
         self.assertEqual((ch.id, ch.head_sha, ch.state), (5, SHA(4), "open"))
         self.assertEqual(ch.people, [("Alice", "a@example.com"), ("Bob", "b@example.com")])
         self.assertEqual((rows[0].author, rows[0].body), ("Alice", "risk: copy"))
-        self.assertEqual(fake.calls[-1], ["gh", "pr", "list", "--state", "open", "--json",
-                                          "number,title,headRefName,url,author,createdAt,body"])
+        self.assertEqual([r.id for r in rows], [5])  # the fork PR is dropped
+        self.assertEqual(fake.calls[-1], [
+            "gh", "pr", "list", "--state", "open", "--json",
+            "number,title,headRefName,url,author,createdAt,body,isCrossRepository"])
 
     def test_server_defaults_to_github_and_reject_uses_gh(self):
-        fake = FakeGh({("gh", "pr", "list", "--head"): (0, json.dumps([{"number": 8}]))})
+        fake = FakeGh({("gh", "pr", "list", "--head"): (0, json.dumps([pr_json(8, SHA(3))])),
+                       **REPO})
         ident = {"login": "bob", "name": "Bob", "email": "bob@example.com", "source": "test"}
         env = {k: v for k, v in os.environ.items() if k != "FORGE"}
         with mock.patch.dict(os.environ, env, clear=True), self.run_with(fake), \
                 mock.patch.object(srv, "_gh_identity", return_value=ident), \
+                mock.patch.object(srv, "_recorded_change", return_value=None), \
                 mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
             out = srv.tool_reject_proposal({"slug": "a", "reason": "no"})
         self.assertEqual((out["pr"], out["recorded"], out["closed"]), (8, True, True))
-        self.assertEqual(fake.calls[1][:4], ["gh", "pr", "comment", "8"])
-        self.assertEqual(fake.calls[2], ["gh", "pr", "close", "8", "--delete-branch"])
+        self.assertEqual(fake.calls[-2][:4], ["gh", "pr", "comment", "8"])
+        self.assertEqual(fake.calls[-1], ["gh", "pr", "close", "8", "--delete-branch"])
+
+    def test_server_approve_pins_recorded_head_github(self):
+        fake = FakeGh({**gh_pr(8, SHA(3)), **REPO})
+        rec = {"id": 8, "head": SHA(3)}
+        with self.run_with(fake), \
+                mock.patch.object(srv, "_recorded_change", return_value=rec), \
+                mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
+            out = srv._approve_one("a", "Bob", "bob@example.com", "test")
+        self.assertTrue(out["merged"])
+        self.assertEqual(fake.calls[-1], ["gh", "pr", "merge", "8", "--merge",
+                                          "--delete-branch", "--match-head-commit", SHA(3)])
 
 
 # ------------------------------------------------------ server, FORGE=gitlab
@@ -621,8 +835,11 @@ def _no_gh(cmd, *a, **kw):
 class ServerGitLabModeTest(_StubCase):
     def setUp(self) -> None:
         super().setUp()
+        ledger = Path(tempfile.mkdtemp(prefix="pcms-ledger-")) / "pcms-changes.json"
+        self.addCleanup(shutil.rmtree, ledger.parent, True)
         for p in (mock.patch.object(subprocess, "run", _no_gh),
                   mock.patch.object(srv, "_GH_IDENTITY_CACHE", None),
+                  mock.patch.object(srv, "_ledger_path", return_value=ledger),
                   mock.patch.object(srv, "_proposal_field_diff", return_value=[])):
             p.start()
             self.addCleanup(p.stop)
@@ -632,13 +849,76 @@ class ServerGitLabModeTest(_StubCase):
         self.assertEqual(ident["login"], "alice")
         self.assertEqual(ident["source"], "gitlab:alice via GITLAB_TOKEN")
 
-    def test_approve_one_merges_mr(self):
-        self.stub.add_mr(3, "agent/a")
+    def test_approve_one_merges_recorded_mr_pinned(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"):
             out = srv._approve_one("a", "Bob", "bob@example.com", "test")
         self.assertEqual((out["pr"], out["merged"], out["approval_recorded"]), (3, True, True))
         self.assertEqual(self.stub.mrs[3]["state"], "merged")
         self.assertIn("Approved by Bob", self.stub.notes[3][0]["body"])
+        put = [r for r in self.stub.requests if r["path"].endswith("/merge")][0]
+        self.assertEqual(json.loads(put["body"])["sha"], mr["sha"])
+
+    def test_approve_refuses_unrecorded_change(self):
+        self.stub.add_mr(3, "agent/a")
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
+                self.assertRaises(ValueError) as cm:
+            srv._approve_one("a", "Bob", "bob@example.com", "test")
+        self.assertIn("no change recorded", str(cm.exception))
+        self.assertEqual(self.stub.mrs[3]["state"], "opened")
+
+    def test_approve_refuses_when_mr_head_moved_since_record(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
+        mr["sha"] = SHA(77)  # someone pushed after the server's head
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
+                self.assertRaises(ValueError) as cm:
+            srv._approve_one("a", "Bob", "bob@example.com", "test")
+        self.assertIn("head moved", str(cm.exception))
+        self.assertFalse([r for r in self.stub.requests if r["path"].endswith("/merge")])
+
+    def test_approve_refuses_reviewed_head_mismatch(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
+                self.assertRaises(ValueError) as cm:
+            srv._approve_one("a", "Bob", "bob@example.com", "test", head=SHA(55))
+        self.assertIn("reviewed head", str(cm.exception))
+
+    def test_approve_never_merges_fork_mr_even_if_recorded_id_is_reused(self):
+        fork = self.stub.add_mr(9, "agent/a", source_project_id=666)
+        srv._record_change("agent/a", 9, fork["sha"])
+        with mock.patch.object(srv, "_proposal_branch", return_value="agent/a"), \
+                self.assertRaises(ValueError) as cm:
+            srv._approve_one("a", "Bob", "bob@example.com", "test")
+        self.assertIn("fork", str(cm.exception))
+        self.assertEqual(self.stub.mrs[9]["state"], "opened")
+
+    def test_open_pr_records_id_and_pushed_head_and_merge_now_pins_it(self):
+        self.stub.branches["agent/new"] = SHA(31)
+        pushed = subprocess.CompletedProcess([], 0, SHA(31) + "\n", "")
+        with mock.patch.object(srv, "_git", return_value=pushed):
+            ok, url = srv._open_pr(Path("."), "agent/new", "T", "risk: copy")
+        self.assertTrue(ok)
+        rec = srv._recorded_change("agent/new")
+        assert rec is not None
+        iid = rec["id"]
+        self.assertEqual(rec["head"], self.stub.mrs[iid]["sha"])
+        result: dict = {}
+        srv._merge_now("agent/new", Path("."), "ok", "skipped", result)
+        self.assertTrue(result["merged"], result)
+        put = [r for r in self.stub.requests if r["path"].endswith("/merge")][0]
+        self.assertEqual(json.loads(put["body"])["sha"], rec["head"])
+
+    def test_merge_now_refuses_moved_head(self):
+        mr = self.stub.add_mr(3, "agent/a")
+        srv._record_change("agent/a", 3, mr["sha"])
+        mr["sha"] = SHA(77)
+        result: dict = {}
+        srv._merge_now("agent/a", Path("."), "ok", "skipped", result)
+        self.assertFalse(result["merged"])
+        self.assertIn("head moved", result["merge_error"])
 
     def test_approve_without_open_mr(self):
         with mock.patch.object(srv, "_proposal_branch", return_value="agent/none"), \
@@ -665,9 +945,9 @@ class ServerGitLabModeTest(_StubCase):
         self.assertEqual(out["recently_rejected"][0]["reason"], "stale")
 
     def test_revert_through_pinned_mr(self):
-        self.stub.add_mr(1, "agent/foo-bar")
+        mr1 = self.stub.add_mr(1, "agent/foo-bar")
         mr = self.stub.add_mr(2, "agent/foo-r2", people=[("Carol", "carol@example.com")])
-        self.f.merge_change(1)
+        self.f.merge_change(1, sha_pin=mr1["sha"])
         self.f.merge_change(2, sha_pin=mr["sha"])
         out = srv.tool_revert_proposal({"slug": "foo", "deploy": False})
         self.assertTrue(out["reverted"])
@@ -681,6 +961,27 @@ class ServerGitLabModeTest(_StubCase):
         self.assertEqual(json.loads(put["body"])["sha"], self.stub.mrs[rev_iid]["sha"])
         self.assertIn("Reverted by Alice", self.stub.notes[2][0]["body"])
         self.assert_token_only_in_header()
+
+    def test_revert_gated_opens_mr_without_merging(self):
+        mr = self.stub.add_mr(2, "agent/foo")
+        self.f.merge_change(2, sha_pin=mr["sha"])
+        with mock.patch.dict(os.environ, {"MCP_ALLOW_APPROVE": "0"}):
+            out = srv.tool_revert_proposal({"slug": "foo", "deploy": True})
+        self.assertFalse(out["reverted"] or out["merged"])
+        self.assertIn("MCP_ALLOW_APPROVE=0", out["merge_skipped"])
+        rev_iid = max(self.stub.mrs)
+        self.assertEqual(self.stub.mrs[rev_iid]["state"], "opened")
+        self.assertTrue(out["revert_change"])
+        self.assertFalse([r for r in self.stub.requests
+                          if r["path"].endswith(f"/merge_requests/{rev_iid}/merge")])
+
+    def test_revert_identity_posts_no_private_email(self):
+        mr = self.stub.add_mr(2, "agent/foo")
+        self.f.merge_change(2, sha_pin=mr["sha"])
+        out = srv.tool_revert_proposal({"slug": "foo", "deploy": False})
+        self.assertNotIn("alice.private@example.com", json.dumps(out))
+        for r in self.stub.requests:
+            self.assertNotIn("alice.private@example.com", r["body"])
 
     def test_revert_unknown_slug(self):
         with self.assertRaises(ValueError) as cm:

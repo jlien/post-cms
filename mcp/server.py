@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -470,13 +471,92 @@ def _forge_ok(fn, *args, **kwargs) -> bool:
         return False
 
 
+# ---- change ledger: the id and head the server created --------------------
+#
+# Every change this server opens (or revises) is recorded as branch -> {id,
+# head}: the PR/MR number the forge returned and the commit the server
+# pushed. Merges go to that id, pinned to that head, never to whatever a
+# branch-name lookup or the forge reports now. Kept in the git dir, never in
+# the tree. E54's approval ledger can take over these two functions.
+
+_LEDGER_LOCK = threading.Lock()
+
+
+def _ledger_path() -> Path:
+    res = _git("rev-parse", "--git-common-dir")
+    d = Path(res.stdout.strip() or ".git")
+    if not d.is_absolute():
+        d = ROOT / d
+    return d / "pcms-changes.json"
+
+
+def _ledger_load(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_change(branch: str, change_id: int, head: str) -> None:
+    if not isinstance(change_id, int) or not re.fullmatch(r"[0-9a-f]{40,64}", head or ""):
+        return
+    forge_name = (os.environ.get("FORGE") or "github").strip().lower()
+    with _LEDGER_LOCK:
+        path = _ledger_path()
+        data = _ledger_load(path)
+        data.setdefault(forge_name, {})[branch] = {"id": change_id, "head": head}
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+
+def _recorded_change(branch: str) -> dict[str, Any] | None:
+    """{id, head} the server recorded for `branch`, or None."""
+    forge_name = (os.environ.get("FORGE") or "github").strip().lower()
+    with _LEDGER_LOCK:
+        rec = _ledger_load(_ledger_path()).get(forge_name, {}).get(branch)
+    if isinstance(rec, dict) and isinstance(rec.get("id"), int) and \
+            isinstance(rec.get("head"), str):
+        return rec
+    return None
+
+
+def _change_id_from(ch: forge_mod.Change) -> int | None:
+    if isinstance(ch.id, int):
+        return ch.id
+    m = re.search(r"/pull/(\d+)/?$", ch.url or "")
+    return int(m.group(1)) if m else None
+
+
+def _merge_recorded(f: forge_mod.Forge, branch: str, *, cwd: Path | None = None,
+                    reviewed_head: str | None = None) -> forge_mod.Change:
+    """Merge the change the server recorded for `branch`, pinned to the
+    head it recorded. A caller-supplied reviewed head must equal it."""
+    rec = _recorded_change(branch)
+    if rec is None:
+        raise forge_mod.ForgeError(
+            f"no change recorded by this server for {branch}: it was not opened or "
+            "revised here, so there is no reviewed head to pin a merge to. Run "
+            "revise_proposal to record one, review it, then approve.")
+    if reviewed_head and reviewed_head != rec["head"]:
+        raise forge_mod.ForgeError(
+            f"{branch}: the reviewed head {reviewed_head[:12]} is not the head this "
+            f"server recorded ({rec['head'][:12]}); refusing to merge", 409)
+    return f.merge_change(rec["id"], sha_pin=rec["head"], expect_branch=branch, cwd=cwd)
+
+
 def _merge_now(branch: str, wt: Path, note: str, deploy_note: str,
                result: dict[str, Any]) -> None:
-    """merge=true on a propose_* tool: record the approval, then merge."""
+    """merge=true on a propose_* tool: record the approval, then merge the
+    change just opened, pinned to the head just pushed."""
     f = _forge()
-    result["approval_recorded"] = _forge_ok(f.comment, branch, note, cwd=wt)
+    rec = _recorded_change(branch)
+    result["approval_recorded"] = _forge_ok(
+        f.comment, rec["id"] if rec else branch, note, cwd=wt)
     try:
-        f.merge_change(branch, cwd=wt)
+        _merge_recorded(f, branch, cwd=wt)
     except forge_mod.ForgeError as e:
         result["merged"] = False
         result["merge_error"] = str(e)[:300]
@@ -493,6 +573,10 @@ def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None =
         ch = _forge().create_change(branch, title, pr_body, cwd=wt, head=head)
     except forge_mod.ForgeError as e:
         return False, str(e)[:300]
+    change_id = _change_id_from(ch)
+    pushed = _git("rev-parse", "HEAD", worktree=wt)
+    if change_id is not None and pushed.returncode == 0:
+        _record_change(head or branch, change_id, pushed.stdout.strip())
     return True, ch.url
 
 
@@ -1278,9 +1362,19 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
                    env_extra=env, worktree=tmp)
         if res.returncode != 0 and "nothing to commit" not in (res.stdout + res.stderr):
             raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+        committed = res.returncode == 0
         push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+        if committed:
+            # The new head is the one the server created: record it as the
+            # head to pin approval to. A revise with nothing to commit keeps
+            # the old record (it never adopts a head someone else pushed).
+            rec = _recorded_change(branch)
+            change_id = rec["id"] if rec else _open_change_id(_forge(), branch)
+            pushed = _git("rev-parse", "HEAD", worktree=tmp)
+            if change_id is not None and pushed.returncode == 0:
+                _record_change(branch, change_id, pushed.stdout.strip())
         return {"revised": True, "branch": branch,
                 "pr_url": _open_pr_for_branch(branch),
                 "preview_artifact": _artifact_payload(
@@ -1521,22 +1615,30 @@ def _is_self_approval(author_name: str, author_email: str, ident: dict[str, Any]
 
 
 def _approve_one(slug: str, approver_name: str, approver_email: str,
-                 identity_source: str) -> dict[str, Any]:
-    """Merge one proposal PR with the approver's identity on the record."""
+                 identity_source: str, head: str | None = None) -> dict[str, Any]:
+    """Merge one proposal PR with the approver's identity on the record:
+    the change id the server recorded, pinned to the head it recorded
+    (`head`, when given, must equal it)."""
     branch = _proposal_branch(slug)
     if branch is None:
         raise ValueError(f"no proposal branch for slug {slug!r}")
     f = _forge()
-    pr_number = _open_change_id(f, branch)
-    if pr_number is None:
-        raise ValueError(f"no open PR on {branch} — nothing to approve")
+    rec = _recorded_change(branch)
+    if rec is None:
+        if _open_change_id(f, branch) is None:
+            raise ValueError(f"no open PR on {branch} — nothing to approve")
+        raise ValueError(
+            f"{branch} has no change recorded by this server (not opened or revised "
+            "here), so there is no reviewed head to pin the merge to. Run "
+            "revise_proposal to record one, review it, then approve.")
+    pr_number = rec["id"]
     out: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
     out["approval_recorded"] = _forge_ok(
         f.comment, pr_number,
         f"Approved by {approver_name} <{approver_email}> via approve_proposal "
         f"[identity: {identity_source}]")
     try:
-        f.merge_change(pr_number)
+        _merge_recorded(f, branch, reviewed_head=head)
     except forge_mod.ForgeError as e:
         raise ValueError(f"merge failed for {slug}: {str(e)[:300]}")
     out["merged"] = True
@@ -1639,7 +1741,8 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if branch is None:
         raise ValueError(f"no proposal branch for slug {slug!r}")
     f = _forge()
-    pr_number = _open_change_id(f, branch)
+    rec = _recorded_change(branch)
+    pr_number = rec["id"] if rec else _open_change_id(f, branch)
     if pr_number is None:
         raise ValueError(f"no open PR on {branch} — nothing to reject")
     recorded = _forge_ok(
@@ -1677,8 +1780,19 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("slug required")
     f = _forge()
     if f.name == "gitlab":
+        # Merging the revert MR lands on main, so it takes the same gate as
+        # every merge. Refused: the revert MR still opens, unmerged, for a
+        # human to merge in GitLab.
+        try:
+            _approval_allowed()
+            gate_error = None
+        except ValueError as e:
+            gate_error = str(e)
         return _revert_via_mr(f, slug, approver_name, approver_email,
-                              identity_source, bool(args.get("deploy", True)))
+                              identity_source, bool(args.get("deploy", True)),
+                              merge_refused=gate_error)
+    # GitHub reverts push to main directly: gate before any side effect.
+    _approval_allowed()
     _git("fetch", "origin")
     log = _git("log", "origin/main", "--merges", "--format=%H %s", "--")
     # The branch name in the merge subject may carry a kind prefix
@@ -1727,7 +1841,7 @@ def _merged_change_for(f: forge_mod.Forge, slug: str) -> forge_mod.Change | None
 
 def _revert_via_mr(f: forge_mod.Forge, slug: str, approver_name: str,
                    approver_email: str, identity_source: str,
-                   deploy: bool) -> dict[str, Any]:
+                   deploy: bool, merge_refused: str | None = None) -> dict[str, Any]:
     """Forge-side revert (GitLab): find the merged MR through the API, open
     a revert MR (forge.revert_change), then merge it pinned to the revert
     head so nothing pushed in between can ride along. Nothing touches the
@@ -1753,8 +1867,15 @@ def _revert_via_mr(f: forge_mod.Forge, slug: str, approver_name: str,
     if rev.id is None or not rev.head_sha:
         raise ValueError(f"revert merge request {rev.url or ''} has no head to pin; "
                          "not merging it")
+    _record_change(rev.branch, rev.id, rev.head_sha)
+    if merge_refused:
+        out["reverted"] = False
+        out["merged"] = False
+        out["merge_skipped"] = merge_refused
+        out["deploy"] = "skipped (revert merge request open, not merged)"
+        return out
     try:
-        merged = f.merge_change(rev.id, sha_pin=rev.head_sha)
+        merged = _merge_recorded(f, rev.branch)
     except forge_mod.ForgeError as e:
         raise ValueError(f"revert merge request {rev.url or rev.id} is open but was "
                          f"not merged: {e}")
