@@ -685,6 +685,9 @@ fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .or_else(|| read_site_theme(&root))
         .unwrap_or_else(|| "default".to_string());
+    if !postcms_build::sandbox::valid_theme_name(&theme_name) {
+        bail!("theme {theme_name:?} is not a valid theme name (lowercase letters, digits, '-' and '_', at most 64)");
+    }
     let theme_dir = root.join("themes").join(&theme_name);
     if !theme_dir.is_dir() {
         bail!(
@@ -693,6 +696,7 @@ fn main() -> Result<()> {
             available_themes(&root)
         );
     }
+    postcms_build::sandbox::check_within(&theme_dir, &root).map_err(anyhow::Error::msg)?;
     let templates_dir = root.join("templates");
     let mut tera = load_tera(&root, &theme_dir, &templates_dir)?;
     let style = compile_theme_css(&root, &theme_dir, &theme_name, css)?;
@@ -852,7 +856,7 @@ fn main() -> Result<()> {
         .filter(|s| !s.trim().is_empty())
     {
         let wanted: Vec<String> = if spec.trim() == "all" {
-            available_themes(&root)
+            available_themes(&root).into_iter().filter(|n| postcms_build::sandbox::valid_theme_name(n)).collect()
         } else {
             spec.split(',')
                 .map(|s| s.trim().to_string())
@@ -862,11 +866,15 @@ fn main() -> Result<()> {
         let preview_dir = dist.join("preview");
         let mut built: Vec<String> = Vec::new();
         for name in &wanted {
+            if !postcms_build::sandbox::valid_theme_name(name) {
+                bail!("SITE_PREVIEW_THEMES: {name:?} is not a valid theme name (lowercase letters, digits, '-' and '_', at most 64)");
+            }
             let tdir = root.join("themes").join(name);
             if !tdir.is_dir() {
                 eprintln!("preview: skip unknown theme {name:?}");
                 continue;
             }
+            postcms_build::sandbox::check_within(&tdir, &root).map_err(anyhow::Error::msg)?;
             let root_prefix = format!("/preview/{name}");
             let out = preview_dir.join(name);
             let mut ttera = load_tera(&root, &tdir, &templates_dir)?;

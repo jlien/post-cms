@@ -69,6 +69,13 @@ pub fn check_confined(dir: &Path) -> Result<(), String> {
     walk(&root, &root)
 }
 
+/// A theme name (`site.yaml` `theme:`, `SITE_THEME`, `SITE_PREVIEW_THEMES`)
+/// is one plain directory name under `themes/`: `^[a-z0-9_-]{1,64}$`.
+pub fn valid_theme_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
 /// [`check_confined`], plus: the directory itself must resolve inside
 /// `site_root` (so `templates/` or a theme cannot be a symlink, or a `..`
 /// path, to somewhere else on the machine).
@@ -80,7 +87,7 @@ pub fn check_within(dir: &Path, site_root: &Path) -> Result<(), String> {
     let real = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
     if !real.starts_with(&site) {
         return Err(format!(
-            "template directory {} resolves outside the site root {}",
+            "template or theme directory {} resolves outside the site root {}",
             dir.display(),
             site.display()
         ));
@@ -98,7 +105,7 @@ fn walk(dir: &Path, root: &Path) -> Result<(), String> {
             let inside = path.canonicalize().is_ok_and(|t| t.starts_with(root));
             if !inside {
                 return Err(format!(
-                    "template symlink {} points outside {} (or nowhere); templates may only link inside it",
+                    "symlink {} points outside {} (or nowhere); template and theme files may only link inside it",
                     path.display(),
                     root.display()
                 ));
@@ -203,6 +210,16 @@ mod tests {
         std::fs::remove_file(tpl.join("dangling.html")).unwrap();
 
         assert!(check_confined(&tmp.path().join("absent")).is_ok());
+    }
+
+    #[test]
+    fn theme_names_are_plain_directory_names() {
+        for ok in ["astra", "default", "my-theme_2", &"a".repeat(64)] {
+            assert!(valid_theme_name(ok), "{ok}");
+        }
+        for bad in ["", "../x", "..", ".", "a/b", "A", "x y", "/abs", "a\\b", &"a".repeat(65)] {
+            assert!(!valid_theme_name(bad), "{bad}");
+        }
     }
 
     #[cfg(unix)]

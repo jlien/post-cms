@@ -164,7 +164,9 @@ Templates see only their context; they cannot read the build environment or the 
 - `get_env(...)` always fails the build with `get_env is disabled: templates cannot read the build environment`; pass values through `site.yaml` or page and item fields instead.
 - `throw(...)` fails the build with `a template called throw()`; its `message` is never printed.
 - `now()` is always UTC (`utc=` is accepted and ignored), so the host time zone never reaches the output. `now(timestamp=true)` and `now() | date(format="%Y")` work as before.
-- `include`, `extends` and `import` resolve only among the loaded templates. `templates/` and `<theme>/templates/` must resolve inside the site root (a `theme:` such as `../../x` or a symlinked directory pointing elsewhere is refused), and a symlink under them that resolves outside that directory, or does not resolve, fails the build before any template is read.
+- `include`, `extends` and `import` resolve only among the loaded templates.
+- A theme name (`site.yaml` `theme:`, `SITE_THEME`, each `SITE_PREVIEW_THEMES` entry) must match `^[a-z0-9_-]{1,64}$`; anything else, such as `../../x`, fails the build. `SITE_PREVIEW_THEMES=all` skips directories whose names do not match.
+- `build-site` checks `templates/` and the theme directory (`theme.css`, `assets/`, `templates/`) before reading them: each must resolve inside the site root, and a symlink under them that resolves outside that directory, or does not resolve, fails the build. `pt-render --templates <dir>` applies the symlink check to `<dir>`.
 
 Every other Tera builtin function, filter and test works as documented.
 

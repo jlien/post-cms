@@ -138,17 +138,78 @@ fn a_template_symlink_out_of_templates_stops_the_build() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// `site.yaml` pointing at `../../outside`, which holds only `files`.
+fn outside_theme(tmp: &Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let root = tmp.join("site");
+    site(&root, "ok");
+    for (rel, body) in files {
+        write(tmp, &format!("outside/{rel}"), body);
+    }
+    write(&root, "site.yaml", "theme: ../../outside\nbuiltin_pages: false\nbase_url: https://www.example.com\n");
+    root
+}
+
+fn assert_refused(root: &Path, out: &Output, why: &str) {
+    let seen = everything(root, out);
+    assert!(!out.status.success(), "build succeeded");
+    assert!(seen.contains(why), "expected {why:?}:\n{seen}");
+    assert!(!seen.contains(SECRET), "a file outside the site was read:\n{seen}");
+}
+
 #[test]
 fn a_theme_outside_the_site_cannot_supply_templates() {
     let tmp = tempfile::tempdir().unwrap();
+    let root = outside_theme(tmp.path(), &[("templates/leak.html", &format!("{SECRET} {{{{ broken")), ("theme.css", "body{}\n")]);
+    assert_refused(&root, &build(&root), "not a valid theme name");
+}
+
+#[test]
+fn a_dotdot_theme_with_only_theme_css_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let css = format!(".{SECRET} {{ color: #000; }}\n");
+    let root = outside_theme(tmp.path(), &[("theme.css", &css)]);
+    assert_refused(&root, &build(&root), "not a valid theme name");
+}
+
+#[test]
+fn bad_preview_theme_names_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("site");
     site(&root, "ok");
-    write(tmp.path(), "outside/templates/leak.html", &format!("{SECRET} {{{{ broken"));
-    write(tmp.path(), "outside/theme.css", "body{}\n");
-    write(&root, "site.yaml", "theme: ../../outside\nbuiltin_pages: false\nbase_url: https://www.example.com\n");
-    let out = build(&root);
-    let seen = everything(&root, &out);
-    assert!(!out.status.success(), "build succeeded");
-    assert!(seen.contains("outside the site root"), "{seen}");
-    assert!(!seen.contains(SECRET), "the outside template was read:\n{seen}");
+    write(tmp.path(), "outside/theme.css", &format!(".{SECRET} {{ color: #000; }}\n"));
+    let out = Command::new(env!("CARGO_BIN_EXE_build-site"))
+        .current_dir(&root)
+        .env("SITE_ROOT", &root)
+        .env("SITE_PREVIEW_THEMES", "astra,../../outside")
+        .env_remove("SITE_THEME")
+        .env_remove("SITE_BASE_URL")
+        .env_remove("DRAFTS")
+        .output()
+        .unwrap();
+    assert_refused(&root, &out, "SITE_PREVIEW_THEMES");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_theme_directory_linked_outside_the_site_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("site");
+    site(&root, "ok");
+    write(tmp.path(), "outside/theme.css", &format!(".{SECRET} {{ color: #000; }}\n"));
+    std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("themes/linked")).unwrap();
+    write(&root, "site.yaml", "theme: linked\nbuiltin_pages: false\nbase_url: https://www.example.com\n");
+    assert_refused(&root, &build(&root), "outside the site root");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_theme_file_linked_outside_the_theme_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("site");
+    site(&root, "ok");
+    let css = root.join("themes/astra/theme.css");
+    write(tmp.path(), "outside.css", &format!(".{SECRET} {{ color: #000; }}\n"));
+    fs::remove_file(&css).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("outside.css"), &css).unwrap();
+    assert_refused(&root, &build(&root), "points outside");
 }
