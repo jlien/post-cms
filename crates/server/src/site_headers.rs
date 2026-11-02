@@ -214,6 +214,9 @@ pub fn validate_header(name: &str, value: &str) -> Result<(HeaderName, HeaderVal
     if value != value.trim() {
         return Err("value has leading or trailing whitespace".into());
     }
+    if lower == "cache-control" {
+        crate::cache::validate(value)?;
+    }
     let n = HeaderName::from_bytes(lower.as_bytes()).map_err(|e| e.to_string())?;
     let v = HeaderValue::from_str(value).map_err(|e| e.to_string())?;
     Ok((n, v))
@@ -433,6 +436,15 @@ headers:
         }
         assert!(validate_header("Referrer-Policy", "no-referrer").is_ok());
         assert!(validate_header("Cache-Control", "no-store").is_ok());
+    }
+
+    #[test]
+    fn rule_cache_control_values_are_validated() {
+        let y = "headers:\n  rules:\n    - path: /a\n      headers:\n        Cache-Control: \"public, max-age=soon\"\n";
+        assert!(parse(y).unwrap_err().to_string().contains("whole number"));
+        let y = "headers:\n  default:\n    Cache-Control: \"public, s-max-age=60\"\n";
+        assert!(parse(y).unwrap_err().to_string().contains("not a known"));
+        assert!(parse("headers:\n  default:\n    Cache-Control: \"public, max-age=60\"\n").is_ok());
     }
 
     #[test]

@@ -688,4 +688,91 @@ mod iap_e2e {
             assert!(!err.contains("origin serving"), "{err}");
         }
     }
+
+    fn raw(addr: SocketAddr, method: &str, path: &str, assertion: Option<&str>) -> String {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let extra = assertion.map(|t| format!("x-goog-iap-jwt-assertion: {t}\r\n")).unwrap_or_default();
+        write!(s, "{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    /// Every way site.yaml can set Cache-Control (the `cache:` classes, a
+    /// `headers.default`, a `/preview/*` rule) changes public responses and
+    /// never a /preview response: served, refused (404) or 405.
+    #[test]
+    fn site_yaml_cache_rules_never_reach_preview() {
+        let site = preview_site("cache-preview");
+        std::fs::write(
+            site.path().join("site.yaml"),
+            "title: x\ncache:\n  html: \"public, max-age=600\"\n  not_found: \"public, max-age=900\"\n\
+             headers:\n  default:\n    X-Frame-Options: DENY\n  rules:\n    - path: [/preview, /preview/*]\n      headers:\n        \
+             Cache-Control: \"public, max-age=31536000, immutable\"\n        X-Robots-Tag: all\n    - path: /about\n      headers:\n        \
+             Cache-Control: \"public, max-age=60\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site.path().join("dist/about")).unwrap();
+        std::fs::write(site.path().join("dist/about/index.html"), "<p>about</p>").unwrap();
+        let k = key();
+        let (url, _hits) = jwks_server(jwks("k1", &k));
+        let mut cmd = server();
+        cmd.env("IAP_AUDIENCE", AUD).env("IAP_JWKS_URL", &url).env("IAP_JWKS_ALLOW_HTTP", "1");
+        let (_srv, addr, lines, _rest) = start_cmd(cmd, site.path());
+        assert!(lines.iter().any(|l| l.starts_with("cache: html \"public, max-age=600\"")), "{lines:?}");
+
+        // Public responses take the site's values.
+        let r = raw(addr, "GET", "/", None);
+        assert!(has_header(&r, "cache-control: public, max-age=600"), "{r}");
+        let r = raw(addr, "GET", "/about/", None);
+        assert!(has_header(&r, "cache-control: public, max-age=60"), "{r}");
+        let r = raw(addr, "GET", "/missing/", None);
+        assert!(r.starts_with("HTTP/1.1 404") && has_header(&r, "cache-control: public, max-age=900"), "{r}");
+
+        // Preview: never.
+        let t = token("k1", &k);
+        for (method, path, token, status) in [
+            ("GET", "/preview/drafts/", Some(t.as_str()), "200"),
+            ("GET", "/preview/drafts/", None, "404"),
+            ("GET", "/preview/missing/", Some(t.as_str()), "404"),
+            ("POST", "/preview/drafts/", Some(t.as_str()), "405"),
+            ("GET", "/preview", None, "404"),
+        ] {
+            let r = raw(addr, method, path, token);
+            assert!(r.starts_with(&format!("HTTP/1.1 {status}")), "{method} {path}: {r}");
+            assert!(has_header(&r, "cache-control: private, no-store"), "{method} {path}: {r}");
+            assert!(has_header(&r, "x-robots-tag: noindex, nofollow"), "{method} {path}: {r}");
+            let head = r.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+            assert_eq!(head.matches("cache-control:").count(), 1, "{method} {path}: {r}");
+            assert!(head.contains("vary:") && head.contains("x-goog-iap-jwt-assertion"), "{method} {path}: {r}");
+        }
+    }
+}
+
+/// An invalid Cache-Control value in site.yaml refuses to start (exit 1)
+/// and names the key.
+#[test]
+fn invalid_cache_values_refuse_to_start() {
+    for (yaml, want) in [
+        ("cache:\n  html: \"public, max-age=1d\"\n", "cache.html"),
+        ("cache:\n  pages: no-store\n", "unknown key"),
+        ("headers:\n  default:\n    Cache-Control: \"public, private\"\n", "both public and private"),
+    ] {
+        let site = temp_site("cache-bad");
+        std::fs::write(site.path().join("site.yaml"), yaml).unwrap();
+        let mut child = server()
+            .env("SITE_ROOT", site.path())
+            .env("PORT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let code = wait_exit(&mut child);
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        assert_eq!(code, Some(1), "{yaml}: {err}");
+        assert!(err.contains(want), "{yaml}: {err}");
+        assert!(!err.contains("origin serving"), "{err}");
+    }
 }
