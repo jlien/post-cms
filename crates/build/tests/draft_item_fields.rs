@@ -231,7 +231,7 @@ fn draft_index_escapes_titles() {
     write(
         root,
         "content/notes/evil/meta.yaml",
-        "title: '<img src=x onerror=alert(1)> \\\"&'\ndescription: Hostile.\n",
+        "title: '<img src=x onerror=alert(1)> \\\"&'\ndescription: Hostile.\nkicker: K\nauthor: ada\n",
     );
     write(root, "content/notes/evil/index.mdx", "Evil.\n");
     build(root, true);
