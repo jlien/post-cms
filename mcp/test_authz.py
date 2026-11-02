@@ -275,6 +275,19 @@ class IdentityTest(_Env):
         ident["id"] = "https://other.example.com|sub-7"
         self.assertIsNone(authz.role_for(ident, self.cfg))
 
+    def test_iap_matches_id_or_signed_email(self):
+        cfg = authz.parse_config({"allowed_domains": ["example.com"], "users": [
+            {"id": "https://cloud.google.com/iap|accounts.google.com:1", "role": "author"},
+            {"email": "bob@example.com", "role": "reader"}]}, require_domains=True)
+        ident = {"id": "https://cloud.google.com/iap|accounts.google.com:1",
+                 "email": "x@example.com", "kind": "iap", "email_verified": True}
+        self.assertEqual(authz.role_for(ident, cfg), "author")
+        ident = {"id": "https://cloud.google.com/iap|accounts.google.com:2",
+                 "email": "bob@example.com", "kind": "iap", "email_verified": True}
+        self.assertEqual(authz.role_for(ident, cfg), "reader")
+        ident["email"] = "bob@example.org"
+        self.assertIsNone(authz.role_for(ident, cfg))
+
     def test_email_on_an_id_entry_is_display_only(self):
         self.assertIsNone(authz.role_for(_oidc("octo.reader@example.com"), self.cfg))
 

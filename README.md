@@ -80,7 +80,7 @@ Lower the batch on small CI runners. Raising it above 32 costs memory and gains 
 
 ### Tailwind CLI
 
-The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. The CLI's own `PATH` is filtered the same way, so a `node` placed in the site never runs either. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. When it is not on `PATH` or exits non-zero, the build inlines the raw `theme.css` and prints a warning.
+The theme CSS is compiled by `tailwindcss` from `PATH` (the npm `@tailwindcss/cli` or the standalone binary). Only absolute `PATH` entries are searched: an empty or relative entry (`::`, `.`, `node_modules/.bin`) is skipped, since it would resolve against the site root and run a `tailwindcss` placed in the site. The CLI's own `PATH` is filtered the same way, so a `node` placed in the site never runs either. Put `$PWD/node_modules/.bin` on `PATH`, not the relative form. By default, when it is not on `PATH`, exits non-zero or writes empty CSS, the build inlines the raw `theme.css` and prints a warning (`warning: ...; inlining raw theme.css`), so a site still builds without Node. To make any of those fail the build instead, pass `build-site --require-css-compiler` or set `POSTCMS_REQUIRE_TAILWIND=1`; use one of them in CI and in any check that measures the CSS, since raw `theme.css` is not what production serves. `POSTCMS_REQUIRE_TAILWIND` accepts `1`, `0` or unset; any other value fails the build before `dist/` is touched.
 
 The CLI is third-party code, so it does not inherit the build's environment (which can hold secrets such as `SANITY_READ_TOKEN`). It gets only these variables, when set:
 
@@ -238,8 +238,28 @@ It listens on 127.0.0.1 only by default, so a dev or CI run is not reachable fro
 | `PORT` | `8787` | Port to listen on. `0` lets the OS pick a free one; the startup line prints the address actually bound. |
 | `--host ADDR` | `127.0.0.1` | IP address to listen on (`--host 0.0.0.0` or `--host=::`). Only IP literals and `localhost` are accepted, never other host names. |
 | `POSTCMS_HOST` | unset | Same as `--host`, for environments configured by env vars; `--host` wins when both are set. |
+| `IAP_AUDIENCE` | unset | Turns on the draft preview behind Identity-Aware Proxy (IAP): the preview backend service, `/projects/<number>/global/backendServices/<id>`. Unset: `/preview/` is always 404. |
+| `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | IAP signing keys (JWK set). Must be `https`. |
+| `IAP_JWKS_MAX_STALE_SECS` | `86400` | How long past the 1 h cache life the key set is still used while every refresh fails. After that every preview token is refused and the server logs an error. |
+| `IAP_JWKS_ALLOW_HTTP` | unset | `1` allows an `http` `IAP_JWKS_URL` on a loopback host only. For tests; never set it in a deploy. |
 
 A host that is not an IP address (including a `POSTCMS_HOST` or `--host` value that is not valid UTF-8), or an unknown flag, is a usage error (exit 2) and nothing listens. Binding a non-loopback address prints `warning: listening on ...: other machines can reach this server` on stderr. IPv4-mapped IPv6 addresses count as the IPv4 address they carry, so `::ffff:127.0.0.1` is loopback and does not warn.
+
+**Draft preview behind IAP.** A `DRAFTS=1` build writes unpublished items under `dist/preview/` (theme previews from `SITE_PREVIEW_THEMES` land there too). The server serves `/preview` and everything under it only when the request carries an `x-goog-iap-jwt-assertion` header that verifies:
+
+- signed ES256 by a key from `IAP_JWKS_URL`, found by the token's `kid` (`alg` must be exactly `ES256`, so `none` and `HS256` are refused; any `crit` header is refused);
+- `aud` equal to `IAP_AUDIENCE` and `iss` equal to `https://cloud.google.com/iap`;
+- `exp` not passed, and `iat` and `nbf` (when present) not in the future, each with 30 s of clock skew; each must be an integer from 1 to 9999999999 (floats, strings and null are refused);
+- an `email` claim.
+
+The `Host` header plays no part: when the public and preview hosts reach the same service, any client can send any header to the public host, so only the signature decides. Every `/preview/` response, served or refused and for any method (a `POST` gets a 405 with them too), sends `Cache-Control: private, no-store` and `X-Robots-Tag: noindex, nofollow`, applied after `site.yaml` headers so no site rule can make a draft cacheable. A refused request gets the site's normal 404 page.
+
+Keys are fetched with a 5 s timeout, a 64 KB cap, no redirects, and https only, one fetch at a time. They are cached for an hour. Two separate budgets decide when to fetch again:
+
+- Stale set: the first request after the hour fetches at once; while fetches fail, retries are at least 30 s apart and the cached keys keep working for up to `IAP_JWKS_MAX_STALE_SECS`.
+- Unknown `kid` on a fresh set: at most one fetch per 30 s, and a `kid` the last fetch showed missing is remembered for 5 minutes and fetches nothing. A flood of forged `kid`s therefore cannot hammer the key endpoint or delay the stale-set refresh.
+
+Startup: with `IAP_AUDIENCE` unset and a `dist/preview/` present, the server logs one warning (`warning: dist/preview/ exists but IAP_AUDIENCE is unset ...`) and serves no preview. A set but malformed `IAP_AUDIENCE`, or an `IAP_JWKS_URL` that is not https, refuses to start. Handlers that need the signed-in user (for example an approval step) take the `iap::VerifiedIdentity` extractor, which holds the verified `email` and `sub`, or `None`.
 
 **Upstream errors.** When the model call fails, `/api/ask` returns a fixed message and never the upstream's own error text, which can name `LLM_BASE_URL`, internal hosts or headers:
 
@@ -301,7 +321,44 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
-Unit tests (standard library, no network):
+## Hosted MCP behind an identity-aware proxy
+
+`mcp/http_server.py` serves the MCP tools over HTTP. `OAUTH_MODE` picks the
+identity source: `github`, `oidc` (bearer tokens), or `iap`.
+
+With `OAUTH_MODE=iap` the server sits behind Google Cloud Identity-Aware
+Proxy and trusts only the proxy's signed `x-goog-iap-jwt-assertion` header.
+The `Authorization` header is ignored, so there is one identity source.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IAP_AUDIENCE` | none, required | Expected `aud`, for example `/projects/<number>/global/backendServices/<id>`. The server refuses to start without it. |
+| `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | Proxy signing keys (JWKS). Must be `https://`; redirects are not followed. |
+| `IAP_JWKS_MAX_STALE_SECS` | `86400` | How long past the 1-hour TTL the held keys stay valid while fetches fail. After that every token is refused, with one logged error, until a fetch succeeds. |
+
+Each request's assertion must be ES256 (exactly), signed by a key in the
+JWKS, with `iss` `https://cloud.google.com/iap`, `aud` equal to
+`IAP_AUDIENCE`, and `exp`, `iat` and `nbf` integers in [1, 9999999999] within
+30 seconds of skew. Every segment must be canonical base64url and its JSON at
+most 32 levels deep. The
+keys are cached for an hour; an unknown `kid` triggers at most one refresh
+every 30 seconds, and a failed fetch keeps the keys already held. The
+identity's stable `id` is `https://cloud.google.com/iap|<sub>`, which is the
+`id` to list in the roles file; `email` (the
+claim, lowercased) is kept for display and the commit record. A missing or
+invalid assertion gets a bare `401 {"error": "unauthorized"}`; the reason goes
+to the server log only.
+
+In every mode, request bodies are capped at 1 MiB (an admin's `add_media`
+call may be larger, see MCP roles; over the cap is a 413), `Transfer-Encoding`
+and malformed or conflicting `Content-Length` get a 400, a body on GET or HEAD
+gets a 400, and every error response closes the connection, so an unread body
+is never parsed as the next request. Faults inside a tool or the connector
+return a generic 500; details go to the server log.
+
+Approvals (`approve_proposal`, `merge=true`) take the approver from this
+identity, and the distinct-approver check compares it with the proposal's
+commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
 
 ```bash
 python3 -m unittest discover -s mcp -p 'test_*.py'
@@ -364,10 +421,12 @@ to narrow it. No roles file is read.
   issuer and subject), `github:<numeric user id>` for GitHub (`id` from
   `GET /user`). Logins and emails can be renamed and re-registered; ids
   cannot. On an entry with `id`, `email` is for display only.
-- An email-only entry matches only an OIDC identity whose `email_verified`
+- An email-only entry matches only an OIDC or IAP identity whose `email_verified`
   claim is true, whose email is plain ASCII on `allowed_domains`, and which
   equals the entry (ASCII case-insensitive). Non-ASCII emails are refused,
   so Unicode lookalikes cannot match.
+- `OAUTH_MODE=iap` matches by `id` (`https://cloud.google.com/iap|<sub>`), or
+  an email-only entry by the email the proxy signed (treated as verified).
 - `OAUTH_MODE=github` matches by numeric id only. A GitHub login or profile
   email never grants a role.
 - An identity with no entry gets HTTP 403 on every request, including

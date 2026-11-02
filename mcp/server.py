@@ -1016,7 +1016,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
             (args.get("approver_email") or "").strip())
         apn = apn_i["name"] or apn_i["login"]
         ape = apn_i["email"] or f"{apn_i['login']}@users.noreply.github.com"
-        apn_src = f"github:{apn_i['login']} via gh session"
+        apn_src = apn_i["source"]
 
     # A throwaway worktree on origin/main — the shared tree is never touched,
     # so a failed proposal cannot leave uncommitted writes behind (and a
