@@ -16,8 +16,9 @@
 //!   binary). They stay.
 //! - `include`, `extends` and `import` look templates up by name among the
 //!   ones already loaded; Tera never opens a file for them. The only file
-//!   reads are the template loads themselves, which [`check_confined`] limits
-//!   to the template directories (a symlink there must not point outside).
+//!   reads are the template loads themselves, which [`check_within`] limits
+//!   to template directories inside the site root (a symlink there must not
+//!   point outside).
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -66,6 +67,25 @@ pub fn check_confined(dir: &Path) -> Result<(), String> {
     }
     let root = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
     walk(&root, &root)
+}
+
+/// [`check_confined`], plus: the directory itself must resolve inside
+/// `site_root` (so `templates/` or a theme cannot be a symlink, or a `..`
+/// path, to somewhere else on the machine).
+pub fn check_within(dir: &Path, site_root: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let site = site_root.canonicalize().map_err(|e| format!("{}: {e}", site_root.display()))?;
+    let real = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !real.starts_with(&site) {
+        return Err(format!(
+            "template directory {} resolves outside the site root {}",
+            dir.display(),
+            site.display()
+        ));
+    }
+    check_confined(dir)
 }
 
 fn walk(dir: &Path, root: &Path) -> Result<(), String> {
@@ -183,5 +203,25 @@ mod tests {
         std::fs::remove_file(tpl.join("dangling.html")).unwrap();
 
         assert!(check_confined(&tmp.path().join("absent")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_directories_must_resolve_inside_the_site() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(site.join("templates")).unwrap();
+        std::fs::create_dir_all(site.join("themes")).unwrap();
+        std::fs::create_dir_all(elsewhere.join("templates")).unwrap();
+        assert!(check_within(&site.join("templates"), &site).is_ok());
+        assert!(check_within(&site.join("themes/none/templates"), &site).is_ok());
+
+        let err = check_within(&site.join("themes/../../elsewhere/templates"), &site).unwrap_err();
+        assert!(err.contains("outside the site root"), "{err}");
+
+        symlink(&elsewhere, site.join("themes/linked")).unwrap();
+        assert!(check_within(&site.join("themes/linked/templates"), &site).is_err());
     }
 }

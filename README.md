@@ -164,7 +164,7 @@ Templates see only their context; they cannot read the build environment or the 
 - `get_env(...)` always fails the build with `get_env is disabled: templates cannot read the build environment`; pass values through `site.yaml` or page and item fields instead.
 - `throw(...)` fails the build with `a template called throw()`; its `message` is never printed.
 - `now()` is always UTC (`utc=` is accepted and ignored), so the host time zone never reaches the output. `now(timestamp=true)` and `now() | date(format="%Y")` work as before.
-- `include`, `extends` and `import` resolve only among the loaded templates. A symlink under `templates/` or `<theme>/templates/` that resolves outside that directory, or does not resolve, fails the build before any template is read.
+- `include`, `extends` and `import` resolve only among the loaded templates. `templates/` and `<theme>/templates/` must resolve inside the site root (a `theme:` such as `../../x` or a symlinked directory pointing elsewhere is refused), and a symlink under them that resolves outside that directory, or does not resolve, fails the build before any template is read.
 
 Every other Tera builtin function, filter and test works as documented.
 

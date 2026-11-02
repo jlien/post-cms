@@ -137,3 +137,18 @@ fn a_template_symlink_out_of_templates_stops_the_build() {
     let out = build(&root);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[test]
+fn a_theme_outside_the_site_cannot_supply_templates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("site");
+    site(&root, "ok");
+    write(tmp.path(), "outside/templates/leak.html", &format!("{SECRET} {{{{ broken"));
+    write(tmp.path(), "outside/theme.css", "body{}\n");
+    write(&root, "site.yaml", "theme: ../../outside\nbuiltin_pages: false\nbase_url: https://www.example.com\n");
+    let out = build(&root);
+    let seen = everything(&root, &out);
+    assert!(!out.status.success(), "build succeeded");
+    assert!(seen.contains("outside the site root"), "{seen}");
+    assert!(!seen.contains(SECRET), "the outside template was read:\n{seen}");
+}

@@ -974,7 +974,7 @@ fn pt_item_body(pt_path: &Path, tera: &Tera, cfg: &SiteConfig) -> Result<(String
 fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera> {
     let theme_templates = theme_dir.join("templates");
     for dir in [templates_dir, theme_templates.as_path()] {
-        postcms_build::sandbox::check_confined(dir).map_err(anyhow::Error::msg)?;
+        postcms_build::sandbox::check_within(dir, root).map_err(anyhow::Error::msg)?;
     }
     let mut tera = Tera::new(
         templates_dir
