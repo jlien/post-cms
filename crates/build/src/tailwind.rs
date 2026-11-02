@@ -37,6 +37,28 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "PATH", "HOME", "TMPDIR", "NODE_PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE",
 ];
 
+/// Environment variable that makes a missing or failing CLI fail the build
+/// (same as `build-site --require-css-compiler`). `1` turns it on; unset,
+/// empty or `0` leaves the default (inline the raw `theme.css`, warn).
+pub const REQUIRE_ENV: &str = "POSTCMS_REQUIRE_TAILWIND";
+
+/// Whether [`REQUIRE_ENV`] asks for a compiled theme CSS. Anything but
+/// unset, empty, `0` or `1` is an error, so a typo never silently turns
+/// the check off.
+pub fn require_from_env() -> Result<bool> {
+    let v = std::env::var_os(REQUIRE_ENV);
+    let v = v.as_deref().map(|s| s.to_str().unwrap_or("\u{fffd}"));
+    parse_require(v).map_err(anyhow::Error::msg)
+}
+
+fn parse_require(v: Option<&str>) -> std::result::Result<bool, String> {
+    match v.map(str::trim).unwrap_or("") {
+        "" | "0" => Ok(false),
+        "1" => Ok(true),
+        v => Err(format!("{REQUIRE_ENV}={v:?} must be 1, 0 or unset. Nothing was built or deleted.")),
+    }
+}
+
 /// The timeout from [`TIMEOUT_ENV`]: unset or empty is the default; anything
 /// but a whole number of seconds from 1 to 3600 is an error.
 pub fn timeout_from_env() -> Result<Duration> {
@@ -376,6 +398,19 @@ mod signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_accepts_only_1_0_or_unset() {
+        assert_eq!(parse_require(None), Ok(false));
+        assert_eq!(parse_require(Some("")), Ok(false));
+        assert_eq!(parse_require(Some("0")), Ok(false));
+        assert_eq!(parse_require(Some("1")), Ok(true));
+        assert_eq!(parse_require(Some(" 1 ")), Ok(true));
+        for bad in ["true", "yes", "2", "on", "\u{fffd}"] {
+            let e = parse_require(Some(bad)).unwrap_err();
+            assert!(e.contains(REQUIRE_ENV) && e.contains("must be 1, 0 or unset"), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn timeout_defaults_and_bounds() {
