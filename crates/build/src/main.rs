@@ -2093,9 +2093,40 @@ fn render_draft_posts(
     Ok(listed)
 }
 
+/// Template data for a draft collection item: `item_ctx` plus the preview
+/// `url`, `draft: true`, and `agent_notes`/`date` defined even when empty.
+fn draft_item_ctx(
+    coll: &Collection,
+    item: &CollectionItem,
+    collections: &[Collection],
+    body: &str,
+    root: &str,
+) -> Result<TeraContext> {
+    let mut ctx = item_ctx(coll, item, collections, body)?;
+    let preview = format!("{}/{}/{}", root.trim_end_matches('/'), coll.name, item.slug);
+    ctx.insert("url", &page_url(&preview));
+    let notes = match item.fields.get("agent_notes") {
+        Some(serde_json::Value::String(n)) => n.clone(),
+        _ => String::new(),
+    };
+    ctx.insert("agent_notes", &notes);
+    if item.date.is_none() {
+        ctx.insert("date", "");
+    }
+    ctx.insert("draft", &true);
+    Ok(ctx)
+}
+
 /// Draft items of typed collections, at the collection's schema-selected
-/// template. agent_notes travels in the item's fields map (pass-through), so
-/// surface it explicitly and keep it out of the field list via the template.
+/// template, with the same template data a published item page gets (title,
+/// slug, description, date, fields, collection, refs, body from `index.mdx`
+/// or `index.pt.json`, and `url`), so any item template that renders on the
+/// site renders as a draft too. `url` is the item's preview path
+/// (`<root>/<collection>/<slug>/`), never its public path. Values that only
+/// drafts carry, or that a draft may lack, are always defined: `draft` is
+/// true, `agent_notes` and `date` are empty strings when the item has none.
+/// agent_notes travels in the item's fields map (pass-through), so surface
+/// it explicitly and keep it out of the field list via the template.
 fn render_draft_collections(
     tera: &Tera,
     out_root: &Path,
@@ -2107,21 +2138,9 @@ fn render_draft_collections(
     let mut listed = Vec::new();
     for coll in collections {
         for item in coll.items.iter() {
-            let md_path = item.dir.join("index.mdx");
-            let body = if md_path.exists() {
-                render_markdown(&fs::read_to_string(&md_path).with_context(|| {
-                    format!("read {}", md_path.display())
-                })?)?
-            } else {
-                String::new()
-            };
-            let mut ctx = item_ctx(coll, item, collections, &body)?;
-            if let Some(serde_json::Value::String(notes)) =
-                item.fields.get("agent_notes").cloned()
-            {
-                ctx.insert("agent_notes", &notes);
-            }
-            ctx.insert("draft", &true);
+            let body = item_body(item, tera, cfg)
+                .with_context(|| format!("render draft {} item {}", coll.name, item.slug))?;
+            let mut ctx = draft_item_ctx(coll, item, collections, &body, root)?;
             ctx.extend(cfg.base_ctx(style, root));
             let html = tera
                 .render(&coll.item_template, &ctx)
