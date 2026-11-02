@@ -1572,3 +1572,67 @@ fn retry_delay_is_deterministic_and_bounded() {
     let base = RETRY_BASE_MS * 2;
     assert!(a.as_millis() as u64 >= base && a.as_millis() as u64 <= base + base / 4, "{a:?}");
 }
+
+// ---- draft scope ----
+
+#[test]
+fn draft_scope_rejects_paths_that_leave_dist() {
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![]);
+    for bad in ["", "/abs", "../x", "a/../b", "a//b", "./a", "a b", "a\\b"] {
+        assert!(p.set_draft_scope(Some(bad)).is_err(), "accepted {bad:?}");
+    }
+    assert!(p.set_draft_scope(Some("preview/drafts")).is_ok());
+    assert!(p.set_draft_scope(None).is_ok());
+}
+
+/// A draft-only image is written under the draft directory and linked
+/// there; an image a public page also uses stays in the public directory,
+/// and the draft links the public copy. Public markup never changes.
+#[test]
+fn draft_only_images_go_under_the_draft_directory() {
+    let f = Fixture::new();
+    let shared = format!("https://{HOST}/shared.png");
+    let secret = format!("https://{HOST}/secret.png");
+    let cfg = cfg_yaml("  widths: [32]\n  formats: [webp]\n");
+    let p = f.pipeline(cfg.clone(), false, vec![(&shared, ok(png(40, 20))), (&secret, ok(png(48, 24)))]);
+    let public = p.request_img(img(&shared));
+    p.set_draft_scope(Some("preview/drafts")).unwrap();
+    let d_shared = p.request_img(img(&shared));
+    let d_secret = p.request_img(img(&secret));
+    let d_url = p.request_url(&secret, None, true);
+    p.set_draft_scope(None).unwrap();
+    std::fs::create_dir_all(f.dist.join("preview/drafts")).unwrap();
+    std::fs::write(f.dist.join("preview/drafts/page.html"), format!("{d_shared}|{d_secret}|{d_url}")).unwrap();
+    let html = f.render(&p, &public);
+    let draft = std::fs::read_to_string(f.dist.join("preview/drafts/page.html")).unwrap();
+
+    let pub_files = f.out_files();
+    let gated: Vec<String> = {
+        let mut v: Vec<String> = std::fs::read_dir(f.dist.join("preview/drafts/assets/img"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let id = |name: &str| name[..16].to_string();
+    let shared_id = id(&pub_files[0]);
+    let secret_id = id(&gated[0]);
+    assert!(pub_files.iter().all(|n| n.starts_with(&shared_id)), "{pub_files:?}");
+    assert!(gated.iter().all(|n| n.starts_with(&secret_id)), "{gated:?}");
+    assert!(html.contains(&format!("/assets/img/{shared_id}-")) && !html.contains("preview"), "{html}");
+    let (ds, rest) = draft.split_once('|').unwrap();
+    assert!(ds.contains(&format!("\"/assets/img/{shared_id}-")) && !ds.contains("preview"), "{ds}");
+    assert!(rest.contains(&format!("/preview/drafts/assets/img/{secret_id}-")), "{rest}");
+    assert!(rest.ends_with(&format!("|https://example.com/preview/drafts/assets/img/{secret_id}-32.jpg")), "{rest}");
+    assert!(!rest.replace("/preview/drafts/assets/img/", "").contains("/assets/img/"), "{rest}");
+
+    // the same sources with no drafts: identical public markup and files
+    let g = Fixture::new();
+    let q = g.pipeline(cfg, false, vec![(&shared, ok(png(40, 20)))]);
+    let m = q.request_img(img(&shared));
+    assert_eq!(g.render(&q, &m), html);
+    assert_eq!(g.out_files(), pub_files);
+}
