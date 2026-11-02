@@ -43,7 +43,8 @@ an AI agent do all content operations.
 | `crates/server` | axum static origin, 127.0.0.1:8787 (`PORT`, `--host` / `POSTCMS_HOST` to override) |
 | `mcp/server.py` | MCP stdio server (stdlib only) |
 | `templates/` | tera templates (base, post, index, 404) |
-| `ci/` | build, deploy, purge scripts |
+| `ci/` | build, deploy, purge scripts; `container-check.sh` for the image |
+| `Dockerfile` | origin image: server binary plus one site's built `dist/` (see Container image) |
 
 ## Build
 
@@ -222,6 +223,7 @@ How it works: rendering records each call and prints a placeholder. After every 
 - WebP encoding (stills and animations) calls libwebp directly through `libwebp-sys`, which compiles its vendored libwebp (1.6.0) into the binary; no system library is used. `build-site --version` prints the linked version. Stills are lossy at `webp_quality` with libwebp's default settings (method 4, alpha kept and compressed losslessly). Decoding WebP sources is pure Rust (the `image` crate).
 - Animated GIFs: resized to the same widths (never upscaled) and encoded as animated WebP (libwebp's animation encoder; each frame lossy at `webp_quality` or lossless, whichever is smaller), printed as an `<img>` with a WebP `srcset`; `image_url` returns the animated WebP too. Widths stop at `animation_max_width` (default 640), because animations cost many times a still's bytes and a phone at DPR 3 would otherwise pick a variant about 3x its slot. The `src`, `width` and `height` are the capped largest variant, and an `image_url` width is clamped to the cap. A slot wider than the cap shows the animation upscaled; raise the cap where that matters. Stills are not capped. There is no GIF fallback: every browser in use decodes animated WebP (Chrome 32, Firefox 65, Safari 14, Edge 18 and later), so shipping the GIF would only add bytes. Frame timing and the loop count are kept, using browser rules: a delay of 10 ms or less plays at 100 ms, a GIF without a loop extension plays once, and a loop count of n repeats n times after the first play. Frames are resized with premultiplied alpha and keep GIF's on/off transparency. Before any frame is decoded, a scan of the GIF's blocks (no decompression) counts frames against `max_frames`, checks width x height x frames against `max_animation_pixels`, checks every frame's own size against `max_pixels` and refuses frames that fall outside the screen (the decoder would fill them anyway), counts the sum of every frame's width x height against `max_animation_pixels` too, and estimates decode and encode memory against the per-image budget (`max_pixels` x 8 bytes, see Memory). Frames are decoded and encoded one at a time, all widths in one pass. Anything over a limit, malformed, or failing to decode keeps its original URL with a warning, like any failed image. A single-frame GIF is a still image. `animated_gifs: copy` keeps the old behavior (the GIF copied unchanged). Social crawlers vary in WebP support, so avoid an animated GIF as `og:image`. SVG is copied only from site paths (files the site already serves); a remote SVG keeps its original URL and is listed, because SVG is a document that can carry script and no markup filter reliably makes an untrusted one safe to serve from the site.
 - Cache: fetched bytes are stored by sha256 under `cache_dir/src/`, URLs map to them in `cache_dir/urls/`, and encoded variants live in `cache_dir/out/`, each with `<name>.sha256` holding the hash of its bytes. Nothing is trusted by name: source bytes are checked against their hash when read and before encoding, variants against their recorded hash, and a mismatch is evicted with a warning and fetched or encoded again (variants cached before hashes were recorded are encoded once more). This catches corrupt or swapped files; it cannot catch a writer who replaces both a file and its record, or points a URL at other valid content, so restore the cache only from builds you trust. Remote URLs are treated as immutable: delete the cache to refetch. `IMAGES_OFFLINE=1` builds from the cache only. Output names include a fingerprint of the quality settings, so changing them never reuses a cached name. `IMAGES_JOBS` sets the worker threads (default: all cores). Add the cache directory to the site's `.gitignore` (`.cache/`): it holds fetched originals and is rebuilt on demand.
+- Draft previews (`DRAFTS=1`): drafts render under `dist/preview/drafts/`, and an image that only drafts use is written to `dist/preview/drafts/<output_dir>/` and linked there, so it sits behind the same access control as the drafts: whatever gates `/preview/` gates it too, and `ci/deploy.sh` excludes `preview/`. An image any published page uses stays in `/<output_dir>/`, and drafts link that copy. Names stay content-addressed and come from the same cache, so when a draft publishes, the next build writes the same files to `/<output_dir>/`. A build without `DRAFTS` never renders drafts, so no draft-only image is written at all. Search index, embeddings, sitemap, RSS, `llms.txt` and per-post markdown list published items only.
 - Memory: at most `IMAGES_DECODES` images (default: the smaller of the core count and 4) are decoded and held at once, each up to `max_pixels` x 8 bytes while resizing, so the default caps image memory near 1.6 GB (4 x 50 MP x 8 B); an animated GIF or an AVIF holds one slot and must fit the same per-image budget, with its decode estimated from its header (see AVIF above); lower `max_pixels` or `IMAGES_DECODES` on small runners.
 - Security: https only, the host must be allowed on every redirect hop (at most 3), the resolver drops loopback, private, link-local, CGNAT, site-local, 6to4, Teredo, NAT64-wrapped private, and other reserved addresses (so DNS cannot point an allowed name inward), no proxy, a global timeout, a body cap, and a pixel cap before decode. Output and cache names are hex digests and numbers only; site paths cannot leave `dist/` (`..`, encoded separators, and symlinks are refused). Remote SVG is never copied (see Variants). The origin server sends SVG with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox`.
 
@@ -283,6 +285,12 @@ POSTCMS_HOST=0.0.0.0 PORT=8080 server       # or: server --host 0.0.0.0
 
 Earlier versions always listened on `0.0.0.0`; a deployment that relied on that must now set `POSTCMS_HOST=0.0.0.0` (or pass `--host 0.0.0.0`). Behind a reverse proxy on the same machine, keep the default and point the proxy at `127.0.0.1:$PORT`.
 
+**Stopping.** SIGTERM or SIGINT stops the server accepting connections, logs `origin: SIGTERM, shutting down` (or `SIGINT`), lets open requests finish for up to `POSTCMS_SHUTDOWN_TIMEOUT_SECS` (default 25, so it fits a 30 s platform grace period), then drops whatever is still open (logging `origin: <n> connection(s) still open after <s>s ...`), logs `origin stopped`, and exits 0. Idle keep-alive connections close at once. Set the timeout below your platform's grace period (Cloud Run and `docker stop` give 10 s).
+
+**Timeouts and limits.** A client has `POSTCMS_HEADER_READ_TIMEOUT_SECS` (default 10) to send a complete request head; a connection that sends part of one and stalls is closed. `POST /api/ask` and `POST /mcp` must deliver the whole body within `POSTCMS_BODY_READ_TIMEOUT_SECS` (default 15, a total, so a slow drip does not reset it), else `408`. Bodies are capped at 16 KiB for `/api/ask` and 256 KiB for `/mcp` (`413`, refused up front when `Content-Length` is larger); a body that is not `application/json` gets `415`, and malformed JSON `400`. `/api/ask` applies its per-client rate limit before reading the body and takes one of its `ASK_MAX_CONCURRENT` model slots only once the whole body has arrived, so stalled bodies cannot hold the slots. A response write that makes no progress for `POSTCMS_WRITE_TIMEOUT_SECS` (default 15; the clock restarts on every byte) drops the connection, so a client that stops reading cannot hold it. At most `POSTCMS_MAX_CONNECTIONS` (default 512) connections are open at once; further connections are closed as soon as they are accepted, with one log line per 10 s. The cap is global, not per client: behind a load balancer such as Google Cloud Load Balancing or Cloud Run's front end, which hold client connections and open their own to the origin, that is the intended shape; exposed directly, one client can use all the slots. Timeouts take whole seconds from 1 to 3600 and the cap a whole number from 1 to 65535; any other value refuses to start (exit 2).
+
+**Client address for the rate limit.** By default (`POSTCMS_TRUSTED_PROXY_HOPS=0`) the `/api/ask` rate limit keys on the socket peer and ignores `X-Forwarded-For`, which any client can forge. Behind `n` proxies that each append to `X-Forwarded-For`, set `POSTCMS_TRUSTED_PROXY_HOPS=n`: the client is then the `n`th entry from the right (all `X-Forwarded-For` headers joined in order), and entries to its left are ignored. Google Cloud Load Balancing in front of Cloud Run appends `<client>, <load balancer>`, so use 2. A request whose header has fewer entries, or a non-IP entry there, falls back to the peer. Whole number from 0 to 10.
+
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
 
@@ -322,6 +330,65 @@ python3 mcp/server.py --self-test
 
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
+
+## Container image
+
+`Dockerfile` builds an image holding the origin server and one site's built `dist/`. It needs BuildKit (`docker buildx`, the default builder in current Docker).
+
+```bash
+docker build -t demo-site --build-arg SITE_CACHE_ID=demo .     # the demo site in this repo
+ci/site-context.sh ../my-site /tmp/my-site-ctx                 # stage a site: tracked files only
+docker build -t my-site --build-context site=/tmp/my-site-ctx --build-arg SITE_CACHE_ID=my-site .
+docker run --rm --read-only --tmpfs /tmp -p 8080:8080 my-site  # http://127.0.0.1:8080/health
+```
+
+Stages: `engine` compiles `server` and `build-site` (dependencies in their own layer, reused until `Cargo.toml` or `Cargo.lock` changes), `site-build` runs `build-site` over the site, and `runtime` gets only the server binary at `/usr/local/bin/post-cms-server` and `dist/`, `site.yaml` and `redirects.yaml` under `/site`. `build-site`, the site sources and the Rust toolchain are not in the runtime image.
+
+### Build inputs
+
+| Input | How | Meaning |
+|---|---|---|
+| engine | build context (`.`) | A post-cms checkout. `.dockerignore` is an allowlist: only `Cargo.*`, `crates/` and the demo site files enter the context, and `.env*`, `*.key`, `*.enc`, `*.pem`, `credentials*.json`, `.cache`, `node_modules`, `target` and `dist` are dropped even inside those. |
+| site | `--build-context site=<dir>` (default: the demo site in this repo) | A directory staged by `ci/site-context.sh <site-checkout> <dir> [extra-path...]`: only `site.yaml`, `redirects.yaml`, `content/`, `templates/`, `themes/`, `plugins/` and any extra paths named, as git tracks them at `HEAD`. No `.git`, untracked or ignored files (a local `master.key`, `.env`, `node_modules`), uncommitted edits or other tracked paths (`config/`, `scripts/`), and tracked secret-named files inside the allowed paths are removed (`.env*`, `*.key`, `*.enc`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `credentials*.json`, `.npmrc`, `.netrc`). Stage it because a named context is sent to BuildKit whole (its cache, or a remote builder) and this repo's `.dockerignore` does not filter it; the build refuses a site context holding `.git`, `.env*`, `*.key`, `*.enc` or `*.pem`. The site is bind-mounted into the `build-site` step, never copied into a layer; only `dist/`, `site.yaml` and `redirects.yaml` reach the image. |
+| `SITE_CACHE_ID` | `--build-arg`, required | One id per site (letters, digits, `.`, `_`, `-`); the build fails without it. Scopes the build's model and image cache mounts, so on a shared builder one site's build never reuses cache entries another site wrote. Never share an id between sites. |
+| `SANITY_READ_TOKEN` | `--secret id=SANITY_READ_TOKEN,env=SANITY_READ_TOKEN` (or `src=<file>`) | Read token for sites that pull from Sanity. Mounted for the `build-site` step only; never in a layer, the history or the image config. |
+| `SITE_BASE_URL`, `SITE_THEME`, `DRAFTS`, `POSTCMS_EMBED_BATCH`, `IMAGES_OFFLINE`, `SANITY_OFFLINE` | `--build-arg` | The `build-site` settings of the same names (see Build). Unset or empty means the engine default. Build args are visible in `docker history`: never pass a secret this way. |
+| `TAILWINDCSS_URL`, `TAILWINDCSS_SHA256` | `--build-arg`, both or neither | Standalone Tailwind CLI for themes that compile CSS (see Tailwind CLI). The download must match the SHA-256 and be https. |
+| `RUST_IMAGE`, `RUNTIME_IMAGE` | `--build-arg` | Base images, pinned by digest in the Dockerfile. To update one, resolve the tag's new digest (`docker buildx imagetools inspect <image>:<tag>`) and replace tag and digest together. |
+
+`build-site` downloads the embedding model during the build (network access to Hugging Face), cached in a BuildKit cache mount (per `SITE_CACHE_ID`) between builds, as are processed images.
+
+A site repository builds its own image from a post-cms checkout at a pinned commit (a submodule or a CI checkout), for example `path/to/post-cms/ci/site-context.sh . "$CTX" && docker build --build-context site="$CTX" --build-arg SITE_CACHE_ID=my-site -t site:$SHA path/to/post-cms`.
+
+### Runtime
+
+Base image: `gcr.io/distroless/cc-debian12:nonroot`, chosen over `debian-slim` because it has no shell, package manager or setuid binaries, and still carries what the server links against: glibc, libstdc++ (the ONNX runtime behind `/api/ask` is C++), OpenSSL and CA certificates (model download, the LLM call). The builder is Debian 12 too, so the binary's glibc matches. Debugging is through logs and `/health`; there is nothing to `exec` into.
+
+The image runs as uid/gid 65532 (`nonroot`), and `/site` is owned by root and not writable by it. The only path the server writes is the `/api/ask` model cache, `$HOME/.cache/post-cms-fastembed` with `HOME=/tmp/post-cms`, so a read-only root file system works with a writable `/tmp` (`--read-only --tmpfs /tmp`, or an `emptyDir` on `/tmp` in Kubernetes). The model (over 100 MB) is downloaded on the first `/api/ask` after each start, so size the tmpfs for it; without network access to Hugging Face, or without a writable `/tmp`, `/api/ask` falls back to inlining the corpus. There is no `HEALTHCHECK` (no shell or curl in the image): point the platform's probe at `GET /health`.
+
+Runtime environment, set when the container runs and never baked into the image (secrets from the platform's secret store):
+
+| Variable | Image default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | Listen port. Platforms that assign one (Cloud Run) set it. |
+| `POSTCMS_HOST` | `0.0.0.0` | Listen address. The server's own default is 127.0.0.1, which a published port cannot reach. |
+| `SITE_ROOT` | `/site` | Site directory holding `dist/`. |
+| `HOME` | `/tmp/post-cms` | Locates the model cache. |
+| `POSTCMS_SHUTDOWN_TIMEOUT_SECS` | unset (25) | Seconds open connections get after SIGTERM (see Serve, Stopping). |
+| `POSTCMS_HEADER_READ_TIMEOUT_SECS` | unset (10) | Seconds a client has to send a request head. |
+| `POSTCMS_BODY_READ_TIMEOUT_SECS` | unset (15) | Seconds a client has to send a whole POST body. |
+| `POSTCMS_MAX_CONNECTIONS` | unset (512) | Connections open at once; more are closed on accept. |
+| `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_MAX_RAG_CHARS` | unset | `/api/ask` upstream. `LLM_API_KEY` is a secret. |
+| `RATE_LIMIT_PER_MIN`, `ASK_MAX_CONCURRENT` | unset (10, 4) | `/api/ask` limits. |
+| `POSTCMS_TRUSTED_PROXY_HOPS` | unset (0) | Proxies that append `X-Forwarded-For` (see Serve, Client address); 2 behind Google Cloud Load Balancing. |
+| `POSTCMS_WRITE_TIMEOUT_SECS` | unset (15) | Seconds a response write may make no progress. |
+| `IAP_AUDIENCE`, `IAP_JWKS_URL` | unset | Identity-Aware Proxy check for `/preview/`, in servers that have it: the backend service audience, and the key set URL (default Google's). Per deployment, so never in the image. |
+
+The image's stop signal is SIGTERM; the server exits 0 on it (see Serve, Stopping).
+
+### Checks
+
+`ci/container-check.sh` builds `git archive HEAD` of this repo twice: the demo site, and a site checkout (a git repo with a tracked `*.enc` and an untracked `config/master.key` and `.env`) staged by `ci/site-context.sh` as a named build context. Canary secrets are planted in the engine context (`config/master.key`, `.env`, `*.enc`, `*.pem`), the site checkout and a `SANITY_READ_TOKEN` build secret. It fails when staging leaves `.git` or a secret; when the build accepts the unstaged checkout; when the build step does not read the token secret; when a canary appears in the build output, any layer (every layer is unpacked, gzip or zstd, and counted against the manifest), the history or the image config; when the image has a secret-like file name, a shell, the site sources or `build-site`; when the image user is root; or when the container, run with `--read-only --tmpfs /tmp --cap-drop ALL` and a non-default `PORT`, does not answer `/health` and `/`, runs a process as uid 0, or does not exit 0 within 10 s of SIGTERM. It removes the containers, images and temp files it creates. Run it in CI on any runner with Docker and BuildKit.
 
 ## Hosted MCP behind an identity-aware proxy
 
@@ -365,6 +432,40 @@ commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
 ```bash
 python3 -m unittest discover -s mcp -p 'test_*.py'
 ```
+
+## MCP forge: GitHub or GitLab
+
+Proposals become pull requests (GitHub) or merge requests (GitLab). The
+propose, approve, reject, revert and queue tools reach the forge only
+through `mcp/forge.py`.
+
+| Variable | Meaning |
+|---|---|
+| `FORGE` | `github` (default) or `gitlab`. |
+| `GITLAB_URL` | Base URL, `https://` only (for example `https://gitlab.example.com`, or a path prefix for a self-managed install). No credentials, query or fragment. |
+| `GITLAB_PROJECT` | Numeric project id, or the project path (`group/project`, plain or url-encoded). |
+| `GITLAB_TOKEN` | Token with the `api` scope. Sent only in the `PRIVATE-TOKEN` header, never in a URL, log line or error. Maintainer role to merge into a protected branch. |
+| `GITLAB_ALLOW_HTTP_LOOPBACK` | Tests only: `1` allows `http://` for `127.0.0.1`, `localhost` or `::1`. |
+
+Both forges:
+
+- Every change the server opens or revises is recorded as branch, change id and the head commit the server pushed, in `changes.json` in the server state dir: `$PCMS_STATE_DIR` (an absolute path outside the repository, mode 0700, required over HTTP), default `.tenants/.state` (gitignored). Writes hold an `flock` on `changes.lock` and replace the file through an `O_EXCL|O_NOFOLLOW` temp file.
+- `approve_proposal` needs `reviewed_head` (or `reviewed_heads` `{slug: sha}` for a batch): the `head` that `list_proposals` and the propose and revise results show. It merges the recorded change id only, pinned to that head, and refuses when the head is missing, differs from the recorded head, or the change moved, was retargeted away from `main`, or was not opened or revised by this server. `list_proposals` also returns `forge_head` and `moved`. `merge=true` on a propose tool pins to the head that same call pushed.
+- `revise_proposal` only revises a change the server recorded, starting from the recorded head: if `origin/<branch>` has moved (someone else pushed), it refuses. Its push leases on the recorded head.
+- Changes from forks are refused everywhere (look up, merge, close, the queue, revert): a GitHub PR must have `isCrossRepository` false and its head repository and owner equal to the base repository; a GitLab MR must have source and target project equal to `GITLAB_PROJECT`. Branch lookups match the exact head ref.
+- `revert_proposal` takes the same gate as every merge (`MCP_ALLOW_APPROVE`). On GitLab, when merging is not allowed, the revert merge request still opens and is left for a person to merge.
+
+`FORGE=github` runs the `gh` CLI (approval identity from `gh api user`).
+`FORGE=gitlab` needs no CLI:
+
+- Proposals open a merge request into `main` that deletes its source branch on merge.
+- Approve merges through the merge endpoint. A pinned head goes in its `sha` parameter, so GitLab refuses the merge (409) when a commit landed after the check.
+- A project whose merge method is fast-forward (or semi-linear) only merges a branch that sits on `main`. A branch that is behind fails with a clear error; the server never rebases, because a rebase makes a new head that nobody approved.
+- Reject posts a `REJECTED:` note, closes the merge request and deletes the branch.
+- The commit list and every author and committer of a change come from the merge request commits API, all pages.
+- Revert opens a revert merge request: a new `revert/<branch>-<time>` branch from `main`, GitLab's commit revert endpoint applied there (the merge commit, or each commit newest first for fast-forward merges), then a merge pinned to the revert head. Nothing is pushed to `main` directly, so protected-branch rules, pipelines and approval rules apply to a revert too. If GitLab cannot merge it (for example a required pipeline), the tool fails and names the open revert merge request.
+- On stdio the approver identity is the token's user (`GET /user`); over HTTP it is the OAuth identity, as before. The email recorded in notes is the user's public email or GitLab's noreply form (`<id>-<username>@users.noreply.<host>`), never the private primary address.
+- Each read waits at most 20 seconds and each request at most 60 seconds overall; a response is capped at 4 MB, a paged read at 16 MB in total, JSON nesting at 64 levels. Proxy settings (`HTTP_PROXY` and similar) are ignored for the API, redirects are refused, and 401, 403, 404, 405, 406, 409 and 422 map to plain tool errors.
 
 ## MCP roles
 

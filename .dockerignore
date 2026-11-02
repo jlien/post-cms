@@ -1,0 +1,33 @@
+# Allowlist: the build context holds only what the Dockerfile needs.
+# Everything else (target/, dist/, .git, caches, local secrets) stays out.
+*
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!crates
+!site.yaml
+!redirects.yaml
+!content
+!templates
+!themes
+!plugins
+
+# Secrets never enter the context, even inside an allowed directory.
+# (Later lines win, so these come last.)
+**/.env
+**/.env.*
+**/master.key
+**/*.key
+**/*.enc
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+**/credentials*.json
+**/.npmrc
+**/.netrc
+**/.cache
+**/node_modules
+**/target
+**/dist

@@ -1442,16 +1442,26 @@ impl Request {
     }
 }
 
+/// Where a request was made: `None` on a public page, or the gated
+/// directory (under dist) of the draft preview that made it.
+type Scope = Option<String>;
+
 #[derive(Default)]
 struct State {
-    requests: Vec<Request>,
-    index: HashMap<Request, usize>,
+    requests: Vec<(Request, Scope)>,
+    index: HashMap<(Request, Scope), usize>,
     /// Requests already turned into markup, by index.
     done: Vec<Option<String>>,
     resolved: HashMap<String, Result<Arc<Source>, Option<String>>>,
-    outputs: BTreeMap<String, (Arc<Source>, BTreeSet<Out>)>,
-    written: BTreeSet<(String, Out)>,
-    passthrough_written: BTreeSet<String>,
+    /// Scope of the requests [`Pipeline::marker`] records next.
+    scope: Scope,
+    /// Output ids some public page uses: these are written to the public
+    /// output directory even when a draft asks for them too.
+    public_ids: BTreeSet<String>,
+    /// Outputs by `(id, output directory under dist)`.
+    outputs: BTreeMap<(String, String), (Arc<Source>, BTreeSet<Out>)>,
+    written: BTreeSet<(String, String, Out)>,
+    passthrough_written: BTreeSet<(String, String)>,
 }
 
 /// Totals from [`Pipeline::finish`].
@@ -1564,18 +1574,48 @@ impl Pipeline {
 
     /// The source of every request so far, by request number.
     fn sources(&self) -> Vec<String> {
-        self.state.lock().unwrap().requests.iter().map(|r| r.src().to_string()).collect()
+        self.state.lock().unwrap().requests.iter().map(|(r, _)| r.src().to_string()).collect()
+    }
+
+    /// Mark the requests that follow as made by draft previews (`Some(dir)`)
+    /// or by public pages (`None`, the default). An image only drafts use is
+    /// written under `<dir>/<output_dir>` and drafts link it there, so it
+    /// sits behind whatever gates `dir` (the origin gates `preview/`); an
+    /// image any public page uses stays in `<output_dir>`. `dir` is a
+    /// relative path under dist (letters, digits, `-`, `_`, `/`).
+    pub fn set_draft_scope(&self, dir: Option<&str>) -> Result<(), String> {
+        if let Some(d) = dir {
+            let ok = !d.is_empty()
+                && d.split('/').all(|seg| {
+                    !seg.is_empty() && seg != "." && seg != ".." && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                });
+            if !ok {
+                return Err(format!("draft image directory {d:?} is not a plain relative path"));
+            }
+        }
+        self.state.lock().unwrap().scope = dir.map(str::to_string);
+        Ok(())
+    }
+
+    /// Output directory under dist for one scope: `output_dir`, or
+    /// `<draft dir>/<output_dir>` for an image only drafts use.
+    fn out_rel(&self, gated: Option<&str>) -> String {
+        match gated {
+            Some(d) => format!("{d}/{}", self.cfg.output_dir),
+            None => self.cfg.output_dir.clone(),
+        }
     }
 
     fn marker(&self, req: Request) -> String {
         let mut st = self.state.lock().unwrap();
-        let n = match st.index.get(&req) {
+        let key = (req, st.scope.clone());
+        let n = match st.index.get(&key) {
             Some(n) => *n,
             None => {
                 let n = st.requests.len();
-                st.requests.push(req.clone());
+                st.requests.push(key.clone());
                 st.done.push(None);
-                st.index.insert(req, n);
+                st.index.insert(key, n);
                 n
             }
         };
@@ -1672,7 +1712,7 @@ impl Pipeline {
                 // A refused remote SVG is policy, not bad data: its bytes may
                 // be shared with a local copy, so leave the cache alone.
                 if src.starts_with('/') || !looks_like_svg(&bytes) {
-                    self.evict(src, &content, None);
+                    self.evict(src, &content, None, &[]);
                 }
                 return Err(Some(e));
             }
@@ -1708,8 +1748,9 @@ impl Pipeline {
     }
 
     /// Forget a source: its cached bytes, URL index entry, alpha answer, and
-    /// (with an output id) its cached variants and files already in dist.
-    fn evict(&self, src: &str, content: &str, id: Option<&str>) {
+    /// (with an output id) its cached variants and files already in dist
+    /// (the public output directory plus `out_dirs`).
+    fn evict(&self, src: &str, content: &str, id: Option<&str>, out_dirs: &[String]) {
         let _ = std::fs::remove_file(self.src_file(content));
         let _ = std::fs::remove_file(self.cache.join("alpha").join(content));
         if !src.starts_with('/') {
@@ -1717,7 +1758,9 @@ impl Pipeline {
         }
         if let Some(id) = id {
             let prefix = format!("{id}-");
-            for dir in [self.cache.join("out"), self.dist.join(&self.cfg.output_dir)] {
+            let mut dirs = vec![self.cache.join("out"), self.dist.join(&self.cfg.output_dir)];
+            dirs.extend(out_dirs.iter().map(|d| self.dist.join(d)));
+            for dir in dirs {
                 for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                     if e.file_name().to_string_lossy().starts_with(&prefix) {
                         let _ = std::fs::remove_file(e.path());
@@ -1737,12 +1780,14 @@ impl Pipeline {
         ((s.height as f64 * w as f64 / s.width as f64).round() as u32).max(1)
     }
 
-    fn url_path(&self, name: &str) -> String {
-        format!("/{}/{}", self.cfg.output_dir, name)
+    fn url_path(&self, rel: &str, name: &str) -> String {
+        format!("/{rel}/{name}")
     }
 
     /// Markup or URL for one request, registering the outputs it needs.
-    fn materialize(&self, st: &mut State, req: &Request) -> String {
+    /// A draft request for an image no public page uses gets the draft
+    /// scope's output directory.
+    fn materialize(&self, st: &mut State, req: &Request, scope: Option<&str>) -> String {
         let res = st.resolved.get(req.src()).cloned();
         let src = match res {
             Some(Ok(s)) => s,
@@ -1756,19 +1801,24 @@ impl Pipeline {
                 };
             }
         };
+        let rel = self.out_rel(scope.filter(|_| !st.public_ids.contains(&src.id)));
         let mut need = |o: Out| {
-            st.outputs.entry(src.id.clone()).or_insert_with(|| (src.clone(), BTreeSet::new())).1.insert(o);
+            st.outputs
+                .entry((src.id.clone(), rel.clone()))
+                .or_insert_with(|| (src.clone(), BTreeSet::new()))
+                .1
+                .insert(o);
         };
         match (req, src.kind) {
             (Request::Img(a), Kind::Passthrough { ext }) => {
                 need(Out { width: 0, enc: Enc::Png });
-                let url = self.url_path(&format!("{}.{ext}", src.id));
+                let url = self.url_path(&rel, &format!("{}.{ext}", src.id));
                 let (w, h) = (src.width > 0).then_some((src.width, src.height)).unzip();
                 format!("<img src=\"{}\"{}", esc(&url), img_tail(a, w, h))
             }
             (Request::Url { absolute, .. }, Kind::Passthrough { ext }) => {
                 need(Out { width: 0, enc: Enc::Png });
-                let url = self.url_path(&format!("{}.{ext}", src.id));
+                let url = self.url_path(&rel, &format!("{}.{ext}", src.id));
                 esc(&if *absolute { format!("{}{url}", self.base_url) } else { url })
             }
             (Request::Url { width, absolute, .. }, Kind::Raster { .. } | Kind::Animated { .. }) => {
@@ -1787,7 +1837,7 @@ impl Pipeline {
                 let w = width.map_or(top, |w| w.clamp(1, max));
                 let o = Out { width: w, enc };
                 need(o);
-                let url = self.url_path(&self.out_name(&src, o));
+                let url = self.url_path(&rel, &self.out_name(&src, o));
                 esc(&if *absolute { format!("{}{url}", self.base_url) } else { url })
             }
             (Request::Img(a), Kind::Animated { .. }) => {
@@ -1800,14 +1850,14 @@ impl Pipeline {
                     .map(|w| {
                         let o = Out { width: *w, enc: Enc::Webp };
                         need(o);
-                        format!("{} {w}w", self.url_path(&self.out_name(&src, o)))
+                        format!("{} {w}w", self.url_path(&rel, &self.out_name(&src, o)))
                     })
                     .collect();
                 // src is the largest (capped) width, already in the srcset
                 let fb = Out { width: top, enc: Enc::Webp };
                 format!(
                     "<img src=\"{}\" srcset=\"{}\" sizes=\"{}\"{}",
-                    self.url_path(&self.out_name(&src, fb)),
+                    self.url_path(&rel, &self.out_name(&src, fb)),
                     set.join(", "),
                     sizes(a),
                     img_tail(a, Some(top), Some(Self::height_for(&src, top)))
@@ -1833,7 +1883,7 @@ impl Pipeline {
                         .map(|w| {
                             let o = Out { width: *w, enc };
                             need(o);
-                            format!("{} {w}w", self.url_path(&self.out_name(&src, o)))
+                            format!("{} {w}w", self.url_path(&rel, &self.out_name(&src, o)))
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -1846,7 +1896,7 @@ impl Pipeline {
                     let fb = Out { width: top, enc: fallback };
                     return format!(
                         "<img src=\"{}\" srcset=\"{}\" sizes=\"{}\"{}",
-                        self.url_path(&self.out_name(&src, fb)),
+                        self.url_path(&rel, &self.out_name(&src, fb)),
                         set,
                         sizes,
                         img_tail(a, dims.0, dims.1)
@@ -1864,13 +1914,13 @@ impl Pipeline {
                     let set = srcset(fallback, &mut need);
                     html.push_str(&format!(
                         "<img src=\"{}\" srcset=\"{set}\" sizes=\"{sizes}\"{}</picture>",
-                        self.url_path(&self.out_name(&src, fb)),
+                        self.url_path(&rel, &self.out_name(&src, fb)),
                         img_tail(a, dims.0, dims.1)
                     ));
                 } else {
                     html.push_str(&format!(
                         "<img src=\"{}\"{}</picture>",
-                        self.url_path(&self.out_name(&src, fb)),
+                        self.url_path(&rel, &self.out_name(&src, fb)),
                         img_tail(a, dims.0, dims.1)
                     ));
                 }
@@ -1889,7 +1939,7 @@ impl Pipeline {
             let set: BTreeSet<String> = st
                 .requests
                 .iter()
-                .map(|r| r.src().to_string())
+                .map(|(r, _)| r.src().to_string())
                 .filter(|s| !st.resolved.contains_key(s))
                 .collect();
             set.into_iter().collect()
@@ -1902,7 +1952,7 @@ impl Pipeline {
         })?;
         let mut stats = Stats::default();
         let replacements: HashMap<usize, String>;
-        let work: Vec<(Arc<Source>, Vec<Out>)>;
+        let work: Vec<(Arc<Source>, String, Vec<Out>)>;
         {
             let mut st = self.state.lock().unwrap();
             for (src, r) in pending.iter().zip(results) {
@@ -1912,41 +1962,59 @@ impl Pipeline {
                 }
                 st.resolved.insert(src.clone(), r);
             }
-            // 2. markup for every request not done yet
+            // 2. which outputs public pages use, then markup for every
+            // request not done yet
+            let public: Vec<String> = st
+                .requests
+                .iter()
+                .filter(|(_, scope)| scope.is_none())
+                .filter_map(|(r, _)| match st.resolved.get(r.src()) {
+                    Some(Ok(s)) => Some(s.id.clone()),
+                    _ => None,
+                })
+                .collect();
+            st.public_ids.extend(public);
             let todo: Vec<usize> = (0..st.requests.len()).filter(|i| st.done[*i].is_none()).collect();
             for i in todo {
-                let req = st.requests[i].clone();
-                let html = self.materialize(&mut st, &req);
+                let (req, scope) = st.requests[i].clone();
+                let html = self.materialize(&mut st, &req, scope.as_deref());
                 st.done[i] = Some(html);
             }
             work = st
                 .outputs
-                .values()
-                .map(|(s, outs)| {
+                .iter()
+                .map(|((id, rel), (s, outs))| {
                     let new: Vec<Out> = outs
                         .iter()
                         .copied()
                         .filter(|o| match s.kind {
-                            Kind::Passthrough { .. } => !st.passthrough_written.contains(&s.id),
-                            Kind::Raster { .. } | Kind::Animated { .. } => !st.written.contains(&(s.id.clone(), *o)),
+                            Kind::Passthrough { .. } => !st.passthrough_written.contains(&(id.clone(), rel.clone())),
+                            Kind::Raster { .. } | Kind::Animated { .. } => {
+                                !st.written.contains(&(id.clone(), rel.clone(), *o))
+                            }
                         })
                         .collect();
-                    (s.clone(), new)
+                    (s.clone(), rel.clone(), new)
                 })
-                .filter(|(_, o)| !o.is_empty())
+                .filter(|(_, _, o)| !o.is_empty())
                 .collect();
         }
         // 3. variants in parallel (CPU bound)
         let out_dir = self.dist.join(&self.cfg.output_dir);
         std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
+        // draft-only directories, only when some image needs one
+        for rel in work.iter().map(|(_, rel, _)| rel).collect::<BTreeSet<_>>() {
+            let d = self.dist.join(rel);
+            std::fs::create_dir_all(&d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+        }
         let files = AtomicUsize::new(0);
         let bytes = std::sync::atomic::AtomicU64::new(0);
         // A source that fails here (truncated or corrupt data the header
         // check passed) keeps its original URL; the build goes on.
         let failed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
         run_parallel(work.len(), jobs, |i| {
-            let (s, outs) = &work[i];
-            match self.write_outputs(s, outs, &out_dir) {
+            let (s, rel, outs) = &work[i];
+            match self.write_outputs(s, outs, &self.dist.join(rel)) {
                 Ok((n, b)) => {
                     files.fetch_add(n, Ordering::Relaxed);
                     bytes.fetch_add(b, Ordering::Relaxed);
@@ -1959,10 +2027,21 @@ impl Pipeline {
         {
             let mut st = self.state.lock().unwrap();
             let mut bad_ids = BTreeSet::new();
+            // every directory this pipeline writes besides the public one
+            let draft_dirs: Vec<String> = st
+                .outputs
+                .keys()
+                .map(|(_, rel)| rel.clone())
+                .filter(|rel| *rel != self.cfg.output_dir)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             for (i, why) in &failed {
                 let s = &work[*i].0;
-                bad_ids.insert(s.id.clone());
-                st.outputs.remove(&s.id);
+                if !bad_ids.insert(s.id.clone()) {
+                    continue;
+                }
+                st.outputs.retain(|(id, _), _| *id != s.id);
                 let srcs: Vec<String> = st
                     .resolved
                     .iter()
@@ -1971,17 +2050,17 @@ impl Pipeline {
                     .collect();
                 for src in srcs {
                     eprintln!("warning: image {src}: {why}; kept the original URL");
-                    self.evict(&src, &s.content, Some(&s.id));
+                    self.evict(&src, &s.content, Some(&s.id), &draft_dirs);
                     st.resolved.insert(src, Err(Some(why.clone())));
                 }
             }
             // redo the markup of every request that pointed at a failed source
             for i in 0..st.requests.len() {
-                let stale = matches!(st.resolved.get(st.requests[i].src()), Some(Err(_)))
+                let stale = matches!(st.resolved.get(st.requests[i].0.src()), Some(Err(_)))
                     && st.done[i].as_deref().is_some_and(|h| bad_ids.iter().any(|id| h.contains(id.as_str())));
                 if stale {
-                    let req = st.requests[i].clone();
-                    let html = self.materialize(&mut st, &req);
+                    let (req, scope) = st.requests[i].clone();
+                    let html = self.materialize(&mut st, &req, scope.as_deref());
                     st.done[i] = Some(html);
                 }
             }
@@ -1994,19 +2073,19 @@ impl Pipeline {
                 })
                 .collect();
             stats.kept.sort();
-            stats.sources = st.outputs.len();
+            stats.sources = st.outputs.keys().map(|(id, _)| id).collect::<BTreeSet<_>>().len();
             replacements = st.done.iter().enumerate().map(|(i, h)| (i, h.clone().unwrap_or_default())).collect();
-            for (i, (s, outs)) in work.iter().enumerate() {
-                if failed.iter().any(|(f, _)| *f == i) {
+            for (s, rel, outs) in work.iter() {
+                if bad_ids.contains(&s.id) {
                     continue;
                 }
                 match s.kind {
                     Kind::Passthrough { .. } => {
-                        st.passthrough_written.insert(s.id.clone());
+                        st.passthrough_written.insert((s.id.clone(), rel.clone()));
                     }
                     Kind::Raster { .. } | Kind::Animated { .. } => {
                         for o in outs {
-                            st.written.insert((s.id.clone(), *o));
+                            st.written.insert((s.id.clone(), rel.clone(), *o));
                         }
                     }
                 }
