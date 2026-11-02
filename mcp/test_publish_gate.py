@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -578,6 +579,175 @@ class LedgerStorageTest(GateCase):
         srv._ledger_append(self.entry())
         self.assertEqual(os.stat(os.environ["PCMS_STATE_DIR"]).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(srv._ledger_path()).st_mode & 0o777, 0o600)
+
+
+class BranchContentTest(GateCase):
+    """A proposal branch's content belongs to whoever can push it: revise
+    must never follow its symlinks, run its code, or reach server state."""
+
+    def item_branch(self, slug: str, link_target: Path | None = None,
+                    extra: dict[str, str] | None = None) -> str:
+        branch = f"agent/{slug}"
+        self.git(self.work, "switch", "-q", "-c", branch, "main")
+        d = self.work / "content" / "posts" / slug
+        d.mkdir(parents=True)
+        (d / "meta.yaml").write_text(f'title: "{slug}"\nslug: "{slug}"\npublished: false\n')
+        if link_target is not None:
+            os.symlink(str(link_target), d / "index.mdx")
+        else:
+            (d / "index.mdx").write_text("body\n")
+        for rel, text in (extra or {}).items():
+            (self.work / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.work / rel).write_text(text)
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-q", "-m", slug, who="dave")
+        self.git(self.work, "push", "-q", "origin", branch)
+        self.git(self.work, "switch", "-q", "main")
+        return branch
+
+    def revise(self, slug: str, body: str) -> dict:
+        with self.as_user("bob"):
+            return srv.tool_revise_proposal({"slug": slug, "feedback": "x", "body": body})
+
+    def test_s1_revise_never_writes_through_a_symlink(self) -> None:
+        victim = self.tmp / "outside-victim.txt"
+        victim.write_text("original\n")
+        self.item_branch("s1", link_target=victim)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.revise("s1", "PWNED\n")
+        self.assertEqual(victim.read_text(), "original\n")
+
+    def test_s2_revise_cannot_reach_the_ledger(self) -> None:
+        with self.as_user("alice"):
+            srv.tool_propose_change({"slug": "real", "title": "real", "body": "b"})
+        ledger = srv._ledger_path()
+        before = ledger.read_text()
+        self.item_branch("s2", link_target=ledger)
+        forged = json.dumps({"v": 1, "event": "commit", "tool": "propose_change",
+                             "branch": "agent/x", "sha": "f" * 40, "actor": "github:999"})
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.revise("s2", forged + "\n")
+        self.assertEqual(ledger.read_text(), before)
+        self.assertNotIn("github:999", [e["actor"] for e in srv._ledger_entries()])
+
+    def test_symlink_in_a_directory_component_is_refused(self) -> None:
+        outside = self.tmp / "outside-dir"
+        outside.mkdir()
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            os.symlink(outside, self.work / "content-link")
+            srv._wt_write(self.work, "content-link/x.md", "x")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_revise_refuses_a_branch_that_changes_other_paths(self) -> None:
+        self.item_branch("s5", extra={"crates/build/build.rs": "fn main() {}\n"})
+        with self.assertRaisesRegex(ValueError, "outside content/posts/s5"):
+            self.revise("s5", "new\n")
+
+    def test_revise_of_a_clean_branch_works_and_is_recorded(self) -> None:
+        self.item_branch("ok")
+        out = self.revise("ok", "new body\n")
+        self.assertTrue(out["revised"])
+        self.assertEqual([(e["branch"], e["actor"]) for e in srv._ledger_entries()],
+                         [("agent/ok", "github:2")])
+
+    def test_s3_rename_out_of_another_path_is_refused(self) -> None:
+        (self.work / "other.txt").write_text("x\n" * 50)
+        self.git(self.work, "add", "other.txt")
+        self.git(self.work, "commit", "-q", "-m", "o", who="dave")
+        before = self.git(self.work, "rev-parse", "HEAD")
+        (self.work / "content/posts/r").mkdir(parents=True)
+        self.git(self.work, "mv", "other.txt", "content/posts/r/meta.yaml")
+        self.git(self.work, "commit", "-q", "-m", "rename", who="alice")
+        with self.assertRaisesRegex(ValueError, "outside its own.*other.txt"):
+            srv._ledger_record_commit("propose_change", "agent/r", self.work, before,
+                                      PEOPLE["alice"], ["content/posts/r"])
+
+    def test_slug_and_collection_injection_is_refused(self) -> None:
+        bad = ["x;touch /tmp/pwn", "x$(id)", "a b", "../x", "-x", "x" * 65, "x\ny", ""]
+        with self.as_user("alice", MCP_ALLOW_APPROVE="1"):
+            for value in bad:
+                with self.subTest(slug=value):
+                    with self.assertRaisesRegex(ValueError, "must match"):
+                        srv.tool_propose_change({"slug": value, "body": "b"})
+                    with self.assertRaisesRegex(ValueError, "must match"):
+                        srv.tool_revise_proposal({"slug": value, "body": "b"})
+                    with self.assertRaisesRegex(ValueError, "must match"):
+                        self.approve(value)
+                    with self.assertRaisesRegex(ValueError, "must match"):
+                        self.revert(value)
+                if not value:
+                    continue  # an empty collection means the default, posts
+                with self.subTest(collection=value):
+                    with self.assertRaisesRegex(ValueError, "must match"):
+                        srv.tool_propose_change({"slug": "ok", "collection": value,
+                                                 "body": "b"})
+        self.assertEqual(self.gh_calls, [])
+
+    def test_preview_command_quotes_every_value(self) -> None:
+        with self.as_user("alice"):
+            out = srv.tool_propose_change({"slug": "q_1", "body": "b"})
+        cmd = out["preview_command"]
+        self.assertIn(shlex.quote(str(self.work)), cmd)
+        self.assertIn(f"git switch {shlex.quote(out['branch'])}", cmd)
+
+
+class StateDirTest(GateCase):
+    def entry(self) -> dict:
+        return {"event": "commit", "tool": "t", "branch": "agent/b",
+                "sha": "e" * 40, "actor": "github:1"}
+
+    def test_http_requires_an_explicit_state_dir(self) -> None:
+        with mock.patch.dict(os.environ, {"PCMS_TRANSPORT": "http"}):
+            os.environ.pop("PCMS_STATE_DIR")
+            with self.assertRaisesRegex(ValueError, "PCMS_STATE_DIR is required"):
+                srv.check_state_dir()
+            with self.assertRaisesRegex(ValueError, "ledger write failed"):
+                srv._ledger_append(self.entry())
+
+    def test_state_dir_inside_the_repo_or_a_worktree_is_refused(self) -> None:
+        self.git(self.work, "worktree", "add", "-q", "--detach",
+                 str(self.tmp / "wt2"), "main")
+        for inside in (self.work / ".tenants" / ".state", self.tmp / "wt2" / "state",
+                       "relative/state"):
+            with self.subTest(dir=str(inside)), \
+                    mock.patch.dict(os.environ, {"PCMS_STATE_DIR": str(inside)}):
+                with self.assertRaisesRegex(ValueError, "inside|absolute"):
+                    srv.check_state_dir()
+
+    def test_stdio_default_is_outside_the_repo(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.tmp / "xdg")}):
+            os.environ.pop("PCMS_STATE_DIR")
+            d = srv.check_state_dir()
+        self.assertEqual(d.parent, self.tmp / "xdg" / "post-cms")
+        self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+
+
+class WorktreeLimitsTest(GateCase):
+    def test_worktree_cap_returns_busy(self) -> None:
+        with mock.patch.dict(os.environ, {"PCMS_MAX_WORKTREES": "1"}):
+            held = srv._add_work_worktree(
+                "change", "origin/main", ["+refs/heads/main:refs/remotes/origin/main"])
+            try:
+                with self.as_user("alice"):
+                    with self.assertRaisesRegex(ValueError, "server busy"):
+                        srv.tool_propose_change({"slug": "busy", "body": "b"})
+            finally:
+                srv._remove_work_worktree(held)
+            with self.as_user("alice"):
+                self.assertTrue(srv.tool_propose_change({"slug": "busy", "body": "b"})["proposed"])
+
+    def test_sweep_removes_worktrees_of_dead_servers_only(self) -> None:
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stale = self.work / ".tenants" / f".work-change-{dead.pid}-{'a' * 12}"
+        live = self.work / ".tenants" / f".work-change-{os.getppid()}-{'b' * 12}"
+        for d in (stale, live):
+            self.git(self.work, "worktree", "add", "-q", "--detach", str(d), "main")
+        removed = srv.sweep_stale_worktrees()
+        self.assertEqual(removed, [stale.name])
+        self.assertFalse(stale.exists())
+        self.assertTrue(live.exists())
+        self.git(self.work, "worktree", "remove", "--force", str(live))
 
 
 class HttpIdentityTest(unittest.TestCase):

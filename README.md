@@ -346,11 +346,14 @@ rights too. In order:
 stdio is a single local user: every commit carries that user's identity, so
 the author checks would block all publishing there.
 
-**Proposals ledger.** `$PCMS_STATE_DIR/proposals-ledger.jsonl`, default
-`.tenants/.state/proposals-ledger.jsonl` (gitignored), append-only and
-written only by the server. The state dir must be a real directory (not a
-symlink) owned by the server user with mode 0700; the server creates it that
-way when missing and refuses any other. The file is opened with
+**Proposals ledger.** `$PCMS_STATE_DIR/proposals-ledger.jsonl`, append-only
+and written only by the server. Server state never lives inside the
+repository or any of its worktrees. Over HTTP `PCMS_STATE_DIR` is required,
+must be absolute and outside the repository and every worktree, and the
+server refuses to start otherwise. On stdio it defaults to
+`$XDG_STATE_HOME/post-cms/<repo hash>` (`~/.local/state/...`). The state dir
+must be a real directory (not a symlink) owned by the server user with mode
+0700; the server creates it that way when missing and refuses any other. The file is opened with
 `O_NOFOLLOW`, must be a regular file the server user owns, and is created
 mode 0600. One JSON object per line:
 
@@ -367,9 +370,21 @@ and refuses to record a commit whose `git diff --name-only <parent> HEAD`
 lists any other path.
 
 **Where proposals are written.** Over HTTP every proposal call works in its
-own throwaway git worktree (`.tenants/.work-*`), created from `origin/main`
-and deleted afterwards, so callers never share an index; a `tenant` argument
-is ignored there (the result says so). On stdio, proposals use the shared
+own throwaway git worktree (`.tenants/.work-<kind>-<pid>-<id>`), created
+from `origin/main` and deleted afterwards, so callers never share an index;
+a `tenant` argument is ignored there (the result says so). At most
+`PCMS_MAX_WORKTREES` (default 4) exist at once; past that a call fails with
+"server busy". Worktrees left by a server that died are swept at startup
+and every 10 minutes.
+
+**Branch content is untrusted.** Worktree files are read and written through
+directory handles with `O_NOFOLLOW`, so a symlink anywhere on a path is
+refused, never followed. `revise_proposal` checks out the proposal branch,
+so it first refuses a branch that contains any symlink or changes anything
+outside `content/<collection>/<slug>/` (its preview runs the repository's
+build code). Slugs, collections and proposal IDs must match
+`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, and every value in a preview command is
+shell-quoted. On stdio, proposals use the shared
 checkout or the tenant's worktree, serialized by a lock file in `.git/`
 (`pcms-root.lock`, `pcms-tenant-<name>.lock`), as do reverts, deploys and
 `create_draft`/`update_post` commits. A failed write fails the tool, and

@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -322,12 +325,120 @@ TOOLS = [
 
 # ---------------------------------------------------------------- content io
 
+# ---- worktree file access: never follow a symlink ----------------------------
+#
+# A proposal branch's content is controlled by whoever can push it. The
+# server therefore reads and writes worktree files through directory fds,
+# component by component, with O_NOFOLLOW: a committed symlink anywhere on
+# the path makes the operation refuse instead of escaping the worktree.
+
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def _check_id(value: Any, what: str) -> str:
+    """Slugs, collections and proposal IDs: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$."""
+    v = value.strip() if isinstance(value, str) else ""
+    if not _ID_RE.fullmatch(v):
+        raise ValueError(f"{what} must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,63}}$")
+    return v
+
+
+def _rel_parts(root: Path, path: Path | str) -> list[str]:
+    p = Path(path)
+    rel = p.relative_to(root) if p.is_absolute() else p
+    parts = list(rel.parts)
+    if not parts or any(x in ("", ".", "..") or "/" in x for x in parts):
+        raise ValueError(f"unsafe worktree path {str(rel)!r}")
+    return parts
+
+
+def _open_dir_nofollow(root: Path, parts: list[str], create: bool) -> int:
+    fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except OSError:
+        os.close(fd)
+        raise
+
+
+def _wt_write(root: Path, path: Path | str, data: str) -> None:
+    """Write a worktree file without following any symlink on its path."""
+    parts = _rel_parts(root, path)
+    try:
+        dfd = _open_dir_nofollow(root, parts[:-1], create=True)
+        try:
+            fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                         0o644, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+    except OSError as exc:
+        raise ValueError(f"refusing to write {'/'.join(parts)}: {exc.strerror or exc} "
+                         "(symlinks are never followed in a worktree)") from exc
+
+
+def _wt_read(root: Path, path: Path | str) -> str | None:
+    """Read a worktree file without following symlinks; None when missing."""
+    parts = _rel_parts(root, path)
+    try:
+        dfd = _open_dir_nofollow(root, parts[:-1], create=False)
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"refusing to read {'/'.join(parts)}: {exc.strerror or exc} "
+                         "(symlinks are never followed in a worktree)") from exc
+    with os.fdopen(fd, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _wt_is_dir(root: Path, path: Path | str) -> bool:
+    """True for a real directory reached without following symlinks; raises
+    when a symlink is in the way."""
+    parts = _rel_parts(root, path)
+    try:
+        os.close(_open_dir_nofollow(root, parts, create=False))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError(f"refusing {'/'.join(parts)}: {exc.strerror or exc} "
+                         "(symlinks are never followed in a worktree)") from exc
+
+
+def _refuse_symlinks_in_tree(rev: str) -> None:
+    """Refuse a tree that contains any symlink (mode 120000) anywhere."""
+    res = _git("ls-tree", "-r", "-z", "--full-tree", rev)
+    if res.returncode != 0:
+        raise ValueError(f"cannot list the tree of {rev}: {res.stderr.strip()[:200]}")
+    for rec in res.stdout.split("\x00"):
+        if not rec:
+            continue
+        meta, _, name = rec.partition("\t")
+        if meta.split(" ", 1)[0] == "120000":
+            raise ValueError(f"{rev} contains a symlink ({name!r}); refusing to work on it")
+
+
 def _slug_ok(slug: str) -> bool:
     return bool(slug) and all(c.isalnum() or c == "-" for c in slug) and slug == slug.lower()
 
 
 def _post_dir(slug: str) -> Path:
-    return CONTENT / slug
+    return CONTENT / _check_id(slug, "slug")
 
 
 def _read_meta(slug: str) -> dict[str, Any]:
@@ -524,6 +635,104 @@ def _render_preview_artifact(wt: Path, collection: str, slug: str) -> str | None
     return str(out)
 
 
+# ---- throwaway worktrees: capped, swept ----------------------------------
+
+_WORK_IN_USE: set[str] = set()
+_WORK_LOCK = threading.Lock()
+
+
+def _max_worktrees() -> int:
+    try:
+        return max(1, int(os.environ.get("PCMS_MAX_WORKTREES", "4")))
+    except ValueError:
+        return 4
+
+
+def _add_work_worktree(kind: str, rev: str, fetch: list[str]) -> Path:
+    """Create a throwaway worktree of `rev` under .tenants/.work-<kind>-<pid>-<id>
+    after fetching `fetch` refspecs. Refuses with a busy error when
+    PCMS_MAX_WORKTREES (default 4) are already in use by this process."""
+    with _WORK_LOCK:
+        if len(_WORK_IN_USE) >= _max_worktrees():
+            raise ValueError(f"server busy: {len(_WORK_IN_USE)} proposal worktrees in "
+                             "use (PCMS_MAX_WORKTREES); retry shortly")
+        tmp = ROOT / ".tenants" / f".work-{kind}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        _WORK_IN_USE.add(str(tmp))
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        with _flock("repo"):
+            for spec in fetch:
+                f = _git("fetch", "--quiet", "origin", spec)
+                if f.returncode != 0:
+                    raise ValueError(f"git fetch failed: {f.stderr.strip()[:300]}")
+            res = _git("worktree", "add", "--detach", str(tmp), rev)
+        if res.returncode != 0:
+            raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
+        return tmp
+    except BaseException:
+        _remove_work_worktree(tmp)
+        raise
+
+
+def _remove_work_worktree(tmp: Path) -> None:
+    try:
+        with _flock("repo"):
+            _git("worktree", "remove", "--force", str(tmp))
+            _git("worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        with _WORK_LOCK:
+            _WORK_IN_USE.discard(str(tmp))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_stale_worktrees() -> list[str]:
+    """Remove .tenants/.work-* left by a server that died (its pid is gone)
+    or by this process but no longer in use. Run at startup and on a timer."""
+    base = ROOT / ".tenants"
+    removed: list[str] = []
+    if not base.is_dir():
+        return removed
+    for p in base.iterdir():
+        m = re.fullmatch(r"\.work-[a-z]+-(\d+)-[0-9a-f]{12}", p.name)
+        if not m or p.is_symlink():
+            continue
+        pid = int(m.group(1))
+        with _WORK_LOCK:
+            busy = str(p) in _WORK_IN_USE
+        if busy or (pid != os.getpid() and _pid_alive(pid)):
+            continue
+        with _flock("repo"):
+            _git("worktree", "remove", "--force", str(p))
+        shutil.rmtree(p, ignore_errors=True)
+        removed.append(p.name)
+    with _flock("repo"):
+        _git("worktree", "prune")
+    return removed
+
+
+def start_worktree_sweeper(interval: float = 600.0) -> None:
+    """Sweep now, then every `interval` seconds on a daemon thread."""
+    def tick() -> None:
+        try:
+            sweep_stale_worktrees()
+        except Exception as exc:  # never let the sweeper kill the server
+            print(f"post-cms-mcp: worktree sweep failed: {exc}", file=sys.stderr)
+        t = threading.Timer(interval, tick)
+        t.daemon = True
+        t.start()
+    tick()
+
+
 # ---- proposal workspaces ---------------------------------------------------
 #
 # Over HTTP every proposal runs in its own throwaway worktree created from
@@ -566,15 +775,8 @@ class _ProposalWorkspace:
         if self.path is not None:
             return self.path
         if self.throwaway:
-            tmp = ROOT / ".tenants" / f".work-{self.kind}-{uuid.uuid4().hex[:12]}"
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            with _flock("repo"):
-                _fetch_origin_main_locked()
-                res = _git("worktree", "add", "--detach", str(tmp), "origin/main")
-            if res.returncode != 0:
-                shutil.rmtree(tmp, ignore_errors=True)
-                raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
-            self.path = tmp
+            self.path = _add_work_worktree(
+                self.kind, "origin/main", ["+refs/heads/main:refs/remotes/origin/main"])
         else:
             if self.tenant:
                 tenant_worktree_name_ok(self.tenant)
@@ -586,10 +788,7 @@ class _ProposalWorkspace:
 
     def close(self) -> None:
         if self.throwaway and self.path is not None:
-            with _flock("repo"):
-                _git("worktree", "remove", "--force", str(self.path))
-                _git("worktree", "prune")
-            shutil.rmtree(self.path, ignore_errors=True)
+            _remove_work_worktree(self.path)
         if self._lock is not None:
             self._lock.__exit__(None, None, None)
             self._lock = None
@@ -688,10 +887,10 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
 
     tpl_rel = Path("templates") / f"{name}.html"
     tpl_path = wt / tpl_rel
-    existed = tpl_path.exists()
-    if not tpl_path.parent.exists():
+    if not _wt_is_dir(wt, "templates"):
         raise ValueError(f"templates/ directory not found in {'worktree' if tenant else 'repo'}")
-    tpl_path.write_text(body if body.endswith("\n") else body + "\n")
+    existed = _wt_read(wt, tpl_rel) is not None
+    _wt_write(wt, tpl_rel, body if body.endswith("\n") else body + "\n")
 
     try:
         # Validation: a real build compiles every template in templates/.
@@ -723,10 +922,11 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
 
         root_arg = "" if tenant else "  # or pass the same tenant to render from its worktree"
         if ws.throwaway:
-            preview_cmd = (f"cd {ROOT} && git fetch origin {branch} && git switch {branch} && "
+            preview_cmd = (f"cd {shlex.quote(str(ROOT))} && git fetch origin "
+                           f"{shlex.quote(branch)} && git switch {shlex.quote(branch)} && "
                            f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
         else:
-            preview_cmd = (f"cd {wt} && cargo run -q -p build && "
+            preview_cmd = (f"cd {shlex.quote(str(wt))} && cargo run -q -p build && "
                            f"python3 -m http.server 8000 -d dist{root_arg}")
         pr_body = (f"Agent-authored template by {author_name}.\n\n"
                    f"Use: set `item_template: {name}.html` (or index_template) in a "
@@ -747,7 +947,7 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
             try:
                 result["template_artifact"] = _artifact_payload(
                     _save_artifact(f"template-{name}.html",
-                                   tpl_path.read_text()))
+                                   _wt_read(wt, tpl_rel) or ""))
             except OSError:
                 pass
         if not ok:
@@ -823,9 +1023,7 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         apn, ape, apn_src, apn_i = _merge_now_gate(args, "propose_change", author_i,
                                                    author_name, author_email)
     _stable_id(author_i)  # the ledger needs it; fail before any side effect
-    slug = (args.get("slug") or "").strip()
-    if not slug or "/" in slug or ".." in slug:
-        raise ValueError("slug required (existing post slug or new draft slug)")
+    slug = _check_id(args.get("slug"), "slug")
     raw_title = (args.get("title") or "").strip()
     title = raw_title or f"Update {slug}"
     body_md = args.get("body")  # optional new markdown body
@@ -837,9 +1035,7 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
     if not isinstance(fields, dict):
         raise ValueError("fields must be an object of extra meta keys")
     published = bool(args.get("published"))
-    collection = (args.get("collection") or "posts").strip()
-    if "/" in collection or ".." in collection:
-        raise ValueError("invalid collection")
+    collection = _check_id(args.get("collection") or "posts", "collection")
     wt = ws.open()
     tenant = ws.tenant
 
@@ -847,7 +1043,7 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
     item_dir = wt / "content" / collection / slug
     meta_path = item_dir / "meta.yaml"
     md_path = item_dir / "index.mdx"
-    is_new = not item_dir.exists()
+    is_new = not _wt_is_dir(wt, item_dir)
 
     # Branch per change, from current default branch state. Version suffixes
     # are -rN (so hyphenated slugs parse unambiguously); a slug's first
@@ -870,7 +1066,6 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
 
     try:
         if is_new:
-            item_dir.mkdir(parents=True, exist_ok=True)
             created.append(meta_path)
             if body_md:
                 created.append(md_path)
@@ -887,24 +1082,21 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
                 lines.append(f"agent_notes: {_yaml_value(agent_notes)}")
             for k, v in fields.items():
                 lines.append(f"{k}: {_yaml_value(v)}")
-            meta_path.write_text("\n".join(lines) + "\n")
+            _wt_write(wt, meta_path, "\n".join(lines) + "\n")
             if body_md:
-                md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+                _wt_write(wt, md_path, body_md if body_md.endswith("\n") else body_md + "\n")
             summary = f"propose: new {collection}/{slug} draft"
         else:
             summary = f"propose: update {collection}/{slug}"
             for f in (meta_path, md_path):
-                if f.exists():
-                    overwritten[f] = f.read_text()
-                else:
-                    overwritten[f] = None
-            _apply_meta_edits(meta_path,
+                overwritten[f] = _wt_read(wt, f)
+            _apply_meta_edits(meta_path, root=wt,
                               title=raw_title or None,
                               description=description,
                               agent_notes=agent_notes,
                               fields=fields or None)
         if body_md and not is_new:
-            md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+            _wt_write(wt, md_path, body_md if body_md.endswith("\n") else body_md + "\n")
 
         # Validate with a real build BEFORE committing anything: a schema
         # violation or broken item fails here with the exact compiler error,
@@ -935,8 +1127,9 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
-        preview_cmd = (f"cd {ROOT if ws.throwaway else wt} && git fetch origin {branch} && "
-                       f"git switch {branch} && "
+        preview_cmd = (f"cd {shlex.quote(str(ROOT if ws.throwaway else wt))} && "
+                       f"git fetch origin {shlex.quote(branch)} && "
+                       f"git switch {shlex.quote(branch)} && "
                        f"DRAFTS=1 cargo run -q -p build && "
                        f"python3 -m http.server 8000 -d dist")
         preview_url = f"http://localhost:8000/preview/drafts/{collection}/{slug}/"
@@ -946,7 +1139,7 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         if not is_new:
             try:
                 cur = {}
-                for line in meta_path.read_text().splitlines():
+                for line in (_wt_read(wt, meta_path) or "").splitlines():
                     if ":" in line and not line.startswith((" ", "#", "-")):
                         k, _, v = line.partition(":")
                         cur[k.strip()] = v.strip()
@@ -1034,9 +1227,9 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
 
 # ------------------------------------------------------------------- plugins
 
-def _read_site_yaml_plugins(site_path: Path) -> list[dict[str, Any]]:
+def _read_site_yaml_plugins(site_path: Path, root: Path) -> list[dict[str, Any]]:
     """Parse the top-level `plugins:` block of a site.yaml (stdlib only)."""
-    lines = site_path.read_text().splitlines()
+    lines = (_wt_read(root, site_path) or "").splitlines()
     try:
         start = next(i for i, ln in enumerate(lines) if ln.startswith("plugins:"))
     except StopIteration:
@@ -1076,10 +1269,11 @@ def _site_yaml_plugins_block(entries: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _set_site_yaml_plugins(site_path: Path, new_entries: list[dict[str, Any]]) -> None:
+def _set_site_yaml_plugins(site_path: Path, new_entries: list[dict[str, Any]],
+                           root: Path) -> None:
     """Replace the top-level `plugins:` block in site.yaml (or append it, or
     remove it entirely when the list is empty). Rest of the file untouched."""
-    lines = site_path.read_text().splitlines()
+    lines = (_wt_read(root, site_path) or "").splitlines()
     try:
         start = next(i for i, ln in enumerate(lines) if ln.startswith("plugins:"))
     except StopIteration:
@@ -1094,7 +1288,7 @@ def _set_site_yaml_plugins(site_path: Path, new_entries: list[dict[str, Any]]) -
         if lines and lines[-1].strip():
             lines.append("")
         lines.extend(block.splitlines())
-    site_path.write_text("\n".join(lines) + "\n")
+    _wt_write(root, site_path, "\n".join(lines) + "\n")
 
 
 def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
@@ -1151,31 +1345,29 @@ def _propose_plugin(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
 
     try:
         site_path = wt / "site.yaml"
-        if not site_path.exists():
+        if _wt_read(wt, "site.yaml") is None:
             raise ValueError("site.yaml not found in repo")
         plugin_dir = wt / "plugins" / name
         snippet_path = plugin_dir / "snippet.html"
 
-        current = _read_site_yaml_plugins(site_path)
+        current = _read_site_yaml_plugins(site_path, wt)
         if remove:
             if not any(e["name"] == name for e in current):
                 raise ValueError(f"plugin {name!r} is not declared in site.yaml — nothing to remove")
-            if snippet_path.exists():
+            if _wt_read(wt, snippet_path) is not None:
                 _git("rm", "-rqf", str(plugin_dir.relative_to(wt)), worktree=wt)
             new_entries = [e for e in current if e["name"] != name]
-            _set_site_yaml_plugins(site_path, new_entries)
+            _set_site_yaml_plugins(site_path, new_entries, wt)
             verb = "remove"
         else:
             snippet = args.get("snippet")
             if not snippet or not snippet.strip():
                 raise ValueError("snippet (HTML) is required unless remove=true")
-            if not plugin_dir.exists():
-                plugin_dir.mkdir(parents=True)
-            snippet_path.write_text(snippet if snippet.endswith("\n") else snippet + "\n")
+            _wt_write(wt, snippet_path, snippet if snippet.endswith("\n") else snippet + "\n")
             entry = {"name": name, "mounts": mounts, "csp_script_src": csp_script_src,
                      "require_consent": require_consent}
             new_entries = [e for e in current if e["name"] != name] + [entry]
-            _set_site_yaml_plugins(site_path, new_entries)
+            _set_site_yaml_plugins(site_path, new_entries, wt)
             verb = "add"
 
         # Validation: a real build. The build crate rejects declared plugins
@@ -1269,12 +1461,15 @@ def _propose_plugin(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         raise
 
 
-def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
+def _apply_meta_edits(meta_path: Path, *, root: Path, title: str | None = None,
                       description: str | None = None,
                       agent_notes: str | None = None,
                       fields: dict[str, Any] | None = None) -> None:
-    """Rewrite keys in an existing item's meta.yaml, appending missing ones."""
-    cur = meta_path.read_text()
+    """Rewrite keys in an existing item's meta.yaml, appending missing ones.
+    Reads and writes inside worktree `root` without following symlinks."""
+    cur = _wt_read(root, meta_path)
+    if cur is None:
+        raise ValueError(f"{meta_path.relative_to(root)} not found")
     changed = False
     for key, val in (("title", title), ("description", description),
                      ("agent_notes", agent_notes)):
@@ -1294,7 +1489,7 @@ def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
             cur = cur.rstrip("\n") + "\n" + line + "\n"
         changed = True
     if changed:
-        meta_path.write_text(cur)
+        _wt_write(root, meta_path, cur)
 
 
 def _proposal_branch(slug: str) -> str | None:
@@ -1351,37 +1546,33 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         (args.get("author_email") or "").strip())
     author_name = author_i["name"] or author_i["login"]
     author_email = author_i["email"] or f"{author_i['login']}@users.noreply.github.com"
-    slug = (args.get("slug") or "").strip()
-    if not slug or "/" in slug or ".." in slug:
-        raise ValueError("slug required")
+    slug = _check_id(args.get("slug"), "slug")
+    collection = _check_id(args.get("collection") or "posts", "collection")
     branch = _proposal_branch(slug)
     if branch is None:
         raise ValueError(f"no open proposal branch for slug {slug!r} (propose_change first)")
-    collection = (args.get("collection") or "posts").strip()
-    if "/" in collection or ".." in collection:
-        raise ValueError("invalid collection")
 
-    tmp = ROOT / ".tenants" / f".work-revise-{uuid.uuid4().hex[:12]}"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
     # origin/<branch> is the source of truth — a local ref can be stale
-    # (behind a revision pushed by an earlier session).
-    with _flock("repo"):
-        fres = _git("fetch", "origin",
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}", worktree=ROOT)
-        if fres.returncode != 0:
-            raise ValueError(f"git fetch failed: {fres.stderr.strip()[:300]}")
-        res = _git("worktree", "add", "--detach", str(tmp), f"origin/{branch}")
-    if res.returncode != 0:
-        raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
+    # (behind a revision pushed by an earlier session). Its content is
+    # controlled by whoever can push the branch, so before anything runs
+    # in it: no symlink anywhere in the tree, and the branch may change
+    # nothing but this item (the preview below runs the repo's build code).
+    tmp = _add_work_worktree(
+        "revise", f"origin/{branch}",
+        ["+refs/heads/main:refs/remotes/origin/main",
+         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
     try:
-        item_dir = tmp / "content" / collection / slug
-        if not item_dir.exists():
+        _refuse_symlinks_in_tree(f"origin/{branch}")
+        item_rel = f"content/{collection}/{slug}"
+        _refuse_branch_outside(branch, [item_rel])
+        item_dir = tmp / item_rel
+        if not _wt_is_dir(tmp, item_rel):
             raise ValueError(f"{collection}/{slug} not on {branch}")
         meta_path = item_dir / "meta.yaml"
         md_path = item_dir / "index.mdx"
         body_md = args.get("body")
         if body_md:
-            md_path.write_text(body_md if body_md.endswith("\n") else body_md + "\n")
+            _wt_write(tmp, md_path, body_md if body_md.endswith("\n") else body_md + "\n")
         agent_notes = args.get("agent_notes")
         if agent_notes is not None and not isinstance(agent_notes, str):
             agent_notes = json.dumps(agent_notes, ensure_ascii=False)
@@ -1389,7 +1580,7 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fields, dict):
             fields = None
         raw_title = (args.get("title") or "").strip() or None
-        _apply_meta_edits(meta_path, title=raw_title,
+        _apply_meta_edits(meta_path, root=tmp, title=raw_title,
                           description=args.get("description"),
                           agent_notes=agent_notes, fields=fields)
         env = {"GIT_AUTHOR_NAME": author_name, "GIT_AUTHOR_EMAIL": author_email,
@@ -1409,13 +1600,12 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
                 "pr_url": _open_pr_for_branch(branch),
                 "preview_artifact": _artifact_payload(
                     _render_preview_artifact(tmp, collection, slug)),
-                "preview_command": (f"cd {tmp} && DRAFTS=1 cargo run -q -p build && "
-                                    f"python3 -m http.server 8000 -d dist")}
+                "preview_command": (
+                    f"cd {shlex.quote(str(ROOT))} && git fetch origin {shlex.quote(branch)} "
+                    f"&& git switch {shlex.quote(branch)} && DRAFTS=1 cargo run -q -p build "
+                    f"&& python3 -m http.server 8000 -d dist")}
     finally:
-        with _flock("repo"):
-            _git("worktree", "remove", "--force", str(tmp))
-            _git("worktree", "prune")
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove_work_worktree(tmp)
 
 
 def tool_list_proposals(args: dict[str, Any]) -> dict[str, Any]:
@@ -1656,10 +1846,10 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
 # and of every merge it performs. Approve, merge=true and revert read the
 # ledger; git identities are only a secondary check.
 #
-# Location: $PCMS_STATE_DIR/proposals-ledger.jsonl, default
-# <repo>/.tenants/.state/proposals-ledger.jsonl (gitignored; tenant names
-# cannot start with "."). The state dir must be a real directory owned by
-# the server user, mode 0700; the file is opened O_NOFOLLOW and must be a
+# Location: $PCMS_STATE_DIR/proposals-ledger.jsonl (absolute, required over
+# HTTP), default on stdio $XDG_STATE_HOME/post-cms/<repo hash>/. Never inside
+# the repository or a worktree. The state dir must be a real directory owned
+# by the server user, mode 0700; the file is opened O_NOFOLLOW and must be a
 # regular file the server user owns. One JSON object per line:
 #   {"v": 1, "event": "commit", "tool": "propose_change", "branch": "agent/x",
 #    "sha": "<40 hex>", "actor": "github:123", "email": "...", "time": "..."}
@@ -1671,13 +1861,48 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
 _SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 
 
+def _state_dir() -> Path:
+    """Where server state (the proposals ledger) lives: never inside the repo
+    or any of its worktrees, whose content a branch pusher controls.
+    PCMS_STATE_DIR (absolute) wins and is required over HTTP. On stdio the
+    default is $XDG_STATE_HOME/post-cms/<repo hash> (~/.local/state/...)."""
+    base = os.environ.get("PCMS_STATE_DIR", "").strip()
+    if base:
+        d = Path(base)
+        if not d.is_absolute():
+            raise ValueError("PCMS_STATE_DIR must be an absolute path")
+    elif os.environ.get("PCMS_TRANSPORT") == "http":
+        raise ValueError("PCMS_STATE_DIR is required over HTTP: an absolute path "
+                         "outside the repository and its worktrees")
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+        tag = hashlib.sha256(str(ROOT.resolve()).encode()).hexdigest()[:12]
+        d = Path(xdg) / "post-cms" / tag
+    real = Path(os.path.realpath(d))
+    roots = {Path(os.path.realpath(ROOT))}
+    wl = _git("worktree", "list", "--porcelain")
+    for line in wl.stdout.splitlines():
+        if line.startswith("worktree "):
+            roots.add(Path(os.path.realpath(line[len("worktree "):])))
+    for r in roots:
+        if real == r or r in real.parents:
+            raise ValueError(f"state dir {d} is inside {r}; server state must live "
+                             "outside the repository and its worktrees")
+    return d
+
+
+def check_state_dir() -> Path:
+    """Startup check: resolve the state dir and create or validate it."""
+    _ledger_dir(create=True)
+    return _state_dir()
+
+
 def _ledger_dir(create: bool) -> Path | None:
-    """The ledger's state dir: $PCMS_STATE_DIR, default <repo>/.tenants/.state.
-    It must be a real directory (not a symlink) owned by the server user with
-    mode 0700; anything else refuses. Created 0700 when missing and `create`."""
+    """The ledger's state dir (see _state_dir). It must be a real directory
+    (not a symlink) owned by the server user with mode 0700; anything else
+    refuses. Created 0700 when missing and `create`."""
     import stat as st_mod
-    base = os.environ.get("PCMS_STATE_DIR")
-    d = Path(base) if base else ROOT / ".tenants" / ".state"
+    d = _state_dir()
     try:
         st = os.lstat(d)
     except FileNotFoundError:
@@ -1697,9 +1922,7 @@ def _ledger_dir(create: bool) -> Path | None:
 
 
 def _ledger_path() -> Path:
-    base = os.environ.get("PCMS_STATE_DIR")
-    d = Path(base) if base else ROOT / ".tenants" / ".state"
-    return d / "proposals-ledger.jsonl"
+    return _state_dir() / "proposals-ledger.jsonl"
 
 
 def _ledger_open(flags: int) -> int:
@@ -1748,7 +1971,7 @@ def _ledger_append(entry: dict[str, Any]) -> None:
         finally:
             os.close(fd)
     except (OSError, ValueError) as exc:
-        raise ValueError(f"proposals ledger write failed ({_ledger_path()}): {exc}") from exc
+        raise ValueError(f"proposals ledger write failed: {exc}") from exc
 
 
 def _ledger_entries() -> list[dict[str, Any]]:
@@ -1784,7 +2007,8 @@ def _ledger_record_commit(tool: str, branch: str, wt: Path, before: str,
     parent = _git("rev-parse", "HEAD^", worktree=wt).stdout.strip()
     if not _SHA_RE.fullmatch(head) or head == before or parent != before:
         raise ValueError("ledger: could not identify the commit the server just made")
-    diff = _git("diff", "--name-only", "-z", before, head, worktree=wt)
+    diff = _git("-c", "diff.relative=false", "diff", "--no-renames", "--no-ext-diff",
+                "--name-only", "-z", before, head, worktree=wt)
     changed = [f for f in diff.stdout.split("\x00") if f]
     roots = [o.rstrip("/") for o in own]
     stray = [f for f in changed
@@ -2070,13 +2294,10 @@ def tool_approve_proposal(args: dict[str, Any]) -> dict[str, Any]:
     declared_email = (args.get("approver_email") or "").strip()
     slugs = args.get("slugs")
     if not slugs:
-        slug = (args.get("slug") or "").strip()
-        if not slug or "/" in slug or ".." in slug:
-            raise ValueError("slug required")
-        slugs = [slug]
-    if not isinstance(slugs, list) or not all(isinstance(s, str) and s.strip() for s in slugs):
+        slugs = [args.get("slug")]
+    if not isinstance(slugs, list):
         raise ValueError("slugs must be a list of proposal slugs")
-    slugs = [s.strip() for s in slugs]
+    slugs = [_check_id(s, "slug") for s in slugs]
     ident = _check_declared_identity(declared_name, declared_email)
     approver_name = ident["name"] or ident["login"]
     approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
@@ -2124,8 +2345,7 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     from the authenticated GitHub session; free-text args must match it."""
     slug = (args.get("slug") or "").strip()
     reason = (args.get("reason") or "").strip()
-    if not slug or "/" in slug or ".." in slug:
-        raise ValueError("slug required")
+    slug = _check_id(slug, "slug")
     if not reason:
         raise ValueError("reason required — a rejection without a reason teaches nothing")
     ident = _check_declared_identity(
@@ -2195,6 +2415,21 @@ def _revert_on_shared_tree(merge_sha: str) -> None:
             raise ValueError(f"push of revert failed: {push.stderr.strip()[:300]}")
 
 
+def _refuse_branch_outside(branch: str, roots: list[str]) -> None:
+    """Refuse a proposal branch that changes anything outside `roots` since
+    its merge base with origin/main (renames count as both sides)."""
+    diff = _git("-c", "diff.relative=false", "diff", "--no-renames", "--no-ext-diff",
+                "--name-only", "-z", f"origin/main...origin/{branch}")
+    if diff.returncode != 0:
+        raise ValueError(f"cannot diff {branch}: {diff.stderr.strip()[:200]}")
+    roots = [r.rstrip("/") for r in roots]
+    stray = [f for f in diff.stdout.split("\x00")
+             if f and not any(f == r or f.startswith(r + "/") for r in roots)]
+    if stray:
+        raise ValueError(f"{branch} changes paths outside {', '.join(roots)} "
+                         f"({', '.join(stray[:5])}); refusing to run it")
+
+
 def _find_shipped_merge(slug: str) -> tuple[str, int | None, str]:
     """The exact merge commit that shipped proposal `slug` on origin/main:
     (merge sha, PR number, branch). Branch names match exactly
@@ -2253,9 +2488,7 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     approver_name = ident["name"] or ident["login"]
     approver_email = ident["email"] or f"{ident['login']}@users.noreply.github.com"
     identity_source = ident["source"]
-    slug = (args.get("slug") or "").strip()
-    if not slug or "/" in slug or ".." in slug:
-        raise ValueError("slug required")
+    slug = _check_id(args.get("slug"), "slug")
     _require_approver(ident)
     with _flock("repo"):
         _git("fetch", "origin")
@@ -2520,6 +2753,10 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def serve() -> None:
+    try:
+        sweep_stale_worktrees()
+    except Exception as exc:  # a failed sweep must not stop the server
+        print(f"post-cms-mcp: worktree sweep failed: {exc}", file=sys.stderr)
     for line in sys.stdin:
         line = line.strip()
         if not line:

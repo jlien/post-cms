@@ -276,6 +276,12 @@ def main() -> int:
     if not OAUTH_MODE:
         sys.exit("OAUTH_MODE required (github | oidc) — the hosted server "
                  "refuses to run without a standard connector")
+    try:
+        state = srv.check_state_dir()
+    except ValueError as exc:
+        sys.exit(f"refusing to start: {exc}")
+    srv.start_worktree_sweeper()
+    sys.stderr.write(f"post-cms MCP state dir: {state}\n")
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     sys.stderr.write(f"post-cms MCP over HTTP on http://{HOST}:{PORT}/mcp "
                      f"(oauth: {OAUTH_MODE})\n")
