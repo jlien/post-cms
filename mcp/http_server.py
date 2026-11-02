@@ -10,6 +10,10 @@ STANDARD connector — no FusionAuth, no bespoke IdP:
                         (https://<issuer>/.well-known/openid-configuration)
                         + JWKS — works with any standard issuer: Auth0,
                         Okta, Entra ID, WorkOS, Keycloak, Authentik, ...
+    OAUTH_MODE=iap      behind an identity-aware proxy: the proxy's signed
+                        `x-goog-iap-jwt-assertion` header is the only
+                        identity source (ES256, verified in mcp/iap.py);
+                        `Authorization` is ignored. Requires IAP_AUDIENCE.
 
 The validated principal is bound into the request context; approve / reject
 / revert take the approver's identity from that login — the same structural
@@ -39,6 +43,12 @@ from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parent.parent
 
+_iap_spec = importlib.util.spec_from_file_location("pcms_iap", Path(__file__).with_name("iap.py"))
+if _iap_spec is None or _iap_spec.loader is None:
+    sys.exit("cannot load iap.py next to http_server.py")
+iap = importlib.util.module_from_spec(_iap_spec)
+_iap_spec.loader.exec_module(iap)
+
 # Load the stdio server module by path (its mcp/ dir must not shadow the
 # pip `mcp` package, and this file is executed as a script, not an import).
 # The HTTP transport is a multi-principal channel: identity-aware defaults
@@ -50,11 +60,16 @@ if _spec is None or _spec.loader is None:
 srv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(srv)
 
-OAUTH_MODE = os.environ.get("OAUTH_MODE", "").strip().lower()  # github | oidc
+OAUTH_MODE = os.environ.get("OAUTH_MODE", "").strip().lower()  # github | oidc | iap
 OAUTH_ISSUER = os.environ.get("OAUTH_ISSUER", "").rstrip("/")
 OAUTH_AUDIENCE = os.environ.get("OAUTH_AUDIENCE", "").strip()
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8791"))
+
+IAP_AUDIENCE = os.environ.get("IAP_AUDIENCE", "").strip()
+IAP_JWKS_URL = os.environ.get("IAP_JWKS_URL", "").strip() or iap.DEFAULT_JWKS_URL
+IAP_JWKS_MAX_STALE_SECS = os.environ.get("IAP_JWKS_MAX_STALE_SECS", "86400").strip()
+MAX_BODY_BYTES = 1024 * 1024  # largest JSON-RPC request body accepted
 
 _TOKEN_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_LOCK = threading.Lock()
@@ -151,6 +166,10 @@ def _jwks_client(issuer: str):
 
 def validate_token(token: str) -> dict:
     """Token → principal. Raises AuthError when the connector rejects it."""
+    if OAUTH_MODE == "iap":
+        # One identity source: behind the proxy, a bearer token is never
+        # an identity, whatever it contains.
+        raise AuthError("bearer tokens are not accepted in iap mode")
     if not token:
         raise AuthError("missing bearer token")
     hit = _cached(token)
@@ -162,6 +181,45 @@ def validate_token(token: str) -> dict:
         return _store(token, _identity_oidc(token))
     raise RuntimeError(
         "OAUTH_MODE must be set to a standard connector: github | oidc")
+
+
+_IAP_VERIFIER = None
+_IAP_LOCK = threading.Lock()
+
+
+def iap_config_error() -> str | None:
+    """Why iap mode cannot run with this config, or None."""
+    if not IAP_AUDIENCE:
+        return "OAUTH_MODE=iap requires IAP_AUDIENCE"
+    if not IAP_JWKS_URL.startswith("https://"):
+        return "IAP_JWKS_URL must be an https:// URL"
+    if not IAP_JWKS_MAX_STALE_SECS.isdigit():
+        return "IAP_JWKS_MAX_STALE_SECS must be a whole number of seconds"
+    return None
+
+
+def _iap_verifier():
+    global _IAP_VERIFIER
+    with _IAP_LOCK:
+        if _IAP_VERIFIER is None:
+            err = iap_config_error()
+            if err:
+                raise RuntimeError(err)
+            _IAP_VERIFIER = iap.IapVerifier(IAP_AUDIENCE, iap.JwksCache(
+                IAP_JWKS_URL, max_stale=float(int(IAP_JWKS_MAX_STALE_SECS))))
+        return _IAP_VERIFIER
+
+
+def validate_iap(assertion: str) -> dict:
+    """Proxy assertion → principal (email lowercased, sub kept). Raises
+    AuthError; the reason goes to the server log, never to the client."""
+    verifier = _iap_verifier()  # config errors (RuntimeError) stay server errors
+    try:
+        return verifier.verify(assertion)
+    except iap.IapError as exc:
+        raise AuthError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - any verifier fault (RecursionError too) fails closed
+        raise AuthError(f"verifier error: {type(exc).__name__}") from exc
 
 
 def protected_resource_metadata() -> dict:
@@ -190,40 +248,102 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if code >= 400:
+            # Any refusal may leave a body unread: close, so it is never
+            # parsed as the next request on a reused connection (a proxy
+            # pools connections across clients).
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
+    def _body_length(self) -> int | None:
+        """Declared body length, or None when the framing is unacceptable:
+        Transfer-Encoding (not supported), a Content-Length that is not a
+        plain non-negative integer, conflicting Content-Length headers, or
+        a body over MAX_BODY_BYTES."""
+        if self.headers.get_all("Transfer-Encoding"):
+            return None
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return 0
+        if len(set(v.strip() for v in values)) != 1:
+            return None
+        raw = values[0].strip()
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 10:
+            return None
+        length = int(raw)
+        return length if length <= MAX_BODY_BYTES else None
+
+    def _reject_body(self) -> bool:
+        """For methods that take no body (GET): refuse one with 400 and close
+        the connection, so it is never parsed as the next request."""
+        if self._body_length() == 0:
+            return False
+        if self.command == "HEAD":  # a HEAD response carries no body
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+        else:
+            self._json(400, {"error": "request body not allowed"})
+        return True
+
     def _auth(self) -> dict:
+        if OAUTH_MODE == "iap":
+            return validate_iap(self.headers.get(iap.IAP_HEADER, ""))
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             raise AuthError("Authorization: Bearer <token> required")
         return validate_token(header[7:].strip())
 
     def do_GET(self):  # noqa: N802 (stdlib naming)
-        if self.path == "/.well-known/oauth-protected-resource":
+        if self._reject_body():
+            return
+        if self.path == "/.well-known/oauth-protected-resource" and OAUTH_MODE != "iap":
             self._json(200, protected_resource_metadata())
             return
         self._json(404, {"error": "not found"})
 
+    def do_HEAD(self):  # noqa: N802
+        if self._reject_body():
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):  # noqa: N802
+        length = self._body_length()
+        if length is None:
+            self._json(400, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32600, "message": "invalid request"}})
+            return
         if self.path != "/mcp":
             self._json(404, {"error": "not found"})
             return
         try:
             ident = self._auth()
         except AuthError as exc:
+            if OAUTH_MODE == "iap":
+                sys.stderr.write(f"iap: 401 ({exc})\n")
+                self._json(401, {"error": "unauthorized"})
+                return
             self._json(401, {"error": str(exc)}, {
                 "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"',
             })
             return
-        except RuntimeError as exc:
-            self._json(500, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - config or connector fault: no detail to the client
+            sys.stderr.write(f"auth: 500 ({type(exc).__name__}: {exc})\n")
+            self._json(500, {"error": "server error"})
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length).decode() or "null")
-        except (ValueError, json.JSONDecodeError):
+            body = self.rfile.read(length) if length else b""
+            if len(body) != length:
+                raise ValueError("short body")
+            req = iap.loads_bounded(body.decode() or "null")
+        except (ValueError, RecursionError):
             self._json(400, {"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32700, "message": "parse error"}})
             return
@@ -243,6 +363,11 @@ class Handler(BaseHTTPRequestHandler):
         token = ctx_token.set(ident)
         try:
             resp = srv.handle_request(req)
+        except Exception as exc:  # noqa: BLE001 - no traceback or detail to the client
+            sys.stderr.write(f"mcp: 500 ({type(exc).__name__}: {exc})\n")
+            self._json(500, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32603, "message": "internal error"}})
+            return
         finally:
             ctx_token.reset(token)
         if resp is None:
@@ -257,9 +382,11 @@ ctx_token = srv._HTTP_IDENTITY
 
 
 def main() -> int:
-    if not OAUTH_MODE:
-        sys.exit("OAUTH_MODE required (github | oidc) — the hosted server "
+    if OAUTH_MODE not in ("github", "oidc", "iap"):
+        sys.exit("OAUTH_MODE required (github | oidc | iap): the hosted server "
                  "refuses to run without a standard connector")
+    if OAUTH_MODE == "iap" and iap_config_error():
+        sys.exit(f"{iap_config_error()}; refusing to start")
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     sys.stderr.write(f"post-cms MCP over HTTP on http://{HOST}:{PORT}/mcp "
                      f"(oauth: {OAUTH_MODE})\n")

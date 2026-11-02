@@ -321,6 +321,47 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
+## Hosted MCP behind an identity-aware proxy
+
+`mcp/http_server.py` serves the MCP tools over HTTP. `OAUTH_MODE` picks the
+identity source: `github`, `oidc` (bearer tokens), or `iap`.
+
+With `OAUTH_MODE=iap` the server sits behind Google Cloud Identity-Aware
+Proxy and trusts only the proxy's signed `x-goog-iap-jwt-assertion` header.
+The `Authorization` header is ignored, so there is one identity source.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IAP_AUDIENCE` | none, required | Expected `aud`, for example `/projects/<number>/global/backendServices/<id>`. The server refuses to start without it. |
+| `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | Proxy signing keys (JWKS). Must be `https://`; redirects are not followed. |
+| `IAP_JWKS_MAX_STALE_SECS` | `86400` | How long past the 1-hour TTL the held keys stay valid while fetches fail. After that every token is refused, with one logged error, until a fetch succeeds. |
+
+Each request's assertion must be ES256 (exactly), signed by a key in the
+JWKS, with `iss` `https://cloud.google.com/iap`, `aud` equal to
+`IAP_AUDIENCE`, and `exp`, `iat` and `nbf` integers in [1, 9999999999] within
+30 seconds of skew. Every segment must be canonical base64url and its JSON at
+most 32 levels deep. The
+keys are cached for an hour; an unknown `kid` triggers at most one refresh
+every 30 seconds, and a failed fetch keeps the keys already held. The
+identity's stable `id` is `https://cloud.google.com/iap|<sub>`; `email` (the
+claim, lowercased) is kept for display and the commit record. A missing or
+invalid assertion gets a bare `401 {"error": "unauthorized"}`; the reason goes
+to the server log only.
+
+In every mode, request bodies are capped at 1 MiB, `Transfer-Encoding` and
+malformed or conflicting `Content-Length` get a 400, a body on GET or HEAD
+gets a 400, and every error response closes the connection, so an unread body
+is never parsed as the next request. Faults inside a tool or the connector
+return a generic 500; details go to the server log.
+
+Approvals (`approve_proposal`, `merge=true`) take the approver from this
+identity, and the distinct-approver check compares it with the proposal's
+commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
+
+```bash
+python3 -m unittest discover -s mcp -p 'test_*.py'
+```
+
 ## Deploy + CDN purge
 
 ```bash
