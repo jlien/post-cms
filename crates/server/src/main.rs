@@ -1,8 +1,8 @@
 //! Tiny static-file origin for dist/, built on axum.
 //!
 //! Everything under dist/ is served verbatim: pages (/about/, /blog/, ...),
-//! posts (/posts/<slug>/), and feed/meta files. Cache-Control headers follow
-//! the CDN guidance baked into the build.
+//! posts (/posts/<slug>/), and feed/meta files. Cache-Control comes from
+//! site.yaml `cache:` per response class (see cache.rs).
 
 use anyhow::Context;
 use std::collections::HashMap;
@@ -19,44 +19,51 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 
+mod cache;
 mod serve;
 mod iap;
 mod site_headers;
+use cache::CachePolicy;
 use site_headers::SiteHeaders;
 
-const HTML_CACHE_CONTROL: &str =
-    "public, max-age=0, s-maxage=86400, stale-while-revalidate=604800";
-const XML_CACHE_CONTROL: &str = "public, s-maxage=3600";
+/// site.yaml `cache:`, set once at startup. Unset (unit tests) means the
+/// defaults.
+static CACHE: OnceLock<CachePolicy> = OnceLock::new();
 
+fn cache_policy() -> &'static CachePolicy {
+    static DEFAULT: OnceLock<CachePolicy> = OnceLock::new();
+    CACHE.get().unwrap_or_else(|| DEFAULT.get_or_init(CachePolicy::default))
+}
 #[derive(Clone)]
 struct StaticDir(PathBuf);
 
-/// Map a dist file extension to its content type + cache policy.
-fn content_type_for(path: &StdPath) -> (&'static str, &'static str) {
+/// Map a dist file extension to its content type. Cache-Control comes from
+/// [`cache::CachePolicy::class_for_file`].
+fn content_type_for(path: &StdPath) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("html") | Some("htm") => ("text/html; charset=utf-8", HTML_CACHE_CONTROL),
-        Some("xml") => ("application/xml", XML_CACHE_CONTROL),
-        Some("txt") => ("text/plain; charset=utf-8", XML_CACHE_CONTROL),
-        Some("md") => ("text/markdown; charset=utf-8", XML_CACHE_CONTROL),
-        Some("css") => ("text/css; charset=utf-8", HTML_CACHE_CONTROL),
-        Some("ttf") | Some("otf") => ("font/ttf", "public, max-age=31536000, immutable"),
-        Some("woff") => ("font/woff", "public, max-age=31536000, immutable"),
-        Some("woff2") => ("font/woff2", "public, max-age=31536000, immutable"),
-        Some("js") => ("application/javascript", HTML_CACHE_CONTROL),
-        Some("json") => ("application/json", XML_CACHE_CONTROL),
-        Some("svg") => ("image/svg+xml", HTML_CACHE_CONTROL),
-        Some("png") => ("image/png", "public, max-age=31536000, immutable"),
-        Some("jpg") | Some("jpeg") => ("image/jpeg", "public, max-age=31536000, immutable"),
-        Some("webp") => ("image/webp", "public, max-age=31536000, immutable"),
-        Some("avif") => ("image/avif", "public, max-age=31536000, immutable"),
-        Some("gif") => ("image/gif", "public, max-age=31536000, immutable"),
-        Some("mp4") => ("video/mp4", "public, max-age=31536000, immutable"),
-        Some("webm") => ("video/webm", "public, max-age=31536000, immutable"),
-        Some("mp3") => ("audio/mpeg", "public, max-age=31536000, immutable"),
-        Some("ogg") => ("audio/ogg", "public, max-age=31536000, immutable"),
-        Some("wav") => ("audio/wav", "public, max-age=31536000, immutable"),
-        Some("pdf") => ("application/pdf", "public, max-age=31536000, immutable"),
-        _ => ("application/octet-stream", HTML_CACHE_CONTROL),
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("xml") => "application/xml",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("ttf") | Some("otf") => "font/ttf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("js") => "application/javascript",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("gif") => "image/gif",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -222,6 +229,9 @@ fn main() -> anyhow::Result<()> {
     // in a value, or a server-owned header refuses to start.
     let site_headers = load_site_headers(&root)?;
     let _ = SITE_HEADERS.set(site_headers);
+    // site.yaml `cache:` likewise: an unknown class or an invalid
+    // Cache-Control directive refuses to start.
+    let _ = CACHE.set(load_cache_policy(&root)?);
     if embed_cache_dir().is_none() {
         eprintln!("{EMBED_OFF_NO_HOME}");
     }
@@ -262,18 +272,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8787);
 
-    let state = StaticDir(dist.clone());
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/health", get(health))
-        .route("/api/ask", axum::routing::post(ask))
-        .route("/mcp", axum::routing::post(mcp_endpoint))
-        // Everything else (pages, posts, feeds) is a file under dist/.
-        .fallback(get(serve_path))
-        // Draft headers on every /preview response, including the 405 the
-        // router sends for POST or OPTIONS.
-        .layer(axum::middleware::from_fn(preview_response_headers))
-        .with_state(state);
+    let app = router(StaticDir(dist.clone()));
 
     let addr = SocketAddr::new(host, port);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -297,6 +296,22 @@ fn main() -> anyhow::Result<()> {
     // embedding call) running; do not wait for it.
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
     Ok(())
+}
+
+/// Every route the origin answers.
+fn router(state: StaticDir) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/health", get(health))
+        .route("/api/ask", axum::routing::post(ask))
+        .route("/mcp", axum::routing::post(mcp_endpoint))
+        // Everything else (pages, posts, feeds) is a file under dist/.
+        .fallback(get(serve_path))
+        // Draft headers on every /preview response, and private, no-store on
+        // /mcp and /api/ask, including the 405 the router sends for other
+        // methods. Runs after everything site.yaml sets.
+        .layer(axum::middleware::from_fn(private_response_headers))
+        .with_state(state)
 }
 
 /// Resolves on SIGTERM or SIGINT (Ctrl-C). The server then stops accepting
@@ -492,10 +507,8 @@ fn redirect_response(r: &Redirect) -> Response {
     if let Ok(v) = HeaderValue::from_str(&r.to) {
         resp.headers_mut().insert(header::LOCATION, v);
     }
-    // Redirects are permanent routing facts, not content: let the CDN cache
-    // them but revalidate daily.
-    let v = HeaderValue::from_static("public, max-age=86400");
-    resp.headers_mut().insert(header::CACHE_CONTROL, v);
+    // site.yaml `cache.redirects` (see cache.rs for the default).
+    resp.headers_mut().insert(header::CACHE_CONTROL, cache_policy().redirects.clone());
     resp
 }
 
@@ -636,19 +649,33 @@ fn slash_redirect_with(trailing_slash: bool, path: &str, query: Option<&str>) ->
     })
 }
 
+fn load_cache_policy(root: &StdPath) -> anyhow::Result<CachePolicy> {
+    let path = root.join("site.yaml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(CachePolicy::default());
+    };
+    let p = CachePolicy::from_site_yaml(&raw).with_context(|| format!("{}", path.display()))?;
+    eprintln!(
+        "cache: html {:?}; hashed {:?} for {}",
+        p.html.to_str().unwrap_or(""),
+        p.hashed.to_str().unwrap_or(""),
+        p.hashed_dir.as_deref().map_or("nothing (no images: pipeline)".to_string(), |d| format!("/{d}/<hash>")),
+    );
+    Ok(p)
+}
+
+/// The 404 page (or a plain 404), cached briefly (`cache.not_found`).
 fn not_found(root: PathBuf) -> Response {
-    match std::fs::read_to_string(root.join("404.html")) {
+    let mut resp = match std::fs::read_to_string(root.join("404.html")) {
         Ok(html) => {
             let mut resp = Html(html).into_response();
             *resp.status_mut() = StatusCode::NOT_FOUND;
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(HTML_CACHE_CONTROL),
-            );
             resp
         }
         Err(_) => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
-    }
+    };
+    resp.headers_mut().insert(header::CACHE_CONTROL, cache_policy().not_found.clone());
+    resp
 }
 
 // ---- Case-sensitive path resolution ---------------------------------------
@@ -730,6 +757,12 @@ const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src da
 /// traversal is rejected on every segment. Precompressed .gz siblings are
 /// served when the client sends Accept-Encoding: gzip.
 fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
+    serve_with(cache_policy(), root, rel, accept_gzip)
+}
+
+/// [`serve`] with an explicit cache policy for files (404s and redirects use
+/// the startup policy).
+fn serve_with(policy: &CachePolicy, root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     // Strip surrounding slashes: "/blog/" → "blog".
     let rel = rel.trim_matches('/').to_string();
     if rel.is_empty() {
@@ -758,7 +791,8 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
     if !exact_case(root, &file_rel) {
         return not_found(root.clone());
     }
-    let (content_type, cache_control) = content_type_for(&file);
+    let content_type = content_type_for(&file);
+    let cache_control = policy.get(policy.class_for_file(&file_rel));
 
     // Prefer the precompressed sibling when the client can decode gzip.
     let gz_path = PathBuf::from(format!("{}.gz", file.display()));
@@ -774,9 +808,7 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
                 let mut resp = (StatusCode::OK, bytes).into_response();
                 let headers = resp.headers_mut();
                 headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-                if let Ok(v) = HeaderValue::from_str(cache_control) {
-                    headers.insert(header::CACHE_CONTROL, v);
-                }
+                headers.insert(header::CACHE_CONTROL, cache_control);
                 headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
                 harden(&mut resp);
                 return resp;
@@ -790,9 +822,7 @@ fn serve(root: &PathBuf, rel: &str, accept_gzip: bool) -> Response {
             let mut resp = (StatusCode::OK, bytes).into_response();
             let headers = resp.headers_mut();
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-            if let Ok(v) = HeaderValue::from_str(cache_control) {
-                headers.insert(header::CACHE_CONTROL, v);
-            }
+            headers.insert(header::CACHE_CONTROL, cache_control);
             harden(&mut resp);
             resp
         }
@@ -1097,24 +1127,61 @@ fn is_preview_path(path: &str) -> bool {
 }
 
 /// Mark a preview response private and unindexable. Applied after site.yaml
-/// headers so no site rule can make a draft cacheable.
+/// headers so no site rule can make a draft cacheable. `Vary` names the IAP
+/// assertion too, so even a cache that ignored `no-store` could not hand one
+/// reviewer's response to a request without a token.
 fn preview_headers(mut resp: Response) -> Response {
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(PREVIEW_CACHE_CONTROL));
     h.insert(HeaderName::from_static("x-robots-tag"), HeaderValue::from_static(PREVIEW_ROBOTS));
+    add_vary(h, iap::ASSERTION_HEADER);
     resp
 }
 
-/// Router layer: any response to a /preview path gets the draft headers,
-/// whatever produced it (method errors included).
-async fn preview_response_headers(req: Request, next: axum::middleware::Next) -> Response {
-    let preview = is_preview_path(req.uri().path());
-    let resp = next.run(req).await;
-    if preview {
-        preview_headers(resp)
-    } else {
-        resp
+/// Add `name` to the response's Vary list once, keeping what is there.
+fn add_vary(h: &mut HeaderMap, name: &str) {
+    let mut names: Vec<String> = h
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+        names.push(name.to_string());
     }
+    if let Ok(v) = HeaderValue::from_str(&names.join(", ")) {
+        h.insert(header::VARY, v);
+    }
+}
+
+/// /mcp and /api/ask in every spelling the router or the static fallback
+/// could answer. Their answers depend on the caller (rate limits, POST
+/// bodies) and are never cached.
+fn is_private_route(path: &str) -> bool {
+    matches!(path.trim_matches('/'), "mcp" | "api/ask")
+}
+
+/// Router layer, outermost: any response to a /preview path gets the draft
+/// headers, and any response to /mcp or /api/ask gets `private, no-store`,
+/// whatever produced it (method errors included) and whatever site.yaml
+/// says. /health gets `no-store`.
+async fn private_response_headers(req: Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path();
+    let preview = is_preview_path(path);
+    let private = is_private_route(path);
+    let health = path == "/health";
+    let mut resp = next.run(req).await;
+    if preview {
+        return preview_headers(resp);
+    }
+    if private {
+        resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache::PRIVATE));
+    } else if health {
+        resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
 }
 
 /// /preview/: served only after the IAP assertion verifies against `v`.
@@ -1665,7 +1732,7 @@ mod tests {
 
     #[test]
     fn image_types_and_svg_policy() {
-        assert_eq!(content_type_for(StdPath::new("a/b.avif")).0, "image/avif");
+        assert_eq!(content_type_for(StdPath::new("a/b.avif")), "image/avif");
         let root = test_dir("postcms-svg-");
         std::fs::write(root.join("x.svg"), "<svg/>").unwrap();
         std::fs::write(root.join("x.png"), "png").unwrap();
@@ -1786,7 +1853,7 @@ headers:
         assert_eq!(h["x-frame-options"], "SAMEORIGIN");
         assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         assert_eq!(h[header::REFERRER_POLICY], "strict-origin-when-cross-origin");
-        assert_eq!(h[header::CACHE_CONTROL], HTML_CACHE_CONTROL);
+        assert_eq!(h[header::CACHE_CONTROL], cache::DEFAULT_HTML);
     }
 
     #[test]
@@ -1851,7 +1918,7 @@ headers:
         ] {
             let resp = serve(&dist, p, false);
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{p}");
-            assert_eq!(resp.headers()[header::CACHE_CONTROL], HTML_CACHE_CONTROL, "{p}");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], cache::DEFAULT_NOT_FOUND, "{p}");
         }
         // gzip negotiation cannot reach a file through a case alias either.
         assert_eq!(serve(&dist, "/Pricing/", true).status(), StatusCode::NOT_FOUND);
@@ -2236,6 +2303,148 @@ headers:
             let resp = serve_preview(Some(&v), Some(&cfg), &dist, req).await;
             assert_preview_headers(&resp);
         }
+    }
+
+    // ---- Cache-Control per class (E22) ------------------------------------
+
+    fn class_dist(name: &str) -> TestDir {
+        let dir = temp_dist(name);
+        std::fs::create_dir_all(dir.join("assets/img")).unwrap();
+        std::fs::create_dir_all(dir.join("assets/site")).unwrap();
+        for f in [
+            "assets/img/0123456789abcdef-640.webp",
+            "assets/img/0123456789abcdef.svg",
+            "assets/img/logo.png",
+            "assets/site/logo.png",
+            "assets/site/app.css",
+            "assets/site/icon.svg",
+            "assets/site/font.woff2",
+            "sitemap.xml",
+            "robots.txt",
+        ] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        dir
+    }
+
+    fn cc(resp: &Response) -> &str {
+        resp.headers()[header::CACHE_CONTROL].to_str().unwrap()
+    }
+
+    #[test]
+    fn default_policy_per_class() {
+        let dist = class_dist("cc-default");
+        let p = CachePolicy::from_site_yaml("images: {}\n").unwrap();
+        let get = |path: &str| {
+            let r = serve_with(&p, &dist, path, false);
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            r
+        };
+        // Pages and unhashed CSS, JS and SVG: the short HTML policy.
+        let html = "public, max-age=0, s-maxage=300, stale-while-revalidate=86400";
+        for path in ["/signup/", "/about.html", "/app.js", "/assets/site/app.css", "/assets/site/icon.svg"] {
+            assert_eq!(cc(&get(path)), html, "{path}");
+        }
+        // gzip siblings get the same policy as the file.
+        assert_eq!(cc(&serve_with(&p, &dist, "/signup/", true)), html);
+        // The image pipeline's content-addressed outputs: a year, immutable.
+        for path in ["/assets/img/0123456789abcdef-640.webp", "/assets/img/0123456789abcdef.svg"] {
+            assert_eq!(cc(&get(path)), "public, max-age=31536000, immutable", "{path}");
+        }
+        // Same directory or type but not a pipeline name: never immutable.
+        for path in ["/assets/img/logo.png", "/assets/site/logo.png", "/assets/site/font.woff2"] {
+            let v = get(path);
+            assert_eq!(cc(&v), cache::DEFAULT_STATIC, "{path}");
+            assert!(!cc(&v).contains("immutable"), "{path}");
+        }
+        for path in ["/sitemap.xml", "/robots.txt"] {
+            assert_eq!(cc(&get(path)), cache::DEFAULT_FEEDS, "{path}");
+        }
+        // Without an images: block nothing is hashed, whatever its name.
+        let off = CachePolicy::default();
+        assert_eq!(cc(&serve_with(&off, &dist, "/assets/img/0123456789abcdef-640.webp", false)), cache::DEFAULT_STATIC);
+        assert_eq!(cc(&serve_with(&off, &dist, "/assets/img/0123456789abcdef.svg", false)), html);
+    }
+
+    #[test]
+    fn site_yaml_cache_block_overrides_classes() {
+        let dist = class_dist("cc-override");
+        let p = CachePolicy::from_site_yaml(
+            "images: {}\ncache:\n  html: \"public, max-age=0, s-maxage=30\"\n  hashed: \"public, max-age=600\"\n  static: no-cache\n",
+        )
+        .unwrap();
+        assert_eq!(cc(&serve_with(&p, &dist, "/signup/", false)), "public, max-age=0, s-maxage=30");
+        assert_eq!(cc(&serve_with(&p, &dist, "/assets/img/0123456789abcdef-640.webp", false)), "public, max-age=600");
+        assert_eq!(cc(&serve_with(&p, &dist, "/assets/site/logo.png", false)), "no-cache");
+    }
+
+    #[test]
+    fn not_found_and_redirects_cache_briefly() {
+        let dist = class_dist("cc-404");
+        let missing = serve(&dist, "/missing/", false);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cc(&missing), "public, max-age=0, s-maxage=60");
+        // Without a 404.html the plain 404 is cached the same way.
+        std::fs::remove_file(dist.join("404.html")).unwrap();
+        assert_eq!(cc(&serve(&dist, "/missing/", false)), "public, max-age=0, s-maxage=60");
+        let r = redirect_response(&Redirect { from: String::new(), to: "/a".into(), status: 301 });
+        assert_eq!(cc(&r), cache::DEFAULT_REDIRECTS);
+    }
+
+    #[test]
+    fn startup_refuses_invalid_cache_values() {
+        let dir = test_dir("postcms-cache-bad-");
+        std::fs::write(dir.join("site.yaml"), "cache:\n  html: \"public, max-age=forever\"\n").unwrap();
+        let err = format!("{:#}", load_cache_policy(&dir).unwrap_err());
+        assert!(err.contains("site.yaml") && err.contains("cache.html"), "{err}");
+        std::fs::write(dir.join("site.yaml"), "title: x\n").unwrap();
+        assert_eq!(load_cache_policy(&dir).unwrap().html, cache::DEFAULT_HTML);
+    }
+
+    async fn call(method: &str, path: &str) -> Response {
+        use tower::ServiceExt;
+        let dist = class_dist("cc-router");
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        router(StaticDir(dist.to_path_buf())).oneshot(req).await.unwrap()
+    }
+
+    /// /mcp and /api/ask are never cacheable, whatever the method or result.
+    #[tokio::test]
+    async fn caller_dependent_routes_are_private() {
+        for (method, path) in [
+            ("POST", "/mcp"),
+            ("GET", "/mcp"),
+            ("GET", "/api/ask"),
+            ("OPTIONS", "/api/ask"),
+            ("GET", "/mcp/"),
+            ("GET", "//api/ask"),
+        ] {
+            let r = call(method, path).await;
+            assert_eq!(cc(&r), "private, no-store", "{method} {path}");
+        }
+        assert_eq!(cc(&call("GET", "/health").await), "no-store");
+        // Public pages keep their class policy through the router.
+        assert_eq!(cc(&call("GET", "/signup/").await), cache::DEFAULT_HTML);
+    }
+
+    /// Preview responses name the IAP assertion in Vary, keeping
+    /// Accept-Encoding.
+    #[tokio::test]
+    async fn preview_responses_vary_on_the_assertion() {
+        let r = call("GET", "/preview/drafts/").await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_preview_headers(&r);
+        assert_eq!(r.headers()[header::VARY], "x-goog-iap-jwt-assertion");
+        let mut h = HeaderMap::new();
+        h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        add_vary(&mut h, iap::ASSERTION_HEADER);
+        add_vary(&mut h, iap::ASSERTION_HEADER);
+        assert_eq!(h[header::VARY], "Accept-Encoding, x-goog-iap-jwt-assertion");
     }
 
     /// A real reqwest timeout (an upstream that accepts and never answers)
