@@ -12,6 +12,10 @@ fastembed.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_yaml.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# IAP token checks (src/iap.rs): ES256 via ring, already in the tree through
+# rustls, so verifying adds no new crates.
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
