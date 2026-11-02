@@ -793,8 +793,14 @@ fn main() -> Result<()> {
              margin:3rem auto;padding:0 1rem\"><h1>Draft previews</h1>\
              <p>Unpublished items rendered from the current branch. Not for production.</p><ul>",
         );
+        // Titles and paths come from content: escape both, so a hostile
+        // draft title cannot inject markup into the gated preview host.
         for (path, title) in &draft_links {
-            idx.push_str(&format!("<li><a href=\"{}\">{}</a></li>", path, title));
+            idx.push_str(&format!(
+                "<li><a href=\"{}\">{}</a></li>",
+                escape_xml(path),
+                escape_xml(title)
+            ));
         }
         idx.push_str("</ul></body></html>");
         fs::create_dir_all(&draft_root)?;

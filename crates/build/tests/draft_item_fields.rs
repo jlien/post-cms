@@ -222,3 +222,25 @@ fn drafts_leave_the_public_build_unchanged() {
         assert!(b[rel] == *bytes, "{} differs between a plain and a DRAFTS=1 build", rel.display());
     }
 }
+
+#[test]
+fn draft_index_escapes_titles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    site(root, "");
+    write(
+        root,
+        "content/notes/evil/meta.yaml",
+        "title: '<img src=x onerror=alert(1)> \\\"&'\ndescription: Hostile.\n",
+    );
+    write(root, "content/notes/evil/index.mdx", "Evil.\n");
+    build(root, true);
+    let idx = read(root, "preview/drafts/index.html");
+    assert!(!idx.contains("<img"), "{idx}");
+    assert!(
+        idx.contains("<li><a href=\"/preview/drafts/notes/evil/\">&lt;img src=x onerror=alert(1)&gt; \\&quot;&amp;</a></li>"),
+        "{idx}"
+    );
+    // the other titles are still listed as plain text
+    assert!(idx.contains(">Soon</a>"), "{idx}");
+}
