@@ -330,7 +330,17 @@ name, and accepts PNG, JPEG, GIF, WebP, PDF, MP4, MOV, WebM, MP3, WAV and M4A
 file as `content_base64` (with an optional `filename`). Over HTTP that is the
 only way: a server `file_path` is refused. On stdio `file_path` also works,
 but only for a regular file inside `MCP_UPLOADS_DIR` (default `uploads/`,
-gitignored), and never through a symlink.
+gitignored), opened one directory at a time with no symlink followed.
+Images are probed with ffprobe first and refused over `MCP_MEDIA_MAX_PIXELS`
+(default 50,000,000) or `MCP_MEDIA_MAX_SECONDS` (default 600); every
+ffmpeg/ffprobe run has a timeout (`MCP_FFMPEG_TIMEOUT`, default 60 s), no
+stdin and only `PATH` in its environment.
+
+Request bodies over HTTP: 1 MiB, except an admin's `add_media` call, which may
+be up to `ceil(MCP_MEDIA_MAX_BYTES * 4 / 3) + 64 KiB`. `Content-Length` is
+checked before the body is read (413, connection closed); chunked bodies and
+malformed lengths get 400; a body that stalls for 30 s gets 408. A cached
+OIDC token is dropped at its `exp`.
 
 **stdio** (`python3 mcp/server.py`): one local user, who already holds the
 checkout. The default role is admin; set `MCP_STDIO_ROLE=reader|author|approver`

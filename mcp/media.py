@@ -169,14 +169,70 @@ def ensure_bucket(cfg: MediaConfig) -> None:
 # ------------------------------------------------------------------ variants
 
 
-def _has_webp_encoder() -> bool:
+# ffmpeg and ffprobe parse untrusted uploads: every run has a timeout, no
+# stdin, and a minimal environment; input is probed (pixels, duration)
+# before ffmpeg ever decodes it.
+DEFAULT_FF_TIMEOUT = 60
+DEFAULT_MAX_PIXELS = 50_000_000
+DEFAULT_MAX_SECONDS = 600
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+def _ff_env() -> dict[str, str]:
+    return {"PATH": os.environ.get("PATH") or "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def _run_ff(argv: list[str]) -> subprocess.CompletedProcess | None:
+    """Run ffmpeg/ffprobe bounded; None when missing or over the timeout."""
     try:
-        res = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
-        )
-        return "libwebp" in res.stdout
-    except FileNotFoundError:
-        return False
+        return subprocess.run(argv, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env=_ff_env(),
+                              timeout=_env_int("MCP_FFMPEG_TIMEOUT", DEFAULT_FF_TIMEOUT))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _probe(src: Path) -> dict[str, float] | None:
+    """Width, height and duration of the first video stream, or None when
+    ffprobe is missing, times out or cannot read the file."""
+    res = _run_ff(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=width,height:format=duration",
+                   "-of", "json", str(src)])
+    if res is None or res.returncode != 0:
+        return None
+    try:
+        info = json.loads(res.stdout or "{}")
+        stream = (info.get("streams") or [{}])[0]
+        width, height = int(stream["width"]), int(stream["height"])
+        raw = (info.get("format") or {}).get("duration")
+        duration = float(raw) if raw not in (None, "N/A") else 0.0
+    except (ValueError, KeyError, TypeError, IndexError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"width": width, "height": height, "duration": duration}
+
+
+def check_probe(probe: dict[str, float]) -> None:
+    """Refuse decode bombs before ffmpeg touches them."""
+    pixels = probe["width"] * probe["height"]
+    cap = _env_int("MCP_MEDIA_MAX_PIXELS", DEFAULT_MAX_PIXELS)
+    if pixels > cap:
+        raise ValueError(f"image is {int(probe['width'])}x{int(probe['height'])}, over "
+                         f"the {cap}-pixel limit (MCP_MEDIA_MAX_PIXELS)")
+    secs = _env_int("MCP_MEDIA_MAX_SECONDS", DEFAULT_MAX_SECONDS)
+    if probe["duration"] > secs:
+        raise ValueError(f"media runs {probe['duration']:.0f}s, over the {secs}s "
+                         "limit (MCP_MEDIA_MAX_SECONDS)")
+
+
+def _has_webp_encoder() -> bool:
+    res = _run_ff(["ffmpeg", "-hide_banner", "-encoders"])
+    return res is not None and "libwebp" in res.stdout
 
 
 def _make_resized(src: Path, workdir: Path) -> list[tuple[Path, int]]:
@@ -184,11 +240,9 @@ def _make_resized(src: Path, workdir: Path) -> list[tuple[Path, int]]:
     variants: list[tuple[Path, int]] = []
     for width in VARIANT_WIDTHS:
         out = workdir / f"{src.stem}-{width}w{src.suffix}"
-        res = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-             "-vf", f"scale={width}:-2", str(out)],
-            capture_output=True, text=True)
-        if res.returncode == 0 and out.exists():
+        res = _run_ff(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(src),
+                       "-frames:v", "1", "-vf", f"scale={width}:-2", str(out)])
+        if res is not None and res.returncode == 0 and out.exists():
             variants.append((out, width))
     return variants
 
@@ -211,6 +265,11 @@ def add_media(slug: str, file_path: str, alt: str = "") -> dict[str, Any]:
     if not slug or "/" in slug or ".." in slug:
         raise ValueError(f"invalid slug: {slug!r}")
 
+    # Probe before any upload or decode; unprobed images get no variants.
+    probe = _probe(src) if ext in IMAGE_EXTS else None
+    if probe is not None:
+        check_probe(probe)
+
     cfg = MediaConfig()
     ensure_bucket(cfg)
 
@@ -231,7 +290,7 @@ def add_media(slug: str, file_path: str, alt: str = "") -> dict[str, Any]:
 
     _upload(base_key, src, CONTENT_TYPES[ext])
 
-    if ext in IMAGE_EXTS:
+    if ext in IMAGE_EXTS and probe is not None:
         with tempfile.TemporaryDirectory(prefix="postcms-media-") as tmp:
             workdir = Path(tmp)
             for path, _width in _make_resized(src, workdir):
@@ -239,11 +298,9 @@ def add_media(slug: str, file_path: str, alt: str = "") -> dict[str, Any]:
                 _upload(vkey, path, CONTENT_TYPES[ext])
             if _has_webp_encoder():
                 webp = workdir / f"{stem}.{digest}.webp"
-                res = subprocess.run(
-                    ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-                     "-c:v", "libwebp", "-q:v", "80", str(webp)],
-                    capture_output=True, text=True)
-                if res.returncode == 0 and webp.exists():
+                res = _run_ff(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(src),
+                               "-frames:v", "1", "-c:v", "libwebp", "-q:v", "80", str(webp)])
+                if res is not None and res.returncode == 0 and webp.exists():
                     _upload(f"{slug}/{stem}.{digest}.webp", webp, "image/webp")
 
     ensure_public_read(cfg)
@@ -325,10 +382,22 @@ def sniff_ext(data: bytes) -> str | None:
         if brand in (b"M4A ", b"M4B "):
             return ".m4a"
         return ".mp4"
-    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF
-                                   and data[1] & 0xE0 == 0xE0):
+    if data.startswith(b"ID3") or _mpeg_layer3_header(data):
         return ".mp3"
     return None
+
+
+def _mpeg_layer3_header(data: bytes) -> bool:
+    """An MPEG audio Layer III frame header: 11-bit sync, a defined version,
+    layer III, a bitrate index that is neither free (0) nor bad (15), and a
+    defined sample rate. A UTF-16 BOM (FF FE) is layer I, so it fails."""
+    if len(data) < 4 or data[0] != 0xFF or data[1] & 0xE0 != 0xE0:
+        return False
+    version = (data[1] >> 3) & 0x3
+    layer = (data[1] >> 1) & 0x3
+    bitrate = data[2] >> 4
+    rate = (data[2] >> 2) & 0x3
+    return version != 1 and layer == 1 and bitrate not in (0, 15) and rate != 3
 
 
 def safe_stem(name: Any) -> str:
@@ -380,11 +449,7 @@ def read_confined(file_path: Any, root_dir: Path) -> bytes:
         raise ValueError(f"file_path must be inside the uploads dir {root}")
     if os.path.realpath(path) != path:
         raise ValueError("file_path may not be or pass through a symlink")
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                     | getattr(os, "O_NONBLOCK", 0))
-    except OSError as exc:
-        raise ValueError(f"cannot open {file_path!r}: {exc.strerror}") from None
+    fd = _open_beneath(root, os.path.relpath(path, root))
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise ValueError("file_path is not a regular file")
@@ -396,6 +461,40 @@ def read_confined(file_path: Any, root_dir: Path) -> bytes:
     if not data:
         raise ValueError("file is empty")
     return data
+
+
+def _open_beneath(root: str, rel: str) -> int:
+    """Open root/rel read-only without following a symlink anywhere below
+    root: each directory is opened relative to its parent's fd with
+    O_NOFOLLOW | O_DIRECTORY, then the file relative to the last one. A
+    directory swapped for a symlink mid-walk fails instead of escaping."""
+    parts = rel.split(os.sep)
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise ValueError("file_path must be inside the uploads dir")
+    nofollow = os.O_NOFOLLOW
+    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=cur)
+            except OSError as exc:
+                raise _open_error(exc) from None
+            os.close(cur)
+            cur = nxt
+        try:
+            return os.open(parts[-1], os.O_RDONLY | nofollow | os.O_NONBLOCK, dir_fd=cur)
+        except OSError as exc:
+            raise _open_error(exc) from None
+    finally:
+        os.close(cur)
+
+
+def _open_error(exc: OSError) -> ValueError:
+    import errno
+
+    if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+        return ValueError("file_path may not be or pass through a symlink")
+    return ValueError(f"cannot open file_path: {exc.strerror}")
 
 
 def add_media_bytes(slug: str, data: bytes, name: Any, alt: str = "") -> dict[str, Any]:

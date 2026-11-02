@@ -57,6 +57,11 @@ if _spec is None or _spec.loader is None:
     sys.exit("cannot load server.py next to http_server.py")
 srv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(srv)
+_media_spec = importlib.util.spec_from_file_location("pcms_media", Path(__file__).with_name("media.py"))
+if _media_spec is None or _media_spec.loader is None:
+    sys.exit("cannot load media.py next to http_server.py")
+media = importlib.util.module_from_spec(_media_spec)
+_media_spec.loader.exec_module(media)
 
 OAUTH_MODE = os.environ.get("OAUTH_MODE", "").strip().lower()  # github | oidc
 OAUTH_ISSUER = os.environ.get("OAUTH_ISSUER", "").rstrip("/")
@@ -80,9 +85,18 @@ def _cached(token: str) -> dict | None:
 
 
 def _store(token: str, ident: dict) -> dict:
-    if len(_TOKEN_CACHE) > 256:
-        _TOKEN_CACHE.clear()
-    _TOKEN_CACHE[token] = (time.monotonic() + _CACHE_TTL, ident)
+    """Cache a validated principal for min(_CACHE_TTL, exp - now): a token
+    is never honored from the cache after it expires."""
+    ttl = _CACHE_TTL
+    exp = ident.get("exp")
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        ttl = min(ttl, exp - time.time())
+    if ttl <= 0:
+        return ident
+    with _CACHE_LOCK:
+        if len(_TOKEN_CACHE) > 256:
+            _TOKEN_CACHE.clear()
+        _TOKEN_CACHE[token] = (time.monotonic() + ttl, ident)
     return ident
 
 
@@ -130,7 +144,8 @@ def _identity_oidc(token: str) -> dict:
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         claims = jwt.decode(token, signing_key.key, algorithms=["RS256", "ES256"],
-                            audience=OAUTH_AUDIENCE, issuer=OAUTH_ISSUER)
+                            audience=OAUTH_AUDIENCE, issuer=OAUTH_ISSUER,
+                            options={"require": ["exp", "iss", "aud", "sub"]})
     except jwt.PyJWTError as exc:
         raise AuthError(f"invalid token: {exc}") from exc
     login = claims.get("preferred_username") or claims.get("sub") or ""
@@ -148,6 +163,7 @@ def _identity_oidc(token: str) -> dict:
         # Some issuers send the string "true"; anything else is unverified.
         "email_verified": claims.get("email_verified") in (True, "true"),
         "kind": "oidc",
+        "exp": claims.get("exp"),
         "source": f"oidc:{login} via oauth token",
     }
 
@@ -199,8 +215,33 @@ def protected_resource_metadata() -> dict:
     }
 
 
+# Request bodies. One rule: MAX_BODY_BYTES (1 MiB) for every request,
+# except an admin's tools/call add_media, which may carry a file as base64:
+# ceil(MCP_MEDIA_MAX_BYTES * 4 / 3) + 64 KiB. Content-Length is checked
+# before a byte is read (413 and close when over); chunked bodies are
+# refused; reads time out after BODY_TIMEOUT seconds.
+MAX_BODY_BYTES = 1024 * 1024
+BODY_TIMEOUT = 30.0
+
+
+def media_max_body_bytes() -> int:
+    return -(-media.max_upload_bytes() * 4 // 3) + 64 * 1024
+
+
+def max_body_bytes(role: str | None) -> int:
+    """Largest body this caller may send. Only admins can call add_media."""
+    return max(MAX_BODY_BYTES, media_max_body_bytes()) if role == "admin" else MAX_BODY_BYTES
+
+
+def _is_add_media(req: object) -> bool:
+    return (isinstance(req, dict) and req.get("method") == "tools/call"
+            and isinstance(req.get("params"), dict)
+            and req["params"].get("name") == "add_media")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = BODY_TIMEOUT  # socket timeout for every read, headers and body
 
     def log_message(self, format, *args):  # noqa: A002 — stdlib signature
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
@@ -212,8 +253,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if code >= 400:
+            # A refusal may leave a body unread: close, so it is never
+            # parsed as the next request on a reused connection.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
+
+    def _body_length(self) -> int | None:
+        """Declared body length, or None when the framing is unacceptable:
+        Transfer-Encoding (chunked is not supported), a Content-Length that
+        is not a plain non-negative integer, or conflicting Content-Length
+        headers. The size cap is separate (max_body_bytes, 413)."""
+        if self.headers.get_all("Transfer-Encoding"):
+            return None
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return 0
+        if len(set(v.strip() for v in values)) != 1:
+            return None
+        raw = values[0].strip()
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 12:
+            return None
+        return int(raw)
 
     def _auth(self) -> dict:
         header = self.headers.get("Authorization", "")
@@ -228,6 +291,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802
+        length = self._body_length()
+        if length is None:
+            self._json(400, {"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32600, "message": "invalid request"}})
+            return
         if self.path != "/mcp":
             self._json(404, {"error": "not found"})
             return
@@ -248,19 +316,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(exc)})
             return
 
+        if length > max_body_bytes(ident.get("role")):
+            self._json(413, {"error": "request body too large"})
+            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(length).decode() or "null")
+            body = self.rfile.read(length) if length else b""
+        except TimeoutError:
+            self._json(408, {"error": "request body timed out"})
+            return
+        if len(body) != length:
+            self._json(400, {"error": "short request body"})
+            return
+        try:
+            req = json.loads(body.decode() or "null")
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32700, "message": "parse error"}})
+            return
+        if length > MAX_BODY_BYTES and not _is_add_media(req):
+            self._json(413, {"error": "request body too large"})
             return
         if not isinstance(req, dict):
             self._json(400, {"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32700, "message": "parse error"}})
             return
 
-        if req.get("method", "").startswith("notifications/"):
+        method = req.get("method")
+        if isinstance(method, str) and method.startswith("notifications/"):
             self.send_response(202)
             self.send_header("Content-Length", "0")
             self.end_headers()

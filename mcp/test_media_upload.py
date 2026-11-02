@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -42,11 +44,18 @@ SAMPLES = {
     ".m4a": b"\x00\x00\x00\x1cftypM4A " + b"\x00" * 8,
     ".mp3": b"ID3\x04\x00" + b"\x00" * 8,
 }
+MP3_FRAMES = (b"\xff\xfb\x90\x64", b"\xff\xf3\x48\xc4", b"\xff\xe3\x18\xc4")
 REFUSED = {
     "svg": b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
     "html": b"<!doctype html><script>alert(1)</script>",
     "text": b"root:x:0:0:root:/root:/bin/sh\n",
     "ssh key": b"-----BEGIN OPENSSH PRIVATE KEY-----\n",
+    "utf-16 text": "\ufeffAB".encode("utf-16-le"),
+    "utf-16 bom only": b"\xff\xfeA\x00",
+    "mpeg layer I": b"\xff\xfe\x90\x00",
+    "mpeg bad bitrate": b"\xff\xfb\xf0\x00",
+    "mpeg bad rate": b"\xff\xfb\x9c\x00",
+    "mpeg reserved version": b"\xff\xeb\x90\x00",
 }
 
 
@@ -94,6 +103,14 @@ class MediaUploadTest(unittest.TestCase):
         for ext, data in SAMPLES.items():
             with self.subTest(ext=ext):
                 self.assertEqual(media.sniff_ext(data), ext)
+
+    def test_mp3_frame_headers(self):
+        for frame in MP3_FRAMES:
+            with self.subTest(frame=frame):
+                self.assertEqual(media.sniff_ext(frame + b"\x00" * 8), ".mp3")
+        for label, data in REFUSED.items():
+            with self.subTest(kind=label):
+                self.assertIsNone(media.sniff_ext(data))
 
     def test_type_comes_from_content_not_name(self):
         self.http()
@@ -176,6 +193,19 @@ class MediaUploadTest(unittest.TestCase):
                 self.call(file_path=path)
         self.assertEqual(self.uploaded, [])
 
+    def test_stdio_symlink_swapped_in_after_the_check_is_refused(self):
+        # The race: the realpath check passes, then a directory becomes a
+        # symlink before open. Simulate it by making the check see nothing.
+        (self.outside / "secret.png").write_bytes(PNG)
+        os.symlink(self.outside, self.uploads / "swap")
+        with mock.patch.object(media.os.path, "realpath", os.path.abspath):
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.call(file_path="swap/secret.png")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                (self.uploads / "f.png").symlink_to(self.outside / "secret.png")
+                self.call(file_path="f.png")
+        self.assertEqual(self.uploaded, [])
+
     def test_stdio_non_regular_file_is_refused(self):
         (self.uploads / "d.png").mkdir()
         with self.assertRaises(ValueError):
@@ -196,6 +226,83 @@ class MediaUploadTest(unittest.TestCase):
         for slug in ("../x", "", 5, "Hello"):
             with self.subTest(slug=slug), self.assertRaises(ValueError):
                 srv.tool_add_media({"slug": slug, "content_base64": b64(PNG)})
+
+
+class FfmpegBoundsTest(unittest.TestCase):
+    """The real media.add_media with the bucket and subprocess stubbed."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="pcms-ff-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "pic.png"
+        self.src.write_bytes(PNG)
+        self.calls: list[tuple[list[str], dict]] = []
+        self.puts: list[str] = []
+        self.probe_out = json.dumps({"streams": [{"width": 800, "height": 600}],
+                                     "format": {}})
+        self.ff_raises: Exception | None = None
+
+        def fake_run(argv, **kw):
+            self.calls.append((argv, kw))
+            if argv[0] == "ffprobe":
+                return subprocess.CompletedProcess(argv, 0, self.probe_out, "")
+            if self.ff_raises is not None:
+                raise self.ff_raises
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        def fake_s3(cfg, method, path, payload=b"", content_type=""):
+            self.puts.append(path)
+            return 200, b""
+        for p in (mock.patch.object(media.subprocess, "run", fake_run),
+                  mock.patch.object(media, "_s3_request", fake_s3),
+                  mock.patch.object(media, "ensure_bucket", lambda cfg: None),
+                  mock.patch.object(media, "ensure_public_read", lambda cfg: True),
+                  mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin",
+                                               "MEDIA_S3_SECRET": "do-not-pass"})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_every_ff_run_is_bounded(self):
+        media.add_media("hello", str(self.src))
+        self.assertGreater(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0][0], "ffprobe")
+        for argv, kw in self.calls:
+            with self.subTest(argv=argv[:2]):
+                self.assertEqual(kw.get("timeout"), media.DEFAULT_FF_TIMEOUT)
+                self.assertIs(kw.get("stdin"), subprocess.DEVNULL)
+                self.assertEqual(set(kw["env"]), {"PATH", "LC_ALL"})
+                self.assertNotIn("do-not-pass", json.dumps(kw["env"]))
+
+    def test_pixel_cap_refuses_before_upload_or_decode(self):
+        self.probe_out = json.dumps({"streams": [{"width": 100000, "height": 100000}],
+                                     "format": {}})
+        with self.assertRaisesRegex(ValueError, "pixel limit"):
+            media.add_media("hello", str(self.src))
+        self.assertEqual([a[0] for a, _ in self.calls], ["ffprobe"])
+        self.assertEqual(self.puts, [])
+
+    def test_duration_cap(self):
+        self.probe_out = json.dumps({"streams": [{"width": 10, "height": 10}],
+                                     "format": {"duration": "99999.0"}})
+        with self.assertRaisesRegex(ValueError, "limit"):
+            media.add_media("hello", str(self.src))
+        self.assertEqual(self.puts, [])
+
+    def test_unprobeable_image_gets_no_ffmpeg(self):
+        self.probe_out = "not json"
+        media.add_media("hello", str(self.src))
+        self.assertEqual([a[0] for a, _ in self.calls], ["ffprobe"])
+        self.assertEqual(len(self.puts), 1)  # the original only
+
+    def test_ffmpeg_timeout_is_survived(self):
+        self.ff_raises = subprocess.TimeoutExpired("ffmpeg", 1)
+        out = media.add_media("hello", str(self.src))
+        self.assertEqual(len(out["uploads"]), 1)
+
+    def test_timeout_env_override(self):
+        with mock.patch.dict(os.environ, {"MCP_FFMPEG_TIMEOUT": "5"}):
+            media.add_media("hello", str(self.src))
+        self.assertTrue(all(kw["timeout"] == 5 for _, kw in self.calls))
 
 
 if __name__ == "__main__":

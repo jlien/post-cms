@@ -14,6 +14,8 @@ import importlib.util
 import io
 import json
 import os
+import socket
+import time
 import tempfile
 import threading
 import unittest
@@ -25,7 +27,7 @@ from urllib.error import HTTPError
 
 HERE = Path(__file__).resolve().parent
 _ENV_KEYS = ("PCMS_TRANSPORT", "MCP_ROLES_FILE", "MCP_STDIO_ROLE",
-             "MCP_ALLOW_DIRECT_COMMIT", "MCP_APPROVERS")
+             "MCP_ALLOW_DIRECT_COMMIT", "MCP_APPROVERS", "MCP_MEDIA_MAX_BYTES")
 
 
 def _load(name: str, file: str):
@@ -155,6 +157,28 @@ class ToolRoleMapTest(_Env):
                                                 args={"merge": True}))
         self.as_http({"login": "x", "role": "author"})
         self.assertTrue(_forbidden(_call("propose_change", {"merge": True})))
+
+
+class TokenCacheTest(_Env):
+    def setUp(self) -> None:
+        super().setUp()
+        hs._TOKEN_CACHE.clear()
+        self.addCleanup(hs._TOKEN_CACHE.clear)
+
+    def test_expired_token_is_not_cached(self):
+        hs._store("t1", {"login": "a", "exp": time.time() - 1})
+        self.assertIsNone(hs._cached("t1"))
+
+    def test_cache_ends_at_exp(self):
+        hs._store("t2", {"login": "a", "exp": time.time() + 10})
+        deadline = hs._TOKEN_CACHE["t2"][0]
+        self.assertLessEqual(deadline - time.monotonic(), 10.5)
+        with mock.patch.object(hs.time, "monotonic", return_value=deadline + 0.01):
+            self.assertIsNone(hs._cached("t2"))
+
+    def test_no_exp_uses_five_minutes(self):
+        hs._store("t3", {"login": "a"})
+        self.assertAlmostEqual(hs._TOKEN_CACHE["t3"][0] - time.monotonic(), 300, delta=2)
 
 
 class DispatchInputTest(_Env):
@@ -451,6 +475,75 @@ class HttpEndToEndTest(_Env):
                                                      "method": "tools/call", "params": params})
                 self.assertEqual(code, 200)
                 self.assertEqual(body["error"]["code"], -32602)
+
+    # ---- request body limits
+
+    def raw(self, token: str, headers: dict, body: bytes = b"",
+            timeout: float = 10) -> tuple[int, str]:
+        """Send exact bytes; return (status, Connection header)."""
+        port = self.httpd.server_address[1]
+        lines = [f"POST /mcp HTTP/1.1", f"Host: 127.0.0.1:{port}",
+                 f"Authorization: Bearer {token}"] + [f"{k}: {v}" for k, v in headers.items()]
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        head = data.split(b"\r\n\r\n", 1)[0].decode()
+        status = int(head.split(" ", 2)[1])
+        conn = next((ln.split(":", 1)[1].strip() for ln in head.split("\r\n")[1:]
+                     if ln.lower().startswith("connection:")), "")
+        return status, conn
+
+    def test_oversized_declared_body_is_413_before_reading(self):
+        # 300 MB declared, nothing sent: refused from the header alone.
+        t0 = time.monotonic()
+        status, conn = self.raw("tok-reader", {"Content-Length": str(300 * 1024 * 1024)})
+        self.assertEqual((status, conn), (413, "close"))
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_reader_body_cap_is_one_mib(self):
+        status, _ = self.raw("tok-reader", {"Content-Length": str(hs.MAX_BODY_BYTES + 1)})
+        self.assertEqual(status, 413)
+
+    def test_admin_may_send_a_large_add_media_call_only(self):
+        pad = "A" * (2 * 1024 * 1024)
+        code, body = self.post("tok-admin", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                             "params": {"name": "add_media",
+                                                        "arguments": {"content_base64": pad}}})
+        self.assertEqual(code, 200)
+        self.assertFalse(body["result"]["isError"])
+        code, _ = self.post("tok-admin", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                          "params": {"name": "list_posts",
+                                                     "arguments": {"pad": pad}}})
+        self.assertEqual(code, 413)
+
+    def test_admin_cap_follows_media_cap(self):
+        os.environ["MCP_MEDIA_MAX_BYTES"] = str(3 * 1024 * 1024)
+        cap = hs.max_body_bytes("admin")
+        self.assertEqual(cap, -(-3 * 1024 * 1024 * 4 // 3) + 64 * 1024)
+        status, _ = self.raw("tok-admin", {"Content-Length": str(cap + 1)})
+        self.assertEqual(status, 413)
+        os.environ["MCP_MEDIA_MAX_BYTES"] = "1000"
+        self.assertEqual(hs.max_body_bytes("admin"), hs.MAX_BODY_BYTES)
+        for role in ("reader", "author", "approver", None):
+            self.assertEqual(hs.max_body_bytes(role), hs.MAX_BODY_BYTES)
+
+    def test_bad_framing_is_400(self):
+        for headers in ({"Transfer-Encoding": "chunked"},
+                        {"Content-Length": "-1"}, {"Content-Length": "1e3"},
+                        {"Content-Length": "abc"}):
+            with self.subTest(headers=headers):
+                status, conn = self.raw("tok-reader", headers)
+                self.assertEqual((status, conn), (400, "close"))
+
+    def test_slow_body_times_out(self):
+        with mock.patch.object(hs.Handler, "timeout", 0.5):
+            status, conn = self.raw("tok-reader", {"Content-Length": "100"}, b"{", timeout=10)
+        self.assertEqual((status, conn), (408, "close"))
 
     def test_bad_token_is_401(self):
         code, _ = self.tool("nope", "list_posts")
