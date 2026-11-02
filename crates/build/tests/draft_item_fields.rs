@@ -108,9 +108,10 @@ fn read(root: &Path, rel: &str) -> String {
     fs::read_to_string(root.join("dist").join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
-fn between<'a>(html: &'a str, open: &str) -> &'a str {
+/// Text of the `<p>` that starts with `open`, with Tera's `/` escape undone.
+fn between(html: &str, open: &str) -> String {
     let start = html.find(open).unwrap_or_else(|| panic!("no {open} in {html}")) + open.len();
-    &html[start..start + html[start..].find("</p>").unwrap()]
+    html[start..start + html[start..].find("</p>").unwrap()].replace("&#x2F;", "/")
 }
 
 /// Every file under dist/ outside preview/, by relative path.
@@ -153,7 +154,10 @@ fn draft_items_render_with_the_published_item_fields() {
     // A Markdown draft gets the same fields, with the preview url.
     let soon = read(root, "preview/drafts/notes/soon/index.html");
     assert_eq!(between(&soon, "<p id=\"url\">"), "/preview/drafts/notes/soon/");
-    assert!(soon.contains("href=\"https://www.example.com/preview/drafts/notes/soon/\""), "{soon}");
+    assert!(
+        soon.replace("&#x2F;", "/").contains("href=\"https://www.example.com/preview/drafts/notes/soon/\""),
+        "{soon}"
+    );
     assert_eq!(
         between(&soon, "<p id=\"meta\">"),
         "soon|notes|Notes|/journal/|2026-02-01|Coming.|Preview|Ada|/people/ada/"
