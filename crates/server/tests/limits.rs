@@ -25,6 +25,9 @@ fn start(extra: &[(&str, &str)]) -> Server {
     std::fs::write(site.path().join("site.yaml"), "title: Test\n").unwrap();
     std::fs::create_dir(site.path().join("dist")).unwrap();
     std::fs::write(site.path().join("dist/index.html"), "<h1>ok</h1>").unwrap();
+    // One post, so /api/ask with a model configured reaches the upstream call.
+    std::fs::create_dir_all(site.path().join("dist/posts/a")).unwrap();
+    std::fs::write(site.path().join("dist/posts/a/index.md"), "# A\n\nSome text.\n").unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
         .env_clear()
         .env("SITE_ROOT", site.path())
@@ -171,19 +174,106 @@ fn ask_rate_limit_applies_before_the_body_is_read() {
     assert!(took < Duration::from_secs(2), "took {took:?}");
 }
 
+/// A whole /api/ask request; returns the response.
+fn ask(addr: &str, xff: Option<&str>) -> String {
+    let body = br#"{"question":"hi"}"#;
+    let mut s = TcpStream::connect(addr).unwrap();
+    let xff = xff.map(|v| format!("X-Forwarded-For: {v}\r\n")).unwrap_or_default();
+    write!(
+        s,
+        "POST /api/ask HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{xff}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    s.write_all(body).unwrap();
+    response_within(&mut s, Duration::from_secs(10)).0
+}
+
+/// Regression: stalled bodies must not hold the /api/ask in-flight slots.
 #[test]
-fn ask_in_flight_cap_applies_before_the_body_is_read() {
+fn stalled_bodies_do_not_take_the_ask_slots() {
     let srv = start(&[
-        ("ASK_MAX_CONCURRENT", "1"),
+        ("ASK_MAX_CONCURRENT", "4"),
         ("RATE_LIMIT_PER_MIN", "100"),
         ("POSTCMS_BODY_READ_TIMEOUT_SECS", "30"),
     ]);
-    let _first = post_partial(&srv.addr, "/api/ask", 100, b"{");
+    let _stalled: Vec<TcpStream> = (0..4).map(|_| post_partial(&srv.addr, "/api/ask", 100, b"{")).collect();
     std::thread::sleep(Duration::from_millis(300));
-    let mut second = post_partial(&srv.addr, "/api/ask", 100, b"{");
-    let (resp, took) = response_within(&mut second, Duration::from_secs(5));
-    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // No model is configured, so a request that gets a slot ends at that check.
+    let resp = ask(&srv.addr, None);
+    assert!(!resp.contains("server busy"), "{resp}");
+    assert!(resp.contains("LLM not configured"), "{resp}");
+}
+
+#[test]
+fn ask_in_flight_cap_still_limits_model_calls() {
+    // An upstream that accepts and never answers holds the one slot.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", upstream.local_addr().unwrap());
+    let srv = start(&[
+        ("ASK_MAX_CONCURRENT", "1"),
+        ("RATE_LIMIT_PER_MIN", "100"),
+        ("LLM_BASE_URL", base.as_str()),
+        ("LLM_MODEL", "m"),
+    ]);
+    let q = br#"{"question":"hi"}"#;
+    let _first = post_partial(&srv.addr, "/api/ask", q.len(), q);
+    upstream.set_nonblocking(false).unwrap();
+    let (_held, _) = upstream.accept().unwrap();
+    let resp = ask(&srv.addr, None);
+    assert!(resp.starts_with("HTTP/1.1 503") && resp.contains("server busy"), "{resp}");
+}
+
+#[test]
+fn forged_forwarded_for_is_ignored_without_trusted_hops() {
+    let srv = start(&[("RATE_LIMIT_PER_MIN", "2")]);
+    let codes: Vec<bool> = (0..4)
+        .map(|i| ask(&srv.addr, Some(&format!("203.0.113.{i}"))).starts_with("HTTP/1.1 429"))
+        .collect();
+    assert_eq!(codes, [false, false, true, true], "rotating X-Forwarded-For must not reset the limit");
+}
+
+#[test]
+fn trusted_hops_key_on_the_proxy_appended_entry() {
+    let srv = start(&[("RATE_LIMIT_PER_MIN", "2"), ("POSTCMS_TRUSTED_PROXY_HOPS", "2")]);
+    // Forged leftmost entries rotate; the entry the proxy appended does not.
+    let codes: Vec<bool> = (0..4)
+        .map(|i| {
+            ask(&srv.addr, Some(&format!("203.0.113.{i}, 198.51.100.7, 35.191.0.1"))).starts_with("HTTP/1.1 429")
+        })
+        .collect();
+    assert_eq!(codes, [false, false, true, true]);
+    // Distinct real clients behind the proxy each get their own window.
+    for i in 0..4 {
+        let resp = ask(&srv.addr, Some(&format!("198.51.100.{}, 35.191.0.1", 20 + i)));
+        assert!(!resp.starts_with("HTTP/1.1 429"), "client {i}: {resp}");
+    }
+}
+
+#[test]
+fn a_client_that_stops_reading_is_dropped_after_the_write_timeout() {
+    let srv = start(&[("POSTCMS_WRITE_TIMEOUT_SECS", "1")]);
+    let big = vec![b'x'; 64 * 1024 * 1024];
+    std::fs::write(srv._site.path().join("dist/big.bin"), &big).unwrap();
+    let mut s = TcpStream::connect(&srv.addr).unwrap();
+    s.write_all(b"GET /big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    // Read nothing while the server fills the socket buffers and stalls.
+    std::thread::sleep(Duration::from_secs(4));
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let start = Instant::now();
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                panic!("connection still open after {:?}", start.elapsed())
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(got < big.len(), "whole response delivered ({got} bytes); the write never stalled");
 }
 
 #[test]
@@ -234,7 +324,12 @@ fn invalid_limits_refuse_to_start() {
     let site = tempfile::tempdir().unwrap();
     std::fs::write(site.path().join("site.yaml"), "title: Test\n").unwrap();
     std::fs::create_dir(site.path().join("dist")).unwrap();
-    for (k, v) in [("POSTCMS_BODY_READ_TIMEOUT_SECS", "0"), ("POSTCMS_MAX_CONNECTIONS", "0")] {
+    for (k, v) in [
+        ("POSTCMS_BODY_READ_TIMEOUT_SECS", "0"),
+        ("POSTCMS_MAX_CONNECTIONS", "0"),
+        ("POSTCMS_WRITE_TIMEOUT_SECS", "0"),
+        ("POSTCMS_TRUSTED_PROXY_HOPS", "11"),
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_server"))
             .env_clear()
             .env("SITE_ROOT", site.path())

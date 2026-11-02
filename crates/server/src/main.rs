@@ -80,6 +80,8 @@ Environment:
   POSTCMS_BODY_READ_TIMEOUT_SECS    seconds to send a POST body (default 15)
   POSTCMS_SHUTDOWN_TIMEOUT_SECS     seconds connections get after SIGTERM (default 25)
   POSTCMS_MAX_CONNECTIONS           connections open at once (default 512)
+  POSTCMS_WRITE_TIMEOUT_SECS        seconds a response write may make no progress (default 15)
+  POSTCMS_TRUSTED_PROXY_HOPS        proxies that append X-Forwarded-For (default 0: use the peer)
   IAP_AUDIENCE  serve /preview/ (the DRAFTS=1 build) only to requests with a
                 verified x-goog-iap-jwt-assertion for this audience
                 (/projects/<number>/global/backendServices/<id>). Unset:
@@ -253,6 +255,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let _ = BODY_READ_TIMEOUT.set(timeouts.body_read);
+    let _ = TRUSTED_PROXY_HOPS.set(timeouts.trusted_proxy_hops);
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -500,18 +503,35 @@ fn ask_semaphore() -> &'static tokio::sync::Semaphore {
     ASK_SEM.get_or_init(|| tokio::sync::Semaphore::new(ask_max_concurrent()))
 }
 
-/// Best-effort client identity. Behind a CDN/proxy (the normal deploy for this
-/// stack) X-Forwarded-For carries the real client; a direct client that spoofs
-/// XFF only wins itself a fresh bucket — the global semaphore still caps total
-/// load, so spoofing gains nothing.
-fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
-    if let Some(xff) = headers.get(XFF).and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
-            return ip;
-        }
+/// POSTCMS_TRUSTED_PROXY_HOPS, set once at startup (default 0).
+static TRUSTED_PROXY_HOPS: OnceLock<usize> = OnceLock::new();
+
+/// Client identity for the /api/ask rate limit.
+///
+/// `hops` is how many proxies in front of the server append to
+/// X-Forwarded-For. With 0 (the default) the header is ignored and the socket
+/// peer is the client. With `n`, the client is the `n`th entry from the right
+/// (every X-Forwarded-For header joined in order): the entries to its right
+/// were appended by the trusted proxies, anything to its left came from the
+/// client and can be forged. Behind Google Cloud Load Balancing in front of
+/// Cloud Run that is 2 (the load balancer appends "<client>, <lb address>").
+/// When the header has fewer entries than `hops`, or that entry is not an IP
+/// address, the request did not come through the proxies as configured and
+/// the socket peer is used.
+fn client_ip(headers: &HeaderMap, addr: SocketAddr, hops: usize) -> IpAddr {
+    if hops == 0 {
+        return addr.ip();
     }
-    addr.ip()
+    const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
+    let mut entries: Vec<&str> = Vec::new();
+    for v in headers.get_all(XFF) {
+        let Ok(v) = v.to_str() else { return addr.ip() };
+        entries.extend(v.split(',').map(str::trim));
+    }
+    if entries.len() < hops {
+        return addr.ip();
+    }
+    entries[entries.len() - hops].parse().unwrap_or(addr.ip())
 }
 
 /// Fixed-window counter per client IP. Returns (allowed, remaining, retry_after_secs).
@@ -1331,9 +1351,11 @@ async fn ask(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    // Abuse protection: per-IP fixed window + global in-flight cap, both
-    // before the body is read, so slow or stalled bodies count against them.
-    let ip = client_ip(&headers, addr);
+    // Abuse protection: the per-client fixed window before the body is read
+    // (the key is the socket peer or a trusted proxy's entry, so it cannot
+    // be forged), and the global in-flight cap only after the whole body
+    // arrived, so stalled bodies cannot hold the few model slots.
+    let ip = client_ip(&headers, addr, TRUSTED_PROXY_HOPS.get().copied().unwrap_or(0));
     let (allowed, _remaining, retry_after) = rate_limit(ip);
     if !allowed {
         return (
@@ -1349,6 +1371,10 @@ async fn ask(
         )
             .into_response();
     }
+    let body: AskBody = match read_json(&headers, body, ASK_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let _permit = match ask_semaphore().try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -1358,10 +1384,6 @@ async fn ask(
             )
                 .into_response()
         }
-    };
-    let body: AskBody = match read_json(&headers, body, ASK_BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(r) => return r,
     };
     let question = body.question.trim();
     if question.is_empty() {
@@ -1578,6 +1600,41 @@ fn redact_key(text: &str, key: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_ip_ignores_forwarded_for_without_trusted_hops() {
+        let peer: SocketAddr = "192.0.2.9:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+        assert_eq!(super::client_ip(&h, peer, 0), peer.ip());
+    }
+
+    #[test]
+    fn client_ip_takes_the_entry_the_trusted_proxies_appended() {
+        let peer: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        // Client forged two entries; the load balancer appended the real
+        // client and its own address.
+        h.insert("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 2.2.2.2, 198.51.100.7, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(super::client_ip(&h, peer, 1), "35.191.0.1".parse::<IpAddr>().unwrap());
+        // Several headers are one list, in order.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("1.1.1.1"));
+        h.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_peer_on_short_or_bad_headers() {
+        let peer: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+        h.insert("x-forwarded-for", HeaderValue::from_static("35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+        h.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+    }
+
     use super::*;
 
     /// A private temp directory (random name, mode 0700) removed on drop.
