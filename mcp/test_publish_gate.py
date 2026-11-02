@@ -886,11 +886,17 @@ class BuildCommandTest(unittest.TestCase):
             ok = srv._run_build(site)
             self.assertEqual(ok.returncode, 0, srv._build_error_tail(ok))
             self.assertTrue((site / "dist" / "index.html").exists())
-            (site / "templates" / "leak.html").write_text(
-                '{{ throw(message=get_env(name="LEAK")) }}\n')
+            probe = '{{ throw(message="LEAK=" ~ get_env(name="LEAK", default="unset")) }}'
+            for tpl in (site / "templates").glob("*.html"):
+                text = tpl.read_text()
+                if "{% block content %}" in text:
+                    tpl.write_text(text.replace("{% block content %}",
+                                                "{% block content %}" + probe, 1))
             bad = srv._run_build(site)
+        out = bad.stdout + bad.stderr
         self.assertNotEqual(bad.returncode, 0)
-        self.assertNotIn("s3cr3t-probe-value", bad.stdout + bad.stderr)
+        self.assertIn("LEAK=unset", out)
+        self.assertNotIn("s3cr3t-probe-value", out)
 
 
 class HttpIdentityTest(unittest.TestCase):
