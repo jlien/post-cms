@@ -1426,7 +1426,7 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str, css: CssCompile
             "tailwindcss produced empty CSS".to_string()
         }
         tailwind::Run::Exited(st) if st.success() => "tailwindcss wrote no output file".to_string(),
-        tailwind::Run::Exited(st) => format!("tailwindcss CLI unavailable (exit {st})"),
+        tailwind::Run::Exited(st) => format!("tailwindcss CLI unavailable ({st})"),
         tailwind::Run::NotStarted(e) => format!("tailwindcss CLI unavailable ({e})"),
     };
     if css.require {
