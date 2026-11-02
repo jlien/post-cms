@@ -5,12 +5,16 @@ edition.workspace = true
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 anyhow.workspace = true
 serde_json.workspace = true
 fastembed.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_yaml.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # IAP token checks (src/iap.rs): ES256 via ring, already in the tree through
 # rustls, so verifying adds no new crates.

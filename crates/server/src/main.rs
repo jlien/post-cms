@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 
+mod serve;
 mod iap;
 mod site_headers;
 use site_headers::SiteHeaders;
@@ -75,6 +76,12 @@ Environment:
   SITE_ROOT     site directory (default: the current directory)
   PORT          port to listen on (default 8787)
   POSTCMS_HOST  IP address to listen on when --host is not given
+  POSTCMS_HEADER_READ_TIMEOUT_SECS  seconds to send a request head (default 10)
+  POSTCMS_BODY_READ_TIMEOUT_SECS    seconds to send a POST body (default 15)
+  POSTCMS_SHUTDOWN_TIMEOUT_SECS     seconds connections get after SIGTERM (default 25)
+  POSTCMS_MAX_CONNECTIONS           connections open at once (default 512)
+  POSTCMS_WRITE_TIMEOUT_SECS        seconds a response write may make no progress (default 15)
+  POSTCMS_TRUSTED_PROXY_HOPS        proxies that append X-Forwarded-For (default 0: use the peer)
   IAP_AUDIENCE  serve /preview/ (the DRAFTS=1 build) only to requests with a
                 verified x-goog-iap-jwt-assertion for this audience
                 (/projects/<number>/global/backendServices/<id>). Unset:
@@ -239,6 +246,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let timeouts = match serve::timeouts_from(|k| env::var(k).ok()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("server: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let _ = BODY_READ_TIMEOUT.set(timeouts.body_read);
+    let _ = TRUSTED_PROXY_HOPS.set(timeouts.trusted_proxy_hops);
+
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -271,14 +289,43 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{w}");
         }
         eprintln!("origin serving dist/ on http://{bound}");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
+        serve::serve(listener, app, timeouts, shutdown_signal()).await;
+        eprintln!("origin stopped");
         Ok::<(), anyhow::Error>(())
     })?;
+    // A connection dropped at the deadline can leave a blocking task (an
+    // embedding call) running; do not wait for it.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
     Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C). The server then stops accepting
+/// connections, lets in-flight requests finish for up to
+/// POSTCMS_SHUTDOWN_TIMEOUT_SECS (see `serve`), and `main` returns 0. This
+/// matters in a container, where the server is PID 1: the kernel ignores a
+/// signal PID 1 has no handler for, so without this `docker stop` and
+/// Kubernetes wait out their grace period and SIGKILL the process.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => eprintln!("origin: SIGINT, shutting down"),
+        _ = term => eprintln!("origin: SIGTERM, shutting down"),
+    }
 }
 
 // ---- Rate limiting / abuse protection (built into the origin) -----------
@@ -456,18 +503,35 @@ fn ask_semaphore() -> &'static tokio::sync::Semaphore {
     ASK_SEM.get_or_init(|| tokio::sync::Semaphore::new(ask_max_concurrent()))
 }
 
-/// Best-effort client identity. Behind a CDN/proxy (the normal deploy for this
-/// stack) X-Forwarded-For carries the real client; a direct client that spoofs
-/// XFF only wins itself a fresh bucket — the global semaphore still caps total
-/// load, so spoofing gains nothing.
-fn client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
-    if let Some(xff) = headers.get(XFF).and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = xff.split(',').next().and_then(|s| s.trim().parse().ok()) {
-            return ip;
-        }
+/// POSTCMS_TRUSTED_PROXY_HOPS, set once at startup (default 0).
+static TRUSTED_PROXY_HOPS: OnceLock<usize> = OnceLock::new();
+
+/// Client identity for the /api/ask rate limit.
+///
+/// `hops` is how many proxies in front of the server append to
+/// X-Forwarded-For. With 0 (the default) the header is ignored and the socket
+/// peer is the client. With `n`, the client is the `n`th entry from the right
+/// (every X-Forwarded-For header joined in order): the entries to its right
+/// were appended by the trusted proxies, anything to its left came from the
+/// client and can be forged. Behind Google Cloud Load Balancing in front of
+/// Cloud Run that is 2 (the load balancer appends "<client>, <lb address>").
+/// When the header has fewer entries than `hops`, or that entry is not an IP
+/// address, the request did not come through the proxies as configured and
+/// the socket peer is used.
+fn client_ip(headers: &HeaderMap, addr: SocketAddr, hops: usize) -> IpAddr {
+    if hops == 0 {
+        return addr.ip();
     }
-    addr.ip()
+    const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
+    let mut entries: Vec<&str> = Vec::new();
+    for v in headers.get_all(XFF) {
+        let Ok(v) = v.to_str() else { return addr.ip() };
+        entries.extend(v.split(',').map(str::trim));
+    }
+    if entries.len() < hops {
+        return addr.ip();
+    }
+    entries[entries.len() - hops].parse().unwrap_or(addr.ip())
 }
 
 /// Fixed-window counter per client IP. Returns (allowed, remaining, retry_after_secs).
@@ -913,11 +977,84 @@ fn mcp_call_tool(state: &StaticDir, req: &serde_json::Value) -> Result<serde_jso
     }
 }
 
+// ---- Request bodies --------------------------------------------------------
+//
+// The two POST routes read their JSON body themselves, after any check that
+// needs no body (the /api/ask rate limit and in-flight cap), with a size cap
+// and a total read timeout, so a slow-drip or stalled body cannot hold a
+// connection or an /api/ask slot.
+
+/// Largest /api/ask body (a question).
+const ASK_BODY_LIMIT: usize = 16 * 1024;
+/// Largest /mcp body (one JSON-RPC request).
+const MCP_BODY_LIMIT: usize = 256 * 1024;
+/// POSTCMS_BODY_READ_TIMEOUT_SECS, set once at startup.
+static BODY_READ_TIMEOUT: OnceLock<std::time::Duration> = OnceLock::new();
+
+fn body_error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({ "error": msg }))).into_response()
+}
+
+/// Read and parse a JSON body: 415 without a JSON content type, 413 over
+/// `limit` bytes (by Content-Length up front, or while reading), 408 when the
+/// whole body has not arrived within the body-read timeout, 400 when it is
+/// not the expected JSON.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<T, Response> {
+    let json_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|m| {
+            let m = m.trim().to_ascii_lowercase();
+            m == "application/json" || (m.starts_with("application/") && m.ends_with("+json"))
+        })
+        .unwrap_or(false);
+    if !json_type {
+        return Err(body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "expected Content-Type: application/json"));
+    }
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Err(body_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"));
+    }
+    let wait = BODY_READ_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(std::time::Duration::from_secs(serve::DEFAULT_BODY_READ_TIMEOUT_SECS));
+    let bytes = match tokio::time::timeout(wait, axum::body::to_bytes(body, limit)).await {
+        Err(_) => return Err(body_error(StatusCode::REQUEST_TIMEOUT, "request body not received in time")),
+        Ok(Err(e)) => {
+            let too_large = e
+                .into_inner()
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some();
+            return Err(if too_large {
+                body_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+            } else {
+                body_error(StatusCode::BAD_REQUEST, "request body could not be read")
+            });
+        }
+        Ok(Ok(b)) => b,
+    };
+    serde_json::from_slice(&bytes).map_err(|_| body_error(StatusCode::BAD_REQUEST, "invalid JSON body"))
+}
+
 /// POST /mcp — JSON-RPC 2.0 request in, JSON-RPC response out.
 async fn mcp_endpoint(
     State(s): State<StaticDir>,
-    Json(req): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: axum::body::Body,
 ) -> Response {
+    let req: serde_json::Value = match read_json(&headers, body, MCP_BODY_LIMIT).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // Notifications take no response body (HTTP 202 per streamable-http).
@@ -1212,15 +1349,13 @@ async fn ask(
     State(s): State<StaticDir>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Json<AskBody>,
+    body: axum::body::Body,
 ) -> Response {
-    let question = body.question.trim();
-    if question.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
-    }
-
-    // Abuse protection: per-IP fixed window + global in-flight cap.
-    let ip = client_ip(&headers, addr);
+    // Abuse protection: the per-client fixed window before the body is read
+    // (the key is the socket peer or a trusted proxy's entry, so it cannot
+    // be forged), and the global in-flight cap only after the whole body
+    // arrived, so stalled bodies cannot hold the few model slots.
+    let ip = client_ip(&headers, addr, TRUSTED_PROXY_HOPS.get().copied().unwrap_or(0));
     let (allowed, _remaining, retry_after) = rate_limit(ip);
     if !allowed {
         return (
@@ -1236,6 +1371,10 @@ async fn ask(
         )
             .into_response();
     }
+    let body: AskBody = match read_json(&headers, body, ASK_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let _permit = match ask_semaphore().try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -1246,6 +1385,10 @@ async fn ask(
                 .into_response()
         }
     };
+    let question = body.question.trim();
+    if question.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
+    }
     // Keyless endpoints (e.g. a private GLM server on the tailnet) are fine: no auth header.
     // Only a present-but-empty key is an error.
     let key = env::var("LLM_API_KEY").ok().filter(|k| !k.trim().is_empty());
@@ -1457,6 +1600,41 @@ fn redact_key(text: &str, key: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_ip_ignores_forwarded_for_without_trusted_hops() {
+        let peer: SocketAddr = "192.0.2.9:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+        assert_eq!(super::client_ip(&h, peer, 0), peer.ip());
+    }
+
+    #[test]
+    fn client_ip_takes_the_entry_the_trusted_proxies_appended() {
+        let peer: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        // Client forged two entries; the load balancer appended the real
+        // client and its own address.
+        h.insert("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 2.2.2.2, 198.51.100.7, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(super::client_ip(&h, peer, 1), "35.191.0.1".parse::<IpAddr>().unwrap());
+        // Several headers are one list, in order.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("1.1.1.1"));
+        h.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_peer_on_short_or_bad_headers() {
+        let peer: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+        h.insert("x-forwarded-for", HeaderValue::from_static("35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+        h.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip, 35.191.0.1"));
+        assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+    }
+
     use super::*;
 
     /// A private temp directory (random name, mode 0700) removed on drop.

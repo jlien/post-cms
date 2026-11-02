@@ -43,7 +43,8 @@ an AI agent do all content operations.
 | `crates/server` | axum static origin, 127.0.0.1:8787 (`PORT`, `--host` / `POSTCMS_HOST` to override) |
 | `mcp/server.py` | MCP stdio server (stdlib only) |
 | `templates/` | tera templates (base, post, index, 404) |
-| `ci/` | build, deploy, purge scripts |
+| `ci/` | build, deploy, purge scripts; `container-check.sh` for the image |
+| `Dockerfile` | origin image: server binary plus one site's built `dist/` (see Container image) |
 
 ## Build
 
@@ -282,6 +283,12 @@ POSTCMS_HOST=0.0.0.0 PORT=8080 server       # or: server --host 0.0.0.0
 
 Earlier versions always listened on `0.0.0.0`; a deployment that relied on that must now set `POSTCMS_HOST=0.0.0.0` (or pass `--host 0.0.0.0`). Behind a reverse proxy on the same machine, keep the default and point the proxy at `127.0.0.1:$PORT`.
 
+**Stopping.** SIGTERM or SIGINT stops the server accepting connections, logs `origin: SIGTERM, shutting down` (or `SIGINT`), lets open requests finish for up to `POSTCMS_SHUTDOWN_TIMEOUT_SECS` (default 25, so it fits a 30 s platform grace period), then drops whatever is still open (logging `origin: <n> connection(s) still open after <s>s ...`), logs `origin stopped`, and exits 0. Idle keep-alive connections close at once. Set the timeout below your platform's grace period (Cloud Run and `docker stop` give 10 s).
+
+**Timeouts and limits.** A client has `POSTCMS_HEADER_READ_TIMEOUT_SECS` (default 10) to send a complete request head; a connection that sends part of one and stalls is closed. `POST /api/ask` and `POST /mcp` must deliver the whole body within `POSTCMS_BODY_READ_TIMEOUT_SECS` (default 15, a total, so a slow drip does not reset it), else `408`. Bodies are capped at 16 KiB for `/api/ask` and 256 KiB for `/mcp` (`413`, refused up front when `Content-Length` is larger); a body that is not `application/json` gets `415`, and malformed JSON `400`. `/api/ask` applies its per-client rate limit before reading the body and takes one of its `ASK_MAX_CONCURRENT` model slots only once the whole body has arrived, so stalled bodies cannot hold the slots. A response write that makes no progress for `POSTCMS_WRITE_TIMEOUT_SECS` (default 15; the clock restarts on every byte) drops the connection, so a client that stops reading cannot hold it. At most `POSTCMS_MAX_CONNECTIONS` (default 512) connections are open at once; further connections are closed as soon as they are accepted, with one log line per 10 s. The cap is global, not per client: behind a load balancer such as Google Cloud Load Balancing or Cloud Run's front end, which hold client connections and open their own to the origin, that is the intended shape; exposed directly, one client can use all the slots. Timeouts take whole seconds from 1 to 3600 and the cap a whole number from 1 to 65535; any other value refuses to start (exit 2).
+
+**Client address for the rate limit.** By default (`POSTCMS_TRUSTED_PROXY_HOPS=0`) the `/api/ask` rate limit keys on the socket peer and ignores `X-Forwarded-For`, which any client can forge. Behind `n` proxies that each append to `X-Forwarded-For`, set `POSTCMS_TRUSTED_PROXY_HOPS=n`: the client is then the `n`th entry from the right (all `X-Forwarded-For` headers joined in order), and entries to its left are ignored. Google Cloud Load Balancing in front of Cloud Run appends `<client>, <load balancer>`, so use 2. A request whose header has fewer entries, or a non-IP entry there, falls back to the peer. Whole number from 0 to 10.
+
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
 
@@ -321,6 +328,65 @@ python3 mcp/server.py --self-test
 
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
+
+## Container image
+
+`Dockerfile` builds an image holding the origin server and one site's built `dist/`. It needs BuildKit (`docker buildx`, the default builder in current Docker).
+
+```bash
+docker build -t demo-site --build-arg SITE_CACHE_ID=demo .     # the demo site in this repo
+ci/site-context.sh ../my-site /tmp/my-site-ctx                 # stage a site: tracked files only
+docker build -t my-site --build-context site=/tmp/my-site-ctx --build-arg SITE_CACHE_ID=my-site .
+docker run --rm --read-only --tmpfs /tmp -p 8080:8080 my-site  # http://127.0.0.1:8080/health
+```
+
+Stages: `engine` compiles `server` and `build-site` (dependencies in their own layer, reused until `Cargo.toml` or `Cargo.lock` changes), `site-build` runs `build-site` over the site, and `runtime` gets only the server binary at `/usr/local/bin/post-cms-server` and `dist/`, `site.yaml` and `redirects.yaml` under `/site`. `build-site`, the site sources and the Rust toolchain are not in the runtime image.
+
+### Build inputs
+
+| Input | How | Meaning |
+|---|---|---|
+| engine | build context (`.`) | A post-cms checkout. `.dockerignore` is an allowlist: only `Cargo.*`, `crates/` and the demo site files enter the context, and `.env*`, `*.key`, `*.enc`, `*.pem`, `credentials*.json`, `.cache`, `node_modules`, `target` and `dist` are dropped even inside those. |
+| site | `--build-context site=<dir>` (default: the demo site in this repo) | A directory staged by `ci/site-context.sh <site-checkout> <dir> [extra-path...]`: only `site.yaml`, `redirects.yaml`, `content/`, `templates/`, `themes/`, `plugins/` and any extra paths named, as git tracks them at `HEAD`. No `.git`, untracked or ignored files (a local `master.key`, `.env`, `node_modules`), uncommitted edits or other tracked paths (`config/`, `scripts/`), and tracked secret-named files inside the allowed paths are removed (`.env*`, `*.key`, `*.enc`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `credentials*.json`, `.npmrc`, `.netrc`). Stage it because a named context is sent to BuildKit whole (its cache, or a remote builder) and this repo's `.dockerignore` does not filter it; the build refuses a site context holding `.git`, `.env*`, `*.key`, `*.enc` or `*.pem`. The site is bind-mounted into the `build-site` step, never copied into a layer; only `dist/`, `site.yaml` and `redirects.yaml` reach the image. |
+| `SITE_CACHE_ID` | `--build-arg`, required | One id per site (letters, digits, `.`, `_`, `-`); the build fails without it. Scopes the build's model and image cache mounts, so on a shared builder one site's build never reuses cache entries another site wrote. Never share an id between sites. |
+| `SANITY_READ_TOKEN` | `--secret id=SANITY_READ_TOKEN,env=SANITY_READ_TOKEN` (or `src=<file>`) | Read token for sites that pull from Sanity. Mounted for the `build-site` step only; never in a layer, the history or the image config. |
+| `SITE_BASE_URL`, `SITE_THEME`, `DRAFTS`, `POSTCMS_EMBED_BATCH`, `IMAGES_OFFLINE`, `SANITY_OFFLINE` | `--build-arg` | The `build-site` settings of the same names (see Build). Unset or empty means the engine default. Build args are visible in `docker history`: never pass a secret this way. |
+| `TAILWINDCSS_URL`, `TAILWINDCSS_SHA256` | `--build-arg`, both or neither | Standalone Tailwind CLI for themes that compile CSS (see Tailwind CLI). The download must match the SHA-256 and be https. |
+| `RUST_IMAGE`, `RUNTIME_IMAGE` | `--build-arg` | Base images, pinned by digest in the Dockerfile. To update one, resolve the tag's new digest (`docker buildx imagetools inspect <image>:<tag>`) and replace tag and digest together. |
+
+`build-site` downloads the embedding model during the build (network access to Hugging Face), cached in a BuildKit cache mount (per `SITE_CACHE_ID`) between builds, as are processed images.
+
+A site repository builds its own image from a post-cms checkout at a pinned commit (a submodule or a CI checkout), for example `path/to/post-cms/ci/site-context.sh . "$CTX" && docker build --build-context site="$CTX" --build-arg SITE_CACHE_ID=my-site -t site:$SHA path/to/post-cms`.
+
+### Runtime
+
+Base image: `gcr.io/distroless/cc-debian12:nonroot`, chosen over `debian-slim` because it has no shell, package manager or setuid binaries, and still carries what the server links against: glibc, libstdc++ (the ONNX runtime behind `/api/ask` is C++), OpenSSL and CA certificates (model download, the LLM call). The builder is Debian 12 too, so the binary's glibc matches. Debugging is through logs and `/health`; there is nothing to `exec` into.
+
+The image runs as uid/gid 65532 (`nonroot`), and `/site` is owned by root and not writable by it. The only path the server writes is the `/api/ask` model cache, `$HOME/.cache/post-cms-fastembed` with `HOME=/tmp/post-cms`, so a read-only root file system works with a writable `/tmp` (`--read-only --tmpfs /tmp`, or an `emptyDir` on `/tmp` in Kubernetes). The model (over 100 MB) is downloaded on the first `/api/ask` after each start, so size the tmpfs for it; without network access to Hugging Face, or without a writable `/tmp`, `/api/ask` falls back to inlining the corpus. There is no `HEALTHCHECK` (no shell or curl in the image): point the platform's probe at `GET /health`.
+
+Runtime environment, set when the container runs and never baked into the image (secrets from the platform's secret store):
+
+| Variable | Image default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | Listen port. Platforms that assign one (Cloud Run) set it. |
+| `POSTCMS_HOST` | `0.0.0.0` | Listen address. The server's own default is 127.0.0.1, which a published port cannot reach. |
+| `SITE_ROOT` | `/site` | Site directory holding `dist/`. |
+| `HOME` | `/tmp/post-cms` | Locates the model cache. |
+| `POSTCMS_SHUTDOWN_TIMEOUT_SECS` | unset (25) | Seconds open connections get after SIGTERM (see Serve, Stopping). |
+| `POSTCMS_HEADER_READ_TIMEOUT_SECS` | unset (10) | Seconds a client has to send a request head. |
+| `POSTCMS_BODY_READ_TIMEOUT_SECS` | unset (15) | Seconds a client has to send a whole POST body. |
+| `POSTCMS_MAX_CONNECTIONS` | unset (512) | Connections open at once; more are closed on accept. |
+| `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_MAX_RAG_CHARS` | unset | `/api/ask` upstream. `LLM_API_KEY` is a secret. |
+| `RATE_LIMIT_PER_MIN`, `ASK_MAX_CONCURRENT` | unset (10, 4) | `/api/ask` limits. |
+| `POSTCMS_TRUSTED_PROXY_HOPS` | unset (0) | Proxies that append `X-Forwarded-For` (see Serve, Client address); 2 behind Google Cloud Load Balancing. |
+| `POSTCMS_WRITE_TIMEOUT_SECS` | unset (15) | Seconds a response write may make no progress. |
+| `IAP_AUDIENCE`, `IAP_JWKS_URL` | unset | Identity-Aware Proxy check for `/preview/`, in servers that have it: the backend service audience, and the key set URL (default Google's). Per deployment, so never in the image. |
+
+The image's stop signal is SIGTERM; the server exits 0 on it (see Serve, Stopping).
+
+### Checks
+
+`ci/container-check.sh` builds `git archive HEAD` of this repo twice: the demo site, and a site checkout (a git repo with a tracked `*.enc` and an untracked `config/master.key` and `.env`) staged by `ci/site-context.sh` as a named build context. Canary secrets are planted in the engine context (`config/master.key`, `.env`, `*.enc`, `*.pem`), the site checkout and a `SANITY_READ_TOKEN` build secret. It fails when staging leaves `.git` or a secret; when the build accepts the unstaged checkout; when the build step does not read the token secret; when a canary appears in the build output, any layer (every layer is unpacked, gzip or zstd, and counted against the manifest), the history or the image config; when the image has a secret-like file name, a shell, the site sources or `build-site`; when the image user is root; or when the container, run with `--read-only --tmpfs /tmp --cap-drop ALL` and a non-default `PORT`, does not answer `/health` and `/`, runs a process as uid 0, or does not exit 0 within 10 s of SIGTERM. It removes the containers, images and temp files it creates. Run it in CI on any runner with Docker and BuildKit.
 
 ## Hosted MCP behind an identity-aware proxy
 
