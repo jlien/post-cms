@@ -1,4 +1,5 @@
 //! Library surface of the build crate, shared by build-site and pt-render.
 pub mod images;
 pub mod pt;
+pub mod sandbox;
 pub mod sanity;
