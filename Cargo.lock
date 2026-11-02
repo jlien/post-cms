@@ -3001,12 +3001,15 @@ dependencies = [
  "anyhow",
  "axum",
  "fastembed",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]

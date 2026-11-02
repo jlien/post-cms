@@ -4,7 +4,8 @@
 # Build inputs, runtime settings and checks: README "Container image".
 #
 #   docker build -t my-site .                                  # the demo site in this repo
-#   docker build -t my-site --build-context site=../my-site .  # any other site
+#   ci/site-context.sh ../my-site /tmp/my-site-ctx            # tracked files only
+#   docker build -t my-site --build-context site=/tmp/my-site-ctx --build-arg SITE_CACHE_ID=my-site .
 #
 # Base images are pinned by digest. To update one, resolve the new digest of
 # the same tag (`docker buildx imagetools inspect <image>:<tag>`) and replace
@@ -20,9 +21,11 @@ ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcb
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 
 # ---- site: the default site is the demo in this repo ------------------------
-# Replace it with `--build-context site=<dir>`. The site is bind-mounted into
-# the build step below, never copied into a layer, so files in it that the
-# build does not write to dist/ never reach any image layer.
+# Replace it with `--build-context site=<dir>`, where <dir> is staged by
+# ci/site-context.sh (tracked files only). A named context is sent to BuildKit
+# whole and this repo's .dockerignore does not filter it, so the build step
+# refuses a site holding .git, .env*, *.key, *.enc or *.pem. The site is
+# bind-mounted into that step, never copied into a layer.
 FROM scratch AS site
 COPY site.yaml redirects.yaml /
 COPY content /content
@@ -73,6 +76,9 @@ COPY --from=engine /out/build-site /usr/local/bin/build-site
 ARG SITE_BASE_URL=""
 ARG SITE_THEME=""
 ARG DRAFTS=""
+# Scopes the model and image cache mounts to one site, so one site's build
+# never reuses entries another site wrote on a shared builder.
+ARG SITE_CACHE_ID=demo
 ARG POSTCMS_EMBED_BATCH=""
 ARG IMAGES_OFFLINE=""
 ARG SANITY_OFFLINE=""
@@ -83,14 +89,20 @@ ARG SANITY_OFFLINE=""
 # a layer, an ARG or an ENV. The model and image caches live in cache mounts.
 RUN --mount=type=bind,from=site,target=/site,rw \
     --mount=type=secret,id=SANITY_READ_TOKEN,required=false \
-    --mount=type=cache,id=post-cms-fastembed,target=/cache/home \
-    --mount=type=cache,id=post-cms-images,target=/cache/images \
+    --mount=type=cache,id=post-cms-fastembed-${SITE_CACHE_ID},target=/cache/home \
+    --mount=type=cache,id=post-cms-images-${SITE_CACHE_ID},target=/cache/images \
     set -eu; \
+    found="$(find /site \( -name .git -o -name .env -o -name '.env.*' -o -name '*.key' -o -name '*.enc' -o -name '*.pem' \) -print | head -n 5)"; \
+    if [ -n "$found" ]; then \
+      echo "site context holds secret-like files (stage it with ci/site-context.sh):" >&2; \
+      echo "$found" | sed 's|^/site/|  |' >&2; exit 1; \
+    fi; \
     for v in SITE_BASE_URL SITE_THEME DRAFTS POSTCMS_EMBED_BATCH IMAGES_OFFLINE SANITY_OFFLINE; do \
       [ -n "$(printenv "$v")" ] || unset "$v"; \
     done; \
     if [ -s /run/secrets/SANITY_READ_TOKEN ]; then \
       SANITY_READ_TOKEN="$(cat /run/secrets/SANITY_READ_TOKEN)"; export SANITY_READ_TOKEN; \
+      echo "site-build: SANITY_READ_TOKEN secret mounted (${#SANITY_READ_TOKEN} bytes)"; \
     fi; \
     rm -rf /site/dist; \
     SITE_ROOT=/site HOME=/cache/home IMAGES_CACHE_DIR=/cache/images build-site; \

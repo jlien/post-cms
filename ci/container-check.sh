@@ -5,7 +5,8 @@
 #
 #   ci/container-check.sh            # builds `git archive HEAD` of this repo
 #
-# Needs docker with BuildKit (buildx), curl, git, tar, gzip. Builds from a
+# Needs docker with BuildKit (buildx), curl, git, tar, gzip (zstd when the
+# image store compresses layers with it). Builds from a
 # copy of the committed tree with canary secrets planted in it (and in a
 # second, named site context), so a .dockerignore or Dockerfile change that
 # lets a secret into the image fails here. Removes every container, image and
@@ -48,15 +49,28 @@ plant "$CTX/content/posts/.env.local"
 plant "$CTX/themes/server.pem"
 plant "$CTX/templates/master.key"
 
+# A site checkout the way a site repository has one: a git repo with a
+# tracked encrypted credentials file, and an untracked master key and .env.
+# A named context is not filtered by this repo's .dockerignore, so it is
+# staged with ci/site-context.sh; the build must also refuse the raw checkout.
+SITE_SRC="$WORK/site-src"
 SITE="$WORK/site"
-mkdir -p "$SITE"
-for p in site.yaml redirects.yaml content templates themes plugins; do cp -R "$CTX/$p" "$SITE/"; done
-# The site context is bind-mounted, not filtered by this repo's .dockerignore:
-# anything here that build-site does not publish must still stay out.
-plant "$SITE/config/master.key"
-plant "$SITE/.env"
-plant "$SITE/config/credentials.json.enc"
-rm -f "$SITE/content/.env" "$SITE/content/posts/.env.local" "$SITE/themes/server.pem" "$SITE/templates/master.key"
+mkdir -p "$SITE_SRC"
+for p in site.yaml redirects.yaml content templates themes plugins; do cp -R "$REPO/$p" "$SITE_SRC/"; done
+plant "$SITE_SRC/config/credentials.json.enc"
+git -C "$SITE_SRC" init -q
+git -C "$SITE_SRC" add -A
+git -C "$SITE_SRC" -c user.name=check -c user.email=check@example.com -c commit.gpgsign=false commit -q -m site
+plant "$SITE_SRC/config/master.key"
+plant "$SITE_SRC/.env"
+"$REPO/ci/site-context.sh" "$SITE_SRC" "$SITE" >/dev/null
+if [ -e "$SITE/.git" ] || [ -e "$SITE/.env" ] || [ -e "$SITE/config/master.key" ] || [ -e "$SITE/config/credentials.json.enc" ]; then
+  fail "site-context.sh left .git or a secret in the staged site"
+elif grep -r -l -F "$CANARY" "$SITE" >/dev/null 2>&1; then
+  fail "site-context.sh left a planted secret in the staged site"
+else
+  ok "site-context.sh stages tracked files only, without .git or secrets"
+fi
 printf '%s' "$CANARY" > "$WORK/sanity-token"
 
 # ---- build ------------------------------------------------------------------
@@ -74,35 +88,66 @@ ok "image builds from the committed tree"
 echo "building $IMG_SITE (site from a named build context)"
 build build-site -t "$IMG_SITE" --build-context site="$SITE" \
   --secret id=SANITY_READ_TOKEN,src="$WORK/sanity-token" "$CTX"
-ok "image builds with --build-context site=<dir>"
+ok "image builds with --build-context site=<staged dir>"
+if grep -q -F "SANITY_READ_TOKEN secret mounted (${#CANARY} bytes)" "$WORK/build-site.log"; then
+  ok "the build step read the SANITY_READ_TOKEN secret"
+else
+  fail "the build step did not read the SANITY_READ_TOKEN secret"
+fi
+if grep -q -F "$CANARY" "$WORK/build-demo.log" "$WORK/build-site.log"; then
+  fail "a planted secret is in the build output"
+else
+  ok "no planted secret in the build output"
+fi
+
+echo "building the unstaged site checkout (must be refused)"
+if "$DOCKER" build --progress=plain --target site-build --build-context site="$SITE_SRC" \
+    "$CTX" >"$WORK/build-raw.log" 2>&1; then
+  fail "the build accepted a site context holding .git, .env and keys"
+elif grep -q 'site context holds secret-like files' "$WORK/build-raw.log"; then
+  ok "the build refuses a site context holding .git, .env and keys"
+else
+  tail -n 30 "$WORK/build-raw.log"
+  fail "the unstaged site build failed for another reason"
+fi
 
 size=$("$DOCKER" image inspect -f '{{.Size}}' "$IMG")
 echo "info image size: $size bytes ($((size / 1024 / 1024)) MiB)"
 
 # ---- static checks on each image -------------------------------------------
 # Every layer as a tar stream, whatever the store compressed it with.
+# Returns non-zero when a layer cannot be decompressed (or zstd is missing),
+# so no layer is ever skipped silently; the caller compares the count with
+# the manifest.
 layer_streams() { # image outdir
-  local tarball="$2/image.tar" n=0
+  local tarball="$2/image.tar" n=0 f
   mkdir -p "$2/blobs"
   "$DOCKER" save -o "$tarball" "$1"
   tar -x -f "$tarball" -C "$2/blobs"
-  find "$2/blobs" -type f ! -name '*.json' ! -name 'repositories' | while read -r f; do
+  while read -r f; do
     n=$((n + 1))
     case "$(od -An -N4 -tx1 "$f" | tr -d ' \n')" in
-      1f8b*)    gzip -dc "$f" > "$2/layer.$n.tar" 2>/dev/null || true ;;
-      28b52ffd) if command -v zstd >/dev/null; then zstd -dcq "$f" > "$2/layer.$n.tar" || true; else echo "zstd layer and no zstd: $f" >&2; exit 1; fi ;;
-      *)        cp "$f" "$2/layer.$n.tar" ;;
+      1f8b*)
+        gzip -dc "$f" > "$2/layer.$n.tar" || { echo "cannot gunzip $f" >&2; return 1; } ;;
+      28b52ffd)
+        command -v zstd >/dev/null || { echo "zstd-compressed layer and no zstd: $f" >&2; return 1; }
+        zstd -dcq "$f" > "$2/layer.$n.tar" || { echo "cannot unzstd $f" >&2; return 1; } ;;
+      *)  cp "$f" "$2/layer.$n.tar" ;;
     esac
+    # Config and manifest blobs are JSON, not tars.
     tar -t -f "$2/layer.$n.tar" >/dev/null 2>&1 || rm -f "$2/layer.$n.tar"
-  done
+  done < <(find "$2/blobs" -type f ! -name '*.json' ! -name 'repositories' ! -name 'oci-layout')
 }
+
 
 check_image() { # image label
   local img="$1" label="$2" dir="$WORK/scan-$2"
-  layer_streams "$img" "$dir"
-  local layers
+  layer_streams "$img" "$dir" || { fail "$label: could not unpack every layer"; return; }
+  local layers want
   layers=$(find "$dir" -maxdepth 1 -name 'layer.*.tar' | wc -l | tr -d ' ')
+  want=$(sed -n 's/.*"Layers":\[\([^]]*\)\].*/\1/p' "$dir/blobs/manifest.json" | tr ',' '\n' | sort -u | grep -c . || true)
   [ "$layers" -gt 0 ] || { fail "$label: found no layers to scan"; return; }
+  [ "$layers" -ge "$want" ] || { fail "$label: scanned $layers of $want layers"; return; }
 
   if grep -a -l -F "$CANARY" "$dir"/layer.*.tar >/dev/null 2>&1; then
     fail "$label: a planted secret is in an image layer"

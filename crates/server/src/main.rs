@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 
+mod serve;
 mod site_headers;
 use site_headers::SiteHeaders;
 
@@ -74,6 +75,8 @@ Environment:
   SITE_ROOT     site directory (default: the current directory)
   PORT          port to listen on (default 8787)
   POSTCMS_HOST  IP address to listen on when --host is not given
+  POSTCMS_HEADER_READ_TIMEOUT_SECS  seconds to send a request head (default 10)
+  POSTCMS_SHUTDOWN_TIMEOUT_SECS     seconds connections get after SIGTERM (default 25)
 ";
 
 /// Build marker the engine writes in dist/ (see build-site). Never served.
@@ -213,6 +216,14 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{EMBED_OFF_NO_HOME}");
     }
 
+    let timeouts = match serve::timeouts_from(|k| env::var(k).ok()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("server: {e}");
+            std::process::exit(2);
+        }
+    };
+
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -242,20 +253,19 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{w}");
         }
         eprintln!("origin serving dist/ on http://{bound}");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        serve::serve(listener, app, timeouts, shutdown_signal()).await;
         eprintln!("origin stopped");
         Ok::<(), anyhow::Error>(())
     })?;
+    // A connection dropped at the deadline can leave a blocking task (an
+    // embedding call) running; do not wait for it.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
     Ok(())
 }
 
 /// Resolves on SIGTERM or SIGINT (Ctrl-C). The server then stops accepting
-/// connections, lets in-flight requests finish, and `main` returns 0. This
+/// connections, lets in-flight requests finish for up to
+/// POSTCMS_SHUTDOWN_TIMEOUT_SECS (see `serve`), and `main` returns 0. This
 /// matters in a container, where the server is PID 1: the kernel ignores a
 /// signal PID 1 has no handler for, so without this `docker stop` and
 /// Kubernetes wait out their grace period and SIGKILL the process.
