@@ -119,6 +119,8 @@ no_index: true
 
 Collection item and index templates get `collection`: `{name, title, url}` (`url` is the index path). Index templates also keep `coll_name` and `coll_title`.
 
+Item templates get `title`, `slug`, `description`, `date` (when the item has one), `fields`, `collection`, `refs` (see below), `body`, and `url`, the item's own path. A `DRAFTS=1` build renders every item again under `/preview/drafts/<collection>/<slug>/` with the same data, so a template that renders on the site renders as a draft too. There `url` is that preview path (following `trailing_slash`), never the public one, `draft` is `true`, and `agent_notes` and `date` are empty strings when the item has none.
+
 A schema can declare reference fields whose values are item slugs in another collection. The build fails, naming the file, when a value is not an item of the target collection:
 
 ```yaml
