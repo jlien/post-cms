@@ -238,8 +238,28 @@ It listens on 127.0.0.1 only by default, so a dev or CI run is not reachable fro
 | `PORT` | `8787` | Port to listen on. `0` lets the OS pick a free one; the startup line prints the address actually bound. |
 | `--host ADDR` | `127.0.0.1` | IP address to listen on (`--host 0.0.0.0` or `--host=::`). Only IP literals and `localhost` are accepted, never other host names. |
 | `POSTCMS_HOST` | unset | Same as `--host`, for environments configured by env vars; `--host` wins when both are set. |
+| `IAP_AUDIENCE` | unset | Turns on the draft preview behind Identity-Aware Proxy (IAP): the preview backend service, `/projects/<number>/global/backendServices/<id>`. Unset: `/preview/` is always 404. |
+| `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | IAP signing keys (JWK set). Must be `https`. |
+| `IAP_JWKS_MAX_STALE_SECS` | `86400` | How long past the 1 h cache life the key set is still used while every refresh fails. After that every preview token is refused and the server logs an error. |
+| `IAP_JWKS_ALLOW_HTTP` | unset | `1` allows an `http` `IAP_JWKS_URL` on a loopback host only. For tests; never set it in a deploy. |
 
 A host that is not an IP address (including a `POSTCMS_HOST` or `--host` value that is not valid UTF-8), or an unknown flag, is a usage error (exit 2) and nothing listens. Binding a non-loopback address prints `warning: listening on ...: other machines can reach this server` on stderr. IPv4-mapped IPv6 addresses count as the IPv4 address they carry, so `::ffff:127.0.0.1` is loopback and does not warn.
+
+**Draft preview behind IAP.** A `DRAFTS=1` build writes unpublished items under `dist/preview/` (theme previews from `SITE_PREVIEW_THEMES` land there too). The server serves `/preview` and everything under it only when the request carries an `x-goog-iap-jwt-assertion` header that verifies:
+
+- signed ES256 by a key from `IAP_JWKS_URL`, found by the token's `kid` (`alg` must be exactly `ES256`, so `none` and `HS256` are refused; any `crit` header is refused);
+- `aud` equal to `IAP_AUDIENCE` and `iss` equal to `https://cloud.google.com/iap`;
+- `exp` not passed, and `iat` and `nbf` (when present) not in the future, each with 30 s of clock skew; each must be an integer from 1 to 9999999999 (floats, strings and null are refused);
+- an `email` claim.
+
+The `Host` header plays no part: when the public and preview hosts reach the same service, any client can send any header to the public host, so only the signature decides. Every `/preview/` response, served or refused and for any method (a `POST` gets a 405 with them too), sends `Cache-Control: private, no-store` and `X-Robots-Tag: noindex, nofollow`, applied after `site.yaml` headers so no site rule can make a draft cacheable. A refused request gets the site's normal 404 page.
+
+Keys are fetched with a 5 s timeout, a 64 KB cap, no redirects, and https only, one fetch at a time. They are cached for an hour. Two separate budgets decide when to fetch again:
+
+- Stale set: the first request after the hour fetches at once; while fetches fail, retries are at least 30 s apart and the cached keys keep working for up to `IAP_JWKS_MAX_STALE_SECS`.
+- Unknown `kid` on a fresh set: at most one fetch per 30 s, and a `kid` the last fetch showed missing is remembered for 5 minutes and fetches nothing. A flood of forged `kid`s therefore cannot hammer the key endpoint or delay the stale-set refresh.
+
+Startup: with `IAP_AUDIENCE` unset and a `dist/preview/` present, the server logs one warning (`warning: dist/preview/ exists but IAP_AUDIENCE is unset ...`) and serves no preview. A set but malformed `IAP_AUDIENCE`, or an `IAP_JWKS_URL` that is not https, refuses to start. Handlers that need the signed-in user (for example an approval step) take the `iap::VerifiedIdentity` extractor, which holds the verified `email` and `sub`, or `None`.
 
 **Upstream errors.** When the model call fails, `/api/ask` returns a fixed message and never the upstream's own error text, which can name `LLM_BASE_URL`, internal hosts or headers:
 
