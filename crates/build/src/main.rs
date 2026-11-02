@@ -771,12 +771,20 @@ fn main() -> Result<()> {
     if drafts_on {
         let draft_root = dist.join("preview").join("drafts");
         copy_theme_assets(&theme_dir, &draft_root, &theme_name)?;
+        // Images only drafts use go under the preview too (DRAFT_IMAGES_DIR),
+        // so they are gated with the drafts and never public.
+        if let Some(p) = &cfg.images {
+            p.set_draft_scope(Some(DRAFT_IMAGES_DIR)).map_err(|e| anyhow::anyhow!(e))?;
+        }
         let mut draft_links = render_draft_posts(
             &tera, &draft_root, &posts, &styling, &cfg, "/preview/drafts",
         )?;
         draft_links.extend(render_draft_collections(
             &tera, &draft_root, &collections, &styling, &cfg, "/preview/drafts",
         )?);
+        if let Some(p) = &cfg.images {
+            p.set_draft_scope(None).map_err(|e| anyhow::anyhow!(e))?;
+        }
         let mut idx = String::from(
             "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -812,8 +820,17 @@ fn main() -> Result<()> {
     if let Some(p) = &cfg.images {
         finish_images(p).map_err(|e| discard_dist(&dist, e))?;
     }
-    let skip_dir = cfg.images.as_ref().map(|p| dist.join(&p.cfg().output_dir));
-    let images_saved = optimize_images(&dist, skip_dir.as_deref())?;
+    let skip_dirs: Vec<PathBuf> = cfg
+        .images
+        .as_ref()
+        .map(|p| {
+            vec![
+                dist.join(&p.cfg().output_dir),
+                dist.join(DRAFT_IMAGES_DIR).join(&p.cfg().output_dir),
+            ]
+        })
+        .unwrap_or_default();
+    let images_saved = optimize_images(&dist, &skip_dirs)?;
     if images_saved > 0 {
         println!("optimized images: {} bytes saved", images_saved);
     }
@@ -1464,6 +1481,11 @@ Options:
 /// it carries this marker, so the build never deletes a directory it did
 /// not create.
 const DIST_MARKER: &str = ".post-cms-build";
+/// Where a DRAFTS=1 build writes images only draft previews use, under
+/// dist/ (the images then live at `/<this>/<images.output_dir>/`). It sits
+/// inside `preview/`, which the origin gates and deploys exclude, so an
+/// unpublished image is never public by URL.
+const DRAFT_IMAGES_DIR: &str = "preview/drafts";
 const DIST_MARKER_BODY: &str = "Written by post-cms build-site. This directory is build output: the next build deletes and recreates it.\n";
 
 #[derive(Debug, Default, PartialEq)]
@@ -3009,7 +3031,7 @@ fn site_base_url(root: &Path) -> String {
 /// downscales any raster image larger than MAX_DIM on its long edge, and
 /// re-encodes JPEG/PNG in place when the re-encode is actually smaller.
 /// Returns total bytes saved. Only ever overwrites when it wins bytes.
-fn optimize_images(dist: &Path, skip: Option<&Path>) -> Result<u64> {
+fn optimize_images(dist: &Path, skip: &[PathBuf]) -> Result<u64> {
     use image::ImageReader;
     use std::io::Cursor;
 
@@ -3019,7 +3041,7 @@ fn optimize_images(dist: &Path, skip: Option<&Path>) -> Result<u64> {
     for entry in walk_files(dist) {
         // The image pipeline's outputs are already sized and encoded, and
         // their width descriptors must stay true.
-        if skip.is_some_and(|s| entry.starts_with(s)) {
+        if skip.iter().any(|s| entry.starts_with(s)) {
             continue;
         }
         let ext = entry
@@ -4240,6 +4262,62 @@ mod tests {
         assert_eq!(titles, vec!["ACME"]);
     }
 
+    /// Drafts and their images stay out of every machine-readable output a
+    /// build writes: search index, sitemap, RSS, llms.txt, per-post
+    /// markdown, and the `collections` every template sees (embeddings use
+    /// the same `indexable_items` rule; their model is not loaded here).
+    #[test]
+    fn draft_only_assets_stay_out_of_indexes_and_feeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dist = root.join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        write(root, "content/notes/schema.yaml", "title: Notes\n");
+        write(
+            root,
+            "content/notes/open/meta.yaml",
+            "title: Open\npublished: true\ndescription: Shown.\ncover: https://img.example.com/shared.png\n",
+        );
+        write(root, "content/notes/open/index.mdx", "Open ![a](https://img.example.com/shared.png)\n");
+        write(
+            root,
+            "content/notes/soon/meta.yaml",
+            "title: Soon\ndescription: Hidden.\ncover: https://img.example.com/unannounced.png\n",
+        );
+        write(root, "content/notes/soon/index.mdx", "Soon ![a](https://img.example.com/unannounced.png)\n");
+        write(root, "content/posts/live/meta.yaml", "title: Live\nslug: live\ndate: 2026-01-01\npublished: true\n");
+        write(root, "content/posts/live/index.mdx", "Live post.\n");
+        write(root, "content/posts/later/meta.yaml", "title: Later\nslug: later\ndate: 2026-02-01\n");
+        write(root, "content/posts/later/index.mdx", "![b](https://img.example.com/unannounced-post.png)\n");
+        let collections = built(root);
+        let posts = load_posts(&root.join("content/posts")).unwrap();
+        let cfg = test_cfg("title: Example\n");
+
+        render_search_index(root, &dist, &posts, &collections).unwrap();
+        render_sitemap(root, &dist, &posts, &[], &collections, true, &Default::default()).unwrap();
+        render_rss(root, &dist, &posts).unwrap();
+        fs::write(dist.join("llms.txt"), llms_txt(&cfg, "https://example.com", &posts, &[], &collections)).unwrap();
+        fs::create_dir_all(dist.join("posts/live")).unwrap();
+        render_posts_markdown(&dist, &posts).unwrap();
+        let seen = serde_json::to_string(&page_collections(&collections).unwrap()).unwrap();
+        fs::write(dist.join("collections.json"), seen).unwrap();
+
+        let mut checked = 0;
+        for f in walk_files(&dist) {
+            let text = fs::read_to_string(&f).unwrap();
+            checked += 1;
+            for needle in ["unannounced", "/notes/soon", "Hidden.", "/posts/later"] {
+                assert!(!text.contains(needle), "{} lists {needle}:\n{text}", f.display());
+            }
+        }
+        // the published items are there, so the scan read real output
+        let all: String = walk_files(&dist).iter().map(|f| fs::read_to_string(f).unwrap()).collect();
+        for want in ["shared.png", "/notes/open", "/posts/live"] {
+            assert!(all.contains(want), "no {want} in any output");
+        }
+        assert!(checked >= 6, "{checked} files");
+    }
+
     #[test]
     fn redirect_sources_load_slash_trimmed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4336,7 +4414,7 @@ mod tests {
             fs::create_dir_all(dist.join(d)).unwrap();
             fs::write(dist.join(d).join("a.png"), &png).unwrap();
         }
-        optimize_images(dist, Some(&dist.join("assets/img"))).unwrap();
+        optimize_images(dist, &[dist.join("assets/img")]).unwrap();
         assert_eq!(fs::read(dist.join("assets/img/a.png")).unwrap(), png);
         assert_eq!(image::image_dimensions(dist.join("other/a.png")).unwrap(), (1600, 9));
     }
