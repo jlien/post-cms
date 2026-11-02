@@ -301,6 +301,38 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
+Unit tests (standard library, no network):
+
+```bash
+python3 -m unittest discover -s mcp -p 'test_*.py'
+```
+
+## MCP forge: GitHub or GitLab
+
+Proposals become pull requests (GitHub) or merge requests (GitLab). The
+propose, approve, reject, revert and queue tools reach the forge only
+through `mcp/forge.py`.
+
+| Variable | Meaning |
+|---|---|
+| `FORGE` | `github` (default) or `gitlab`. |
+| `GITLAB_URL` | Base URL, `https://` only (for example `https://gitlab.example.com`, or a path prefix for a self-managed install). No credentials, query or fragment. |
+| `GITLAB_PROJECT` | Numeric project id, or the project path (`group/project`, plain or url-encoded). |
+| `GITLAB_TOKEN` | Token with the `api` scope. Sent only in the `PRIVATE-TOKEN` header, never in a URL, log line or error. Maintainer role to merge into a protected branch. |
+| `GITLAB_ALLOW_HTTP_LOOPBACK` | Tests only: `1` allows `http://` for `127.0.0.1`, `localhost` or `::1`. |
+
+`FORGE=github` runs the `gh` CLI with the same commands as before (approval
+identity from `gh api user`). `FORGE=gitlab` needs no CLI:
+
+- Proposals open a merge request into `main` that deletes its source branch on merge.
+- Approve merges through the merge endpoint. A pinned head goes in its `sha` parameter, so GitLab refuses the merge (409) when a commit landed after the check.
+- A project whose merge method is fast-forward (or semi-linear) only merges a branch that sits on `main`. A branch that is behind fails with a clear error; the server never rebases, because a rebase makes a new head that nobody approved.
+- Reject posts a `REJECTED:` note, closes the merge request and deletes the branch.
+- The commit list and every author and committer of a change come from the merge request commits API, all pages.
+- Revert opens a revert merge request: a new `revert/<branch>-<time>` branch from `main`, GitLab's commit revert endpoint applied there (the merge commit, or each commit newest first for fast-forward merges), then a merge pinned to the revert head. Nothing is pushed to `main` directly, so protected-branch rules, pipelines and approval rules apply to a revert too. If GitLab cannot merge it (for example a required pipeline), the tool fails and names the open revert merge request.
+- On stdio the approver identity is the token's user (`GET /user`); over HTTP it is the OAuth identity, as before.
+- Requests time out after 20 seconds, responses are capped at 4 MB, redirects are refused, and 401, 403, 404, 405, 406, 409 and 422 map to plain tool errors.
+
 ## Deploy + CDN purge
 
 ```bash
