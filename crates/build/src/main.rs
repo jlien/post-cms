@@ -969,7 +969,13 @@ fn pt_item_body(pt_path: &Path, tera: &Tera, cfg: &SiteConfig) -> Result<(String
     Ok((out.html, warning))
 }
 
+/// Templates are sandboxed (see `postcms_build::sandbox`): no symlink out of
+/// the template directories, and no builtin that reads the environment.
 fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera> {
+    let theme_templates = theme_dir.join("templates");
+    for dir in [templates_dir, theme_templates.as_path()] {
+        postcms_build::sandbox::check_confined(dir).map_err(anyhow::Error::msg)?;
+    }
     let mut tera = Tera::new(
         templates_dir
             .join("**/*.html")
@@ -977,8 +983,8 @@ fn load_tera(root: &Path, theme_dir: &Path, templates_dir: &Path) -> Result<Tera
             .context("templates path is not valid UTF-8")?,
     )
     .context("failed to compile templates")?;
+    postcms_build::sandbox::lock_down(&mut tera);
     postcms_build::pt::register_filters(&mut tera);
-    let theme_templates = theme_dir.join("templates");
     if theme_templates.is_dir() {
         for entry in fs::read_dir(&theme_templates)
             .with_context(|| format!("read_dir {}", theme_templates.display()))?

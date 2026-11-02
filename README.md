@@ -157,6 +157,17 @@ Use it only for collections whose every item is safe to show on a live page, inc
 
 `sitemap.xml` and `llms.txt` leave out any page or collection item whose meta sets `no_index: true` (a YAML boolean), and `search-index.json` and `embeddings.json` leave out such collection items; one predicate decides all four. `sitemap.xml` also leaves out any path that is a source in `redirects.yaml`. Every `<loc>` is XML-escaped. The page itself still builds; emitting a `noindex` robots tag is up to the template (`page.fields.no_index`, `fields.no_index`).
 
+### Template sandbox
+
+Templates see only their context; they cannot read the build environment or the file system. In `build-site` and `pt-render`:
+
+- `get_env(...)` always fails the build with `get_env is disabled: templates cannot read the build environment`; pass values through `site.yaml` or page and item fields instead.
+- `throw(...)` fails the build with `a template called throw()`; its `message` is never printed.
+- `now()` is always UTC (`utc=` is accepted and ignored), so the host time zone never reaches the output. `now(timestamp=true)` and `now() | date(format="%Y")` work as before.
+- `include`, `extends` and `import` resolve only among the loaded templates. A symlink under `templates/` or `<theme>/templates/` that resolves outside that directory, or does not resolve, fails the build before any template is read.
+
+Every other Tera builtin function, filter and test works as documented.
+
 ## Portable Text templates
 
 Collection items stored as `index.pt.json` render through `crates/build/src/pt.rs`. Custom block types need `templates/pt/<_type>.html` (the block is `block`; nested Portable Text fields arrive as `<field>_html`). Built-ins render with engine defaults unless the site adds an override:
