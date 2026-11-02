@@ -305,8 +305,35 @@ Earlier versions always listened on `0.0.0.0`; a deployment that relied on that 
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
 
-Cache-Control: HTML → `public, max-age=0, s-maxage=86400,
-stale-while-revalidate=604800`; RSS/sitemap/robots → `s-maxage=3600`.
+Cache-Control: see [Caching](#caching).
+
+## Caching
+
+`site.yaml` `cache:` sets the `Cache-Control` the origin sends per class of response. Every key is optional; these are the defaults:
+
+```yaml
+cache:
+  html: "public, max-age=0, s-maxage=300, stale-while-revalidate=86400"
+  hashed: "public, max-age=31536000, immutable"
+  static: "public, max-age=3600, s-maxage=300, stale-while-revalidate=86400"
+  feeds: "public, max-age=0, s-maxage=300, stale-while-revalidate=3600"
+  not_found: "public, max-age=0, s-maxage=60"
+  redirects: "public, max-age=3600, s-maxage=300"
+```
+
+| Class | Responses |
+|---|---|
+| `html` | Pages, and CSS, JS and SVG that are not hashed, plus unknown file types. Browsers always revalidate; the CDN keeps a copy 5 minutes and may serve it stale for a day while it refetches, so a deploy shows within minutes even when a purge is slow or rate-limited. |
+| `hashed` | Files the image pipeline wrote under content-addressed names: directly in `images.output_dir` (default `assets/img`), named `<16 hex>.<ext>` or `<16 hex>-<width>.<ext>` with `avif`, `webp`, `jpg`, `png`, `gif` or `svg`. Only when `images:` is on. A changed image gets a new name, so these never go stale. |
+| `static` | Other images, fonts, media and PDFs (theme and plugin assets keep their own names and can change in place, so they are never `immutable`). |
+| `feeds` | `.xml`, `.json`, `.txt`, `.md` (sitemap, RSS, robots.txt, llms.txt, search index). |
+| `not_found` | Every 404 from the static fallback. |
+| `redirects` | `redirects.yaml` hits and slash redirects. |
+
+- Values are checked at startup, which refuses to start (exit 1, naming the key) on any error: known response directives only (`public`, `private`, `no-cache`, `no-store`, `no-transform`, `must-revalidate`, `proxy-revalidate`, `must-understand`, `immutable`, and `max-age`, `s-maxage`, `stale-while-revalidate`, `stale-if-error` with whole seconds up to 2147483648), each at most once, not both `public` and `private`. `private` and `no-cache` take no field list. The same check applies to a `Cache-Control` set under `headers:`.
+- A `Cache-Control` in a `headers:` rule (below) applies after the class value, so a rule can still set one path's policy. `headers.default` cannot set `Cache-Control`.
+- Not configurable: every `/preview` response (served, refused, 404 or 405) gets `Cache-Control: private, no-store`, `X-Robots-Tag: noindex, nofollow` and `Vary` naming `x-goog-iap-jwt-assertion`; every `/mcp` and `/api/ask` response gets `private, no-store`; `/health` gets `no-store`. A router layer sets these after everything `site.yaml` sets.
+- The server logs the active `html` and `hashed` values at startup (`cache: html ...`).
 
 ## Response headers
 
@@ -328,8 +355,8 @@ headers:
 - `path` is a pattern or a list of patterns. Each starts with `/`. `*` matches any run of characters, `/` included, so `/docs/*` matches `/docs/a` and `/docs/a/b` but not `/docs`.
 - Matching ignores leading and trailing slashes, a trailing `.gz` (the precompressed sibling), a trailing `index.html`, and ASCII case, so `/signup`, `/signup/`, `/SignUp/Index.html`, and `/signup/index.html.gz` get the same headers. Query strings are not part of the match.
 - A response gets the `default` headers, then the headers of every matching rule in file order. A later value replaces an earlier one for the same header name.
-- Headers apply to every response from the static fallback: pages, assets, redirects (`redirects.yaml` and slash redirects), and 404s, all matched on the request path. `/health`, `/api/ask`, and `/mcp` get none.
-- The server always sends `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and a `Cache-Control` per file type. Site headers apply last, so a site can replace `Referrer-Policy` or `Cache-Control` for a path. A `Cache-Control` in `default` also replaces the server's value on redirects and 404s.
+- Headers apply to every response from the static fallback: pages, assets, redirects (`redirects.yaml` and slash redirects), and 404s, all matched on the request path. `/health`, `/api/ask`, and `/mcp` get none, and no site header changes a `/preview` response's `Cache-Control` or `X-Robots-Tag`.
+- The server always sends `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and a `Cache-Control` per class (see [Caching](#caching)). Site headers apply last, so a site can replace `Referrer-Policy` or `Cache-Control` for a path. `Cache-Control` is allowed in rules only: under `default` it refuses to start, because it would override 404s and redirects (use `cache:` for a class).
 - Validation at startup, which refuses to start on any error: names must be tokens (letters, digits, and ``!#$%&'*+-.^_`|~``); values must be non-empty strings with no control characters (CR, LF, NUL) and no surrounding whitespace; a name may appear once per map. These headers are rejected because the server owns them: hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-Range`, `Accept-Ranges`, `Location`, `Date`, `Server`, `Set-Cookie`, `Vary`, and `X-Content-Type-Options`.
 - The build does not emit a CDN `_headers` file. CDNs that read one combine every matching block instead of overriding per header, so the same config would mean something different there. Put the CDN in front of this origin and let it pass the headers through.
 
