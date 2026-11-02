@@ -11,6 +11,7 @@ Run:   python3 mcp/server.py            # JSON-RPC server on stdio
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -415,6 +417,11 @@ def _git(*args: str, env_extra: dict[str, str] | None = None,
                           capture_output=True, text=True, env=env)
 
 
+def tenant_worktree_name_ok(tenant: str) -> None:
+    if not tenant or "/" in tenant or ".." in tenant or tenant.startswith("."):
+        raise ValueError("invalid tenant name")
+
+
 def tenant_worktree(tenant: str) -> Path:
     """Per-tenant working copy (simulates multi-tenant locally).
 
@@ -423,8 +430,7 @@ def tenant_worktree(tenant: str) -> Path:
     changes concurrently without touching each other or the shared tree.
     The worktree is refreshed to the default branch head on every use.
     """
-    if not tenant or "/" in tenant or ".." in tenant or tenant.startswith("."):
-        raise ValueError("invalid tenant name")
+    tenant_worktree_name_ok(tenant)
     if not (ROOT / ".git").exists():
         raise ValueError("not a git repository")
     wt = ROOT / ".tenants" / tenant
@@ -451,6 +457,12 @@ def _reset_worktree(wt: Path, created: list[Path]) -> None:
         p.unlink(missing_ok=True)
     _git("reset", "--hard", worktree=wt)
     _git("checkout", "--detach", "origin/main", worktree=wt)
+
+
+def _build_env() -> dict[str, str]:
+    """Builds in throwaway worktrees share the repo's target dir."""
+    return {**os.environ,
+            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR") or str(ROOT / "target")}
 
 
 def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None = None):
@@ -512,7 +524,127 @@ def _render_preview_artifact(wt: Path, collection: str, slug: str) -> str | None
     return str(out)
 
 
+# ---- proposal workspaces ---------------------------------------------------
+#
+# Over HTTP every proposal runs in its own throwaway worktree created from
+# origin/main and deleted afterwards: no two callers ever share an index, so
+# one caller's staged files can never ride in another caller's commit. On
+# stdio (one local user) proposals keep using the shared checkout or a
+# tenant worktree, serialized with a lock. Commits always name their own
+# paths, and the ledger refuses a commit that touches anything else.
+
+
+@contextlib.contextmanager
+def _flock(name: str):
+    """Cross-thread and cross-process lock on <repo>/.git/pcms-<name>.lock.
+    Not re-entrant: never nest the same name."""
+    import fcntl
+    path = ROOT / ".git" / f"pcms-{name}.lock"
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+class _ProposalWorkspace:
+    """Where one proposal call writes and commits. Opened lazily (open())
+    so identity and gate checks still run before any side effect; closed by
+    the tool wrapper whatever happens."""
+
+    def __init__(self, args: dict[str, Any], kind: str) -> None:
+        self.kind = kind
+        self.requested_tenant = (args.get("tenant") or "").strip()
+        self.http = os.environ.get("PCMS_TRANSPORT") == "http"
+        self.throwaway = self.http or (kind == "plugin" and not self.requested_tenant)
+        self.tenant = "" if self.throwaway else self.requested_tenant
+        self.path: Path | None = None
+        self._lock: Any = None
+
+    def open(self) -> Path:
+        if self.path is not None:
+            return self.path
+        if self.throwaway:
+            tmp = ROOT / ".tenants" / f".work-{self.kind}-{uuid.uuid4().hex[:12]}"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with _flock("repo"):
+                _fetch_origin_main_locked()
+                res = _git("worktree", "add", "--detach", str(tmp), "origin/main")
+            if res.returncode != 0:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
+            self.path = tmp
+        else:
+            if self.tenant:
+                tenant_worktree_name_ok(self.tenant)
+            key = "tenant-" + self.tenant if self.tenant else "root"
+            self._lock = _flock(key)
+            self._lock.__enter__()
+            self.path = tenant_worktree(self.tenant) if self.tenant else ROOT
+        return self.path
+
+    def close(self) -> None:
+        if self.throwaway and self.path is not None:
+            with _flock("repo"):
+                _git("worktree", "remove", "--force", str(self.path))
+                _git("worktree", "prune")
+            shutil.rmtree(self.path, ignore_errors=True)
+        if self._lock is not None:
+            self._lock.__exit__(None, None, None)
+            self._lock = None
+        self.path = None
+
+    def note(self, result: dict[str, Any]) -> None:
+        if self.http and self.requested_tenant:
+            result["tenant_ignored"] = ("over HTTP every proposal runs in its own "
+                                        "fresh worktree from origin/main")
+
+
+def _in_workspace(kind: str, body: Any, args: dict[str, Any]) -> dict[str, Any]:
+    if not (ROOT / ".git").exists():
+        raise ValueError("not a git repository")
+    ws = _ProposalWorkspace(args, kind)
+    try:
+        result = body(args, ws)
+        ws.note(result)
+        return result
+    finally:
+        ws.close()
+
+
+def _commit_own_paths(wt: Path, paths: list[str], message: str,
+                      env: dict[str, str], nothing: str | None) -> str | None:
+    """Stage and commit exactly `paths` (pathspec commit: anything else
+    staged in this index stays out of the commit). On any failure our paths
+    are unstaged again, so they cannot ride in a later commit. Returns the
+    commit's parent sha, or None when nothing changed and `nothing` is None
+    (otherwise raises `nothing`)."""
+    before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
+    try:
+        present = [p for p in paths if (wt / p).exists()]
+        if present:
+            add = _git("add", "-A", "--", *present, worktree=wt)
+            if add.returncode != 0:
+                raise ValueError(f"git add failed: {add.stderr.strip()[:300]}")
+        if _git("diff", "--cached", "--quiet", "--", *paths, worktree=wt).returncode == 0:
+            if nothing is None:
+                return None
+            raise ValueError(nothing)
+        res = _git("commit", "-m", message, "--", *paths, env_extra=env, worktree=wt)
+        if res.returncode != 0:
+            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
+    except Exception:
+        _git("reset", "-q", "--", *paths, worktree=wt)
+        raise
+    return before
+
+
 def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
+    return _in_workspace("template", _propose_template, args)
+
+
+def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, Any]:
     """Create a Tera template via the review flow.
 
     Writes templates/<name>.html on an agent/template-<name> branch,
@@ -551,8 +683,8 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("body (HTML) is required")
     if "{% block content %}" not in body:
         raise ValueError("template must extend a base and define a {% block content %}")
-    tenant = (args.get("tenant") or "").strip()
-    wt = tenant_worktree(tenant) if tenant else ROOT
+    wt = ws.open()
+    tenant = ws.tenant
 
     tpl_rel = Path("templates") / f"{name}.html"
     tpl_path = wt / tpl_rel
@@ -564,7 +696,7 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
     try:
         # Validation: a real build compiles every template in templates/.
         build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env=_build_env())
         if build.returncode != 0:
             tail = "\n".join(build.stderr.strip().splitlines()[-15:])
             _reset_worktree(wt, [] if existed else [tpl_path])
@@ -579,24 +711,23 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
             "GIT_COMMITTER_EMAIL": author_email,
         }
         verb = "update" if existed else "add"
-        res = _git("add", str(tpl_rel), worktree=wt)
-        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
-        res = _git("commit", "-m", f"propose: {verb} template {name}", env_extra=commit_env,
-                   worktree=wt)
-        if res.returncode != 0:
-            if "nothing to commit" in (res.stdout + res.stderr):
-                _reset_worktree(wt, [] if existed else [tpl_path])
-                raise ValueError("template content unchanged — nothing to propose")
-            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
-        _ledger_record_commit("propose_template", branch, wt, before, author_i)
+        own = [str(tpl_rel)]
+        before = _commit_own_paths(wt, own, f"propose: {verb} template {name}", commit_env,
+                                   "template content unchanged — nothing to propose")
+        assert before is not None
+        _ledger_record_commit("propose_template", branch, wt, before, author_i, own)
         push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
             _reset_worktree(wt, [] if existed else [tpl_path])
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
         root_arg = "" if tenant else "  # or pass the same tenant to render from its worktree"
-        preview_cmd = (f"cd {wt} && cargo run -q -p build && "
-                       f"python3 -m http.server 8000 -d dist{root_arg}")
+        if ws.throwaway:
+            preview_cmd = (f"cd {ROOT} && git fetch origin {branch} && git switch {branch} && "
+                           f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
+        else:
+            preview_cmd = (f"cd {wt} && cargo run -q -p build && "
+                           f"python3 -m http.server 8000 -d dist{root_arg}")
         pr_body = (f"Agent-authored template by {author_name}.\n\n"
                    f"Use: set `item_template: {name}.html` (or index_template) in a "
                    f"collection's schema.yaml.\n\nPreview: {preview_cmd}")
@@ -645,6 +776,10 @@ def tool_propose_template(args: dict[str, Any]) -> dict[str, Any]:
         raise
 
 def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
+    return _in_workspace("change", _propose_change, args)
+
+
+def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, Any]:
     """Collaboration flow: one branch + one commit + one PR per change.
 
     Instead of committing to the shared working tree, this writes the change
@@ -705,8 +840,8 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
     collection = (args.get("collection") or "posts").strip()
     if "/" in collection or ".." in collection:
         raise ValueError("invalid collection")
-    tenant = (args.get("tenant") or "").strip()
-    wt = tenant_worktree(tenant) if tenant else ROOT
+    wt = ws.open()
+    tenant = ws.tenant
 
     # Resolve target files. Existing item → update in place; new → draft item.
     item_dir = wt / "content" / collection / slug
@@ -782,28 +917,26 @@ def tool_propose_change(args: dict[str, Any]) -> dict[str, Any]:
             tail = "\n".join(build.stderr.strip().splitlines()[-15:])
             raise ValueError(f"proposal failed build validation:\n{tail}")
 
-        _git("add", str(item_dir.relative_to(wt)), worktree=wt)
         commit_env = {
             "GIT_AUTHOR_NAME": author_name,
             "GIT_AUTHOR_EMAIL": author_email,
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
-        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
-        res = _git("commit", "-m", summary, env_extra=commit_env, worktree=wt)
-        if res.returncode != 0:
-            if "nothing to commit" in (res.stdout + res.stderr):
-                raise ValueError(
-                    "nothing to commit — for updates pass body/description; "
-                    "if the item already has this content, no MR is needed")
-            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
-        _ledger_record_commit("propose_change", branch, wt, before, author_i)
+        own = [str(item_dir.relative_to(wt))]
+        before = _commit_own_paths(
+            wt, own, summary, commit_env,
+            "nothing to commit — for updates pass body/description; "
+            "if the item already has this content, no MR is needed")
+        assert before is not None
+        _ledger_record_commit("propose_change", branch, wt, before, author_i, own)
 
         push = _git("push", "-u", "origin", branch, worktree=wt)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
 
-        preview_cmd = (f"cd {wt} && git fetch origin {branch} && git switch {branch} && "
+        preview_cmd = (f"cd {ROOT if ws.throwaway else wt} && git fetch origin {branch} && "
+                       f"git switch {branch} && "
                        f"DRAFTS=1 cargo run -q -p build && "
                        f"python3 -m http.server 8000 -d dist")
         preview_url = f"http://localhost:8000/preview/drafts/{collection}/{slug}/"
@@ -965,6 +1098,10 @@ def _set_site_yaml_plugins(site_path: Path, new_entries: list[dict[str, Any]]) -
 
 
 def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
+    return _in_workspace("plugin", _propose_plugin, args)
+
+
+def _propose_plugin(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, Any]:
     """Propose a client-side plugin (analytics pixel, ad tag) via the review
     flow. Writes plugins/<name>/snippet.html and registers the plugin in
     site.yaml `plugins:`, validates with a real build (a snippet whose
@@ -1005,21 +1142,12 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
                                                    author_name, author_email)
     _stable_id(author_i)  # the ledger needs it; fail before any side effect
 
-    # A throwaway worktree on origin/main — the shared tree is never touched,
-    # so a failed proposal cannot leave uncommitted writes behind (and a
-    # cleanup handler can never eat unrelated work the way a reset --hard
-    # on the shared tree would).
-    tmp: Path | None = None
-    if tenant:
-        wt = tenant_worktree(tenant)
-    else:
-        _git("fetch", "--prune", "origin")
-        tmp = ROOT / ".tenants" / f"plugin-{name}-{int(time.time() * 1000)}"
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        res = _git("worktree", "add", "--detach", str(tmp), "origin/main")
-        if res.returncode != 0:
-            raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
-        wt = tmp
+    # A throwaway worktree on origin/main (always over HTTP, and without a
+    # tenant) — the shared tree is never touched, so a failed proposal
+    # cannot leave uncommitted writes behind. The wrapper deletes it.
+    wt = ws.open()
+    tenant = ws.tenant
+    tmp: Path | None = wt if ws.throwaway else None
 
     try:
         site_path = wt / "site.yaml"
@@ -1056,7 +1184,7 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
         # dist/index.html has the plugin injected at its declared mount, so
         # the reviewer sees exactly what a visitor's browser would run.
         build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env=_build_env())
         if build.returncode != 0:
             tail = "\n".join(build.stderr.strip().splitlines()[-15:])
             raise ValueError(f"plugin failed build validation:\n{tail}")
@@ -1068,22 +1196,17 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
                     _save_artifact(f"plugin-{name}.html", built.read_text()))
 
         branch = f"agent/plugin-{name}"
-        _git("add", str(plugin_dir.relative_to(wt)), worktree=wt)
-        _git("add", "site.yaml", worktree=wt)
         commit_env = {
             "GIT_AUTHOR_NAME": author_name,
             "GIT_AUTHOR_EMAIL": author_email,
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
-        before = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
-        res = _git("commit", "-m", f"propose: {verb} plugin {name}", env_extra=commit_env,
-                   worktree=wt)
-        if res.returncode != 0:
-            if "nothing to commit" in (res.stdout + res.stderr):
-                raise ValueError("plugin unchanged — nothing to propose")
-            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
-        _ledger_record_commit("propose_plugin", branch, wt, before, author_i)
+        own = [str(plugin_dir.relative_to(wt)), "site.yaml"]
+        before = _commit_own_paths(wt, own, f"propose: {verb} plugin {name}", commit_env,
+                                   "plugin unchanged — nothing to propose")
+        assert before is not None
+        _ledger_record_commit("propose_plugin", branch, wt, before, author_i, own)
         if tmp is not None:
             push = _git("push", "origin", f"HEAD:refs/heads/{branch}",
                         "--force-with-lease", worktree=wt)
@@ -1144,11 +1267,6 @@ def tool_propose_plugin(args: dict[str, Any]) -> dict[str, Any]:
         if wt != ROOT:
             _reset_worktree(wt, [])
         raise
-    finally:
-        if tmp is not None:
-            _git("worktree", "remove", "--force", str(tmp))
-            _git("worktree", "prune")
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _apply_meta_edits(meta_path: Path, *, title: str | None = None,
@@ -1243,15 +1361,16 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if "/" in collection or ".." in collection:
         raise ValueError("invalid collection")
 
-    tmp = ROOT / ".tenants" / f"revise-{slug}-{int(time.time() * 1000)}"
+    tmp = ROOT / ".tenants" / f".work-revise-{uuid.uuid4().hex[:12]}"
     tmp.parent.mkdir(parents=True, exist_ok=True)
     # origin/<branch> is the source of truth — a local ref can be stale
     # (behind a revision pushed by an earlier session).
-    fres = _git("fetch", "origin",
-                f"+refs/heads/{branch}:refs/remotes/origin/{branch}", worktree=ROOT)
-    if fres.returncode != 0:
-        raise ValueError(f"git fetch failed: {fres.stderr.strip()[:300]}")
-    res = _git("worktree", "add", "--detach", str(tmp), f"origin/{branch}")
+    with _flock("repo"):
+        fres = _git("fetch", "origin",
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}", worktree=ROOT)
+        if fres.returncode != 0:
+            raise ValueError(f"git fetch failed: {fres.stderr.strip()[:300]}")
+        res = _git("worktree", "add", "--detach", str(tmp), f"origin/{branch}")
     if res.returncode != 0:
         raise ValueError(f"worktree add failed: {res.stderr.strip()[:300]}")
     try:
@@ -1273,18 +1392,16 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
         _apply_meta_edits(meta_path, title=raw_title,
                           description=args.get("description"),
                           agent_notes=agent_notes, fields=fields)
-        _git("add", str(item_dir.relative_to(tmp)), worktree=tmp)
         env = {"GIT_AUTHOR_NAME": author_name, "GIT_AUTHOR_EMAIL": author_email,
                "GIT_COMMITTER_NAME": author_name, "GIT_COMMITTER_EMAIL": author_email}
-        before = _git("rev-parse", "HEAD", worktree=tmp).stdout.strip()
-        res = _git("commit", "-m", f"revise: {collection}/{slug} from review feedback",
-                   env_extra=env, worktree=tmp)
-        if res.returncode != 0 and "nothing to commit" not in (res.stdout + res.stderr):
-            raise ValueError(f"git commit failed: {res.stderr.strip()[:300]}")
-        if res.returncode == 0:
+        own = [str(item_dir.relative_to(tmp))]
+        before = _commit_own_paths(tmp, own,
+                                   f"revise: {collection}/{slug} from review feedback",
+                                   env, None)
+        if before is not None:
             # Only the commit made here is recorded, never the branch head
             # it started from (which may hold commits made outside).
-            _ledger_record_commit("revise_proposal", branch, tmp, before, author_i)
+            _ledger_record_commit("revise_proposal", branch, tmp, before, author_i, own)
         push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
         if push.returncode != 0:
             raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
@@ -1295,8 +1412,9 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
                 "preview_command": (f"cd {tmp} && DRAFTS=1 cargo run -q -p build && "
                                     f"python3 -m http.server 8000 -d dist")}
     finally:
-        _git("worktree", "remove", "--force", str(tmp))
-        _git("worktree", "prune")
+        with _flock("repo"):
+            _git("worktree", "remove", "--force", str(tmp))
+            _git("worktree", "prune")
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1411,6 +1529,11 @@ def _ship_and_purge(result: dict[str, Any]) -> None:
     """Bring the shared tree to origin/main and run build + deploy + purge.
     One call = the whole 'approve/revert means live' tail, atomically from
     the caller's point of view."""
+    with _flock("root"):
+        _ship_and_purge_locked(result)
+
+
+def _ship_and_purge_locked(result: dict[str, Any]) -> None:
     _git("fetch", "origin")
     switch = _git("switch", "main")
     if switch.returncode != 0:
@@ -1533,9 +1656,11 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
 # and of every merge it performs. Approve, merge=true and revert read the
 # ledger; git identities are only a secondary check.
 #
-# Location: $PCMS_STATE_DIR/.proposals-ledger.jsonl, default
-# <repo>/.tenants/.proposals-ledger.jsonl (gitignored; tenant names cannot
-# start with "."). One JSON object per line:
+# Location: $PCMS_STATE_DIR/proposals-ledger.jsonl, default
+# <repo>/.tenants/.state/proposals-ledger.jsonl (gitignored; tenant names
+# cannot start with "."). The state dir must be a real directory owned by
+# the server user, mode 0700; the file is opened O_NOFOLLOW and must be a
+# regular file the server user owns. One JSON object per line:
 #   {"v": 1, "event": "commit", "tool": "propose_change", "branch": "agent/x",
 #    "sha": "<40 hex>", "actor": "github:123", "email": "...", "time": "..."}
 #   {"v": 1, "event": "merge", "tool": "approve_proposal", "branch": "agent/x",
@@ -1546,9 +1671,55 @@ def _check_declared_identity(declared_name: str, declared_email: str) -> dict[st
 _SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 
 
+def _ledger_dir(create: bool) -> Path | None:
+    """The ledger's state dir: $PCMS_STATE_DIR, default <repo>/.tenants/.state.
+    It must be a real directory (not a symlink) owned by the server user with
+    mode 0700; anything else refuses. Created 0700 when missing and `create`."""
+    import stat as st_mod
+    base = os.environ.get("PCMS_STATE_DIR")
+    d = Path(base) if base else ROOT / ".tenants" / ".state"
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        if not create:
+            return None
+        d.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(d, 0o700)
+        st = os.lstat(d)
+    if st_mod.S_ISLNK(st.st_mode) or not st_mod.S_ISDIR(st.st_mode):
+        raise ValueError(f"ledger state dir {d} is not a real directory")
+    if st.st_uid != os.getuid():
+        raise ValueError(f"ledger state dir {d} is not owned by the server user")
+    if st.st_mode & 0o077:
+        raise ValueError(f"ledger state dir {d} must be mode 0700 "
+                         f"(is {oct(st.st_mode & 0o777)})")
+    return d
+
+
 def _ledger_path() -> Path:
     base = os.environ.get("PCMS_STATE_DIR")
-    return (Path(base) if base else ROOT / ".tenants") / ".proposals-ledger.jsonl"
+    d = Path(base) if base else ROOT / ".tenants" / ".state"
+    return d / "proposals-ledger.jsonl"
+
+
+def _ledger_open(flags: int) -> int:
+    """Open the ledger without following symlinks; it must be a regular file
+    owned by the server user."""
+    import stat as st_mod
+    path = _ledger_path()
+    try:
+        fd = os.open(str(path), flags | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ValueError(f"cannot open proposals ledger {path} without following "
+                         f"links: {exc}") from exc
+    st = os.fstat(fd)
+    if not st_mod.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        raise ValueError(f"proposals ledger {path} is not a regular file owned by "
+                         "the server user")
+    return fd
+
+
 
 
 def _stable_id(ident: dict[str, Any]) -> str:
@@ -1565,28 +1736,27 @@ def _stable_id(ident: dict[str, Any]) -> str:
 
 def _ledger_append(entry: dict[str, Any]) -> None:
     import fcntl
-    path = _ledger_path()
     record = {"v": 1, "time": datetime.now(timezone.utc).isoformat(), **entry}
     line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        _ledger_dir(create=True)
+        fd = _ledger_open(os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             os.write(fd, line.encode())
             os.fsync(fd)
         finally:
             os.close(fd)
-    except OSError as exc:
-        raise ValueError(f"proposals ledger write failed ({path}): {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"proposals ledger write failed ({_ledger_path()}): {exc}") from exc
 
 
 def _ledger_entries() -> list[dict[str, Any]]:
     path = _ledger_path()
-    if not path.exists():
+    if _ledger_dir(create=False) is None or not os.path.lexists(path):
         return []
     out: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as fh:
+    with os.fdopen(_ledger_open(os.O_RDONLY), encoding="utf-8") as fh:
         for n, line in enumerate(fh, 1):
             try:
                 e = json.loads(line)
@@ -1605,13 +1775,23 @@ def _ledger_entries() -> list[dict[str, Any]]:
 
 
 def _ledger_record_commit(tool: str, branch: str, wt: Path, before: str,
-                          ident: dict[str, Any]) -> str:
+                          ident: dict[str, Any], own: list[str]) -> str:
     """Record the commit the server just made in `wt` (HEAD, whose parent
-    must be `before`). Raises when no new commit exists or the write fails."""
+    must be `before`). The commit must change exactly the tool's own paths
+    (`own`: files or directories), nothing else. Raises when no new commit
+    exists, it touches other paths, or the write fails."""
     head = _git("rev-parse", "HEAD", worktree=wt).stdout.strip()
     parent = _git("rev-parse", "HEAD^", worktree=wt).stdout.strip()
     if not _SHA_RE.fullmatch(head) or head == before or parent != before:
         raise ValueError("ledger: could not identify the commit the server just made")
+    diff = _git("diff", "--name-only", "-z", before, head, worktree=wt)
+    changed = [f for f in diff.stdout.split("\x00") if f]
+    roots = [o.rstrip("/") for o in own]
+    stray = [f for f in changed
+             if not any(f == r or f.startswith(r + "/") for r in roots)]
+    if diff.returncode != 0 or not changed or stray:
+        raise ValueError(f"ledger: {tool} commit {head[:12]} changes paths outside "
+                         f"its own ({', '.join(stray[:5]) or 'none readable'}); refusing")
     _ledger_append({"event": "commit", "tool": tool, "branch": branch, "sha": head,
                     "actor": _stable_id(ident), "email": ident.get("email") or ""})
     return head
@@ -1658,6 +1838,11 @@ def _commits(rev_range: str) -> list[tuple[str, str, str, str, str]]:
 def _fetch_origin_main() -> None:
     """Fetch origin/main explicitly. Never fall back to a local main: a
     local main that already contains the branch hides its commits."""
+    with _flock("repo"):
+        _fetch_origin_main_locked()
+
+
+def _fetch_origin_main_locked() -> None:
     res = _git("fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main")
     if res.returncode != 0 or _git("rev-parse", "--verify", "--quiet",
                                    "origin/main").returncode != 0:
@@ -1712,8 +1897,10 @@ def _branch_head_and_commits(branch: str, what: str
     """The head the PR will merge and every commit on it since the merge
     base with origin/main. The one place the commit list comes from, so a
     forge API (which lists the change's commits itself) can replace it."""
-    _fetch_origin_main()
-    _git("fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    with _flock("repo"):
+        _fetch_origin_main_locked()
+        _git("fetch", "--quiet", "origin",
+             f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
     rev = _git("rev-parse", "--verify", "--quiet", f"origin/{branch}")
     if rev.returncode != 0:
         raise ValueError(f"{what}: branch {branch!r} not found on origin")
@@ -1987,6 +2174,27 @@ def tool_reject_proposal(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _revert_on_shared_tree(merge_sha: str) -> None:
+    """Revert `merge_sha` on main in the shared checkout and push, under the
+    shared-checkout lock."""
+    with _flock("root"):
+        switch = _git("switch", "main")
+        if switch.returncode != 0:
+            _git("switch", "-")
+        dirty = _git("status", "--porcelain", "--untracked-files=no")
+        if dirty.stdout.strip():
+            raise ValueError(f"shared tree is dirty: {dirty.stdout.strip()[:200]}")
+        pull = _git("pull", "--ff-only", "origin", "main")
+        if pull.returncode != 0:
+            raise ValueError(f"pull failed: {pull.stderr.strip()[:300]}")
+        revert = _git("revert", "--no-edit", "-m", "1", merge_sha)
+        if revert.returncode != 0:
+            raise ValueError(f"revert failed: {revert.stderr.strip()[:400]}")
+        push = _git("push", "origin", "main")
+        if push.returncode != 0:
+            raise ValueError(f"push of revert failed: {push.stderr.strip()[:300]}")
+
+
 def _find_shipped_merge(slug: str) -> tuple[str, int | None, str]:
     """The exact merge commit that shipped proposal `slug` on origin/main:
     (merge sha, PR number, branch). Branch names match exactly
@@ -2049,8 +2257,9 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
     if not slug or "/" in slug or ".." in slug:
         raise ValueError("slug required")
     _require_approver(ident)
-    _git("fetch", "origin")
-    _fetch_origin_main()
+    with _flock("repo"):
+        _git("fetch", "origin")
+        _fetch_origin_main_locked()
     merge_sha, merge_pr, branch = _find_shipped_merge(slug)
     break_glass = False
     if _distinct_required():
@@ -2082,21 +2291,7 @@ def tool_revert_proposal(args: dict[str, Any]) -> dict[str, Any]:
              f"Reverted by {approver_name} <{approver_email}> via revert_proposal "
              f"[identity: {identity_source}].{note}"],
             cwd=str(ROOT), capture_output=True, text=True)
-    switch = _git("switch", "main")
-    if switch.returncode != 0:
-        _git("switch", "-")
-    dirty = _git("status", "--porcelain", "--untracked-files=no")
-    if dirty.stdout.strip():
-        raise ValueError(f"shared tree is dirty: {dirty.stdout.strip()[:200]}")
-    pull = _git("pull", "--ff-only", "origin", "main")
-    if pull.returncode != 0:
-        raise ValueError(f"pull failed: {pull.stderr.strip()[:300]}")
-    revert = _git("revert", "--no-edit", "-m", "1", merge_sha)
-    if revert.returncode != 0:
-        raise ValueError(f"revert failed: {revert.stderr.strip()[:400]}")
-    push = _git("push", "origin", "main")
-    if push.returncode != 0:
-        raise ValueError(f"push of revert failed: {push.stderr.strip()[:300]}")
+    _revert_on_shared_tree(merge_sha)
     out["reverted"] = True
     if not args.get("deploy", True):
         out["deploy"] = "skipped (deploy=false)"
@@ -2109,8 +2304,11 @@ def git_commit(message: str) -> dict[str, Any]:
     """Stage content/ and commit. No-ops when not a git repo."""
     if not (ROOT / ".git").exists():
         return {"committed": False, "reason": "not a git repository"}
-    _git("add", "content")
-    res = _git("commit", "-m", message)
+    # Pathspec commit under the shared-checkout lock: only content/ is
+    # committed, never whatever else happens to be staged.
+    with _flock("root"):
+        _git("add", "-A", "--", "content")
+        res = _git("commit", "-m", message, "--", "content")
     if res.returncode != 0:
         # nothing to commit is fine
         if "nothing to commit" in (res.stdout + res.stderr):

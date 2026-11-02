@@ -459,6 +459,127 @@ class RevertTest(GateCase):
         self.assertNotIn("break_glass", out)
 
 
+class SharedCheckoutTest(GateCase):
+    """L4b: a proposal whose commit fails must not leave its files staged
+    for the next caller's commit; worktrees are per call over HTTP."""
+
+    def propose(self, who: str, slug: str, transport: str = "http") -> dict:
+        with self.as_user(who, transport=transport):
+            return srv.tool_propose_change({"slug": slug, "title": slug, "body": "b"})
+
+    def files_of(self, branch: str) -> list[str]:
+        return self.git(None, "--git-dir", str(self.origin), "show", "--name-only",
+                        "--format=", branch).split()
+
+    def failing_commit(self, lock: Path | None = None):
+        real = srv._git
+
+        def g(*a, **kw):
+            if a and a[0] == "commit":
+                if lock is None:
+                    return subprocess.CompletedProcess(a, 128, "", "fatal: index.lock exists")
+                lock.write_text("")  # a concurrent git op holds the index lock
+                try:
+                    return real(*a, **kw)
+                finally:
+                    lock.unlink()
+            return real(*a, **kw)
+        return mock.patch.object(srv, "_git", g)
+
+    def worktrees(self) -> list[str]:
+        out = self.git(self.work, "worktree", "list", "--porcelain")
+        return [l for l in out.splitlines() if l.startswith("worktree ")]
+
+    def test_l4b_http_failed_commit_leaves_nothing_for_the_next_caller(self) -> None:
+        with self.failing_commit():
+            with self.assertRaisesRegex(ValueError, "git commit failed"):
+                self.propose("bob", "bobstage")
+        self.assertEqual(self.git(self.work, "diff", "--cached", "--name-only"), "")
+        self.assertEqual(len(self.worktrees()), 1, "throwaway worktree removed")
+        self.assertEqual(list((self.work / ".tenants").glob(".work-*")), [])
+        out = self.propose("alice", "later")
+        self.assertEqual(self.files_of(out["branch"]),
+                         ["content/posts/later/index.mdx", "content/posts/later/meta.yaml"])
+        self.assertEqual(len(self.worktrees()), 1)
+
+    def test_l4b_stdio_shared_checkout_commits_only_its_own_paths(self) -> None:
+        with self.failing_commit(lock=self.work / ".git" / "index.lock"):
+            with self.assertRaisesRegex(ValueError, "git commit failed"):
+                self.propose("bob", "bobstage", transport="stdio")
+        self.assertEqual(self.git(self.work, "diff", "--cached", "--name-only"), "",
+                         "the failed proposal's files are unstaged")
+        # Even something staged by hand in the shared checkout stays out.
+        (self.work / "stray.md").write_text("stray\n")
+        self.git(self.work, "add", "stray.md")
+        out = self.propose("alice", "later", transport="stdio")
+        self.assertEqual(self.files_of(out["branch"]),
+                         ["content/posts/later/index.mdx", "content/posts/later/meta.yaml"])
+        self.assertIn("stray.md", self.git(self.work, "diff", "--cached", "--name-only"))
+
+    def test_ledger_refuses_a_commit_outside_the_tools_paths(self) -> None:
+        branch = self.branch("mixed")
+        self.git(self.work, "switch", "-q", branch)
+        before = self.git(self.work, "rev-parse", "HEAD")
+        for f in ("mine.md", "theirs.md"):
+            (self.work / f).write_text(f)
+        self.git(self.work, "add", "mine.md", "theirs.md")
+        self.git(self.work, "commit", "-q", "-m", "mixed", who="alice")
+        with self.assertRaisesRegex(ValueError, "outside its own.*theirs.md"):
+            srv._ledger_record_commit("propose_change", branch, self.work, before,
+                                      PEOPLE["alice"], ["mine.md"])
+        self.assertEqual(srv._ledger_entries(), [])
+
+    def test_http_ignores_tenant_and_uses_a_fresh_worktree(self) -> None:
+        with self.as_user("alice"):
+            out = srv.tool_propose_change({"slug": "t1", "body": "b", "tenant": "team"})
+        self.assertIn("tenant_ignored", out)
+        self.assertFalse((self.work / ".tenants" / "team").exists())
+        self.assertEqual(len(self.worktrees()), 1)
+
+
+class LedgerStorageTest(GateCase):
+    """L6: the ledger never follows a symlink, and its state dir must be a
+    real 0700 directory owned by the server user."""
+
+    def entry(self) -> dict:
+        return {"event": "commit", "tool": "t", "branch": "agent/b",
+                "sha": "e" * 40, "actor": "github:1"}
+
+    def test_l6_symlinked_ledger_is_refused(self) -> None:
+        state = Path(os.environ["PCMS_STATE_DIR"])
+        state.mkdir(mode=0o700)
+        planted = self.tmp / "planted.jsonl"
+        planted.write_text(json.dumps({"v": 1, "event": "commit", "tool": "x",
+                                       "branch": "agent/q", "sha": "d" * 40,
+                                       "actor": "github:3"}) + "\n")
+        os.symlink(planted, srv._ledger_path())
+        with self.assertRaisesRegex(ValueError, "ledger"):
+            srv._ledger_append(self.entry())
+        with self.assertRaisesRegex(ValueError, "without following links"):
+            srv._ledger_entries()
+        self.assertEqual(planted.read_text().count("\n"), 1, "planted file untouched")
+
+    def test_l6_state_dir_must_be_private_and_real(self) -> None:
+        state = Path(os.environ["PCMS_STATE_DIR"])
+        state.mkdir(mode=0o700)
+        os.chmod(state, 0o755)
+        with self.assertRaisesRegex(ValueError, "0700"):
+            srv._ledger_append(self.entry())
+        os.chmod(state, 0o700)
+        real = self.tmp / "real-state"
+        real.mkdir(mode=0o700)
+        link = self.tmp / "link-state"
+        os.symlink(real, link)
+        with mock.patch.dict(os.environ, {"PCMS_STATE_DIR": str(link)}):
+            with self.assertRaisesRegex(ValueError, "not a real directory"):
+                srv._ledger_append(self.entry())
+
+    def test_ledger_created_private(self) -> None:
+        srv._ledger_append(self.entry())
+        self.assertEqual(os.stat(os.environ["PCMS_STATE_DIR"]).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(srv._ledger_path()).st_mode & 0o777, 0o600)
+
+
 class HttpIdentityTest(unittest.TestCase):
     """Stable ids from the HTTP connectors; OIDC email only when verified."""
 

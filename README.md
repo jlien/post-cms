@@ -346,9 +346,13 @@ rights too. In order:
 stdio is a single local user: every commit carries that user's identity, so
 the author checks would block all publishing there.
 
-**Proposals ledger.** `$PCMS_STATE_DIR/.proposals-ledger.jsonl`, default
-`.tenants/.proposals-ledger.jsonl` (gitignored), mode 0600, append-only and
-written only by the server. One JSON object per line:
+**Proposals ledger.** `$PCMS_STATE_DIR/proposals-ledger.jsonl`, default
+`.tenants/.state/proposals-ledger.jsonl` (gitignored), append-only and
+written only by the server. The state dir must be a real directory (not a
+symlink) owned by the server user with mode 0700; the server creates it that
+way when missing and refuses any other. The file is opened with
+`O_NOFOLLOW`, must be a regular file the server user owns, and is created
+mode 0600. One JSON object per line:
 
 ```json
 {"v": 1, "event": "commit", "tool": "propose_change", "branch": "agent/x", "sha": "<40 hex>", "actor": "github:123", "email": "a@example.com", "time": "2026-11-02T18:00:00+00:00"}
@@ -357,7 +361,18 @@ written only by the server. One JSON object per line:
 
 `propose_change`, `propose_template`, `propose_plugin` and
 `revise_proposal` append a `commit` line for the commit they create, before
-pushing; approvals append a `merge` line. A failed write fails the tool, and
+pushing; approvals append a `merge` line. Each tool stages and commits only
+its own paths (`git commit -- <paths>`), unstages them again on any failure,
+and refuses to record a commit whose `git diff --name-only <parent> HEAD`
+lists any other path.
+
+**Where proposals are written.** Over HTTP every proposal call works in its
+own throwaway git worktree (`.tenants/.work-*`), created from `origin/main`
+and deleted afterwards, so callers never share an index; a `tenant` argument
+is ignored there (the result says so). On stdio, proposals use the shared
+checkout or the tenant's worktree, serialized by a lock file in `.git/`
+(`pcms-root.lock`, `pcms-tenant-<name>.lock`), as do reverts, deploys and
+`create_draft`/`update_post` commits. A failed write fails the tool, and
 a malformed line makes every gate refuse. Back the file up with the server's
 state; losing it means open proposals must be re-proposed.
 
