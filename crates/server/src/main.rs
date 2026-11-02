@@ -246,10 +246,40 @@ fn main() -> anyhow::Result<()> {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
+        eprintln!("origin stopped");
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C). The server then stops accepting
+/// connections, lets in-flight requests finish, and `main` returns 0. This
+/// matters in a container, where the server is PID 1: the kernel ignores a
+/// signal PID 1 has no handler for, so without this `docker stop` and
+/// Kubernetes wait out their grace period and SIGKILL the process.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => eprintln!("origin: SIGINT, shutting down"),
+        _ = term => eprintln!("origin: SIGTERM, shutting down"),
+    }
 }
 
 // ---- Rate limiting / abuse protection (built into the origin) -----------

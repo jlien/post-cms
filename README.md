@@ -43,7 +43,8 @@ an AI agent do all content operations.
 | `crates/server` | axum static origin, 127.0.0.1:8787 (`PORT`, `--host` / `POSTCMS_HOST` to override) |
 | `mcp/server.py` | MCP stdio server (stdlib only) |
 | `templates/` | tera templates (base, post, index, 404) |
-| `ci/` | build, deploy, purge scripts |
+| `ci/` | build, deploy, purge scripts; `container-check.sh` for the image |
+| `Dockerfile` | origin image: server binary plus one site's built `dist/` (see Container image) |
 
 ## Build
 
@@ -261,6 +262,8 @@ POSTCMS_HOST=0.0.0.0 PORT=8080 server       # or: server --host 0.0.0.0
 
 Earlier versions always listened on `0.0.0.0`; a deployment that relied on that must now set `POSTCMS_HOST=0.0.0.0` (or pass `--host 0.0.0.0`). Behind a reverse proxy on the same machine, keep the default and point the proxy at `127.0.0.1:$PORT`.
 
+**Stopping.** SIGTERM or SIGINT stops the server accepting connections, lets in-flight requests finish, logs `origin: SIGTERM, shutting down` (or `SIGINT`) then `origin stopped`, and exits 0. Idle keep-alive connections do not hold it open. An `/api/ask` request waiting on the model (up to 60 s) can outlast a short stop grace period, after which the platform kills the process.
+
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
 
@@ -300,6 +303,57 @@ python3 mcp/server.py --self-test
 
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
+
+## Container image
+
+`Dockerfile` builds an image holding the origin server and one site's built `dist/`. It needs BuildKit (`docker buildx`, the default builder in current Docker).
+
+```bash
+docker build -t demo-site .                                    # the demo site in this repo
+docker build -t my-site --build-context site=../my-site .      # any site directory
+docker run --rm --read-only --tmpfs /tmp -p 8080:8080 my-site  # http://127.0.0.1:8080/health
+```
+
+Stages: `engine` compiles `server` and `build-site` (dependencies in their own layer, reused until `Cargo.toml` or `Cargo.lock` changes), `site-build` runs `build-site` over the site, and `runtime` gets only the server binary at `/usr/local/bin/post-cms-server` and `dist/`, `site.yaml` and `redirects.yaml` under `/site`. `build-site`, the site sources and the Rust toolchain are not in the runtime image.
+
+### Build inputs
+
+| Input | How | Meaning |
+|---|---|---|
+| engine | build context (`.`) | A post-cms checkout. `.dockerignore` is an allowlist: only `Cargo.*`, `crates/` and the demo site files enter the context, and `.env*`, `*.key`, `*.enc`, `*.pem`, `credentials*.json`, `.cache`, `node_modules`, `target` and `dist` are dropped even inside those. |
+| site | `--build-context site=<dir>` (default: the demo site in this repo) | Any directory with `site.yaml` (plus `content/`, `templates/`, `themes/`, `plugins/`, `redirects.yaml` as the site uses them). It is bind-mounted into the `build-site` step, never copied into a layer; only the files `build-site` writes to `dist/`, plus `site.yaml` and `redirects.yaml`, reach the image. Keep a `.dockerignore` in the site directory anyway, so secrets are not sent to the builder at all. |
+| `SANITY_READ_TOKEN` | `--secret id=SANITY_READ_TOKEN,env=SANITY_READ_TOKEN` (or `src=<file>`) | Read token for sites that pull from Sanity. Mounted for the `build-site` step only; never in a layer, the history or the image config. |
+| `SITE_BASE_URL`, `SITE_THEME`, `DRAFTS`, `POSTCMS_EMBED_BATCH`, `IMAGES_OFFLINE`, `SANITY_OFFLINE` | `--build-arg` | The `build-site` settings of the same names (see Build). Unset or empty means the engine default. Build args are visible in `docker history`: never pass a secret this way. |
+| `TAILWINDCSS_URL`, `TAILWINDCSS_SHA256` | `--build-arg`, both or neither | Standalone Tailwind CLI for themes that compile CSS (see Tailwind CLI). The download must match the SHA-256 and be https. |
+| `RUST_IMAGE`, `RUNTIME_IMAGE` | `--build-arg` | Base images, pinned by digest in the Dockerfile. To update one, resolve the tag's new digest (`docker buildx imagetools inspect <image>:<tag>`) and replace tag and digest together. |
+
+`build-site` downloads the embedding model during the build (network access to Hugging Face), cached in a BuildKit cache mount between builds, as are processed images.
+
+A site repository builds its own image from a post-cms checkout at a pinned commit (a submodule or a CI checkout), for example `docker build --build-context site=. -t site:$SHA path/to/post-cms`.
+
+### Runtime
+
+Base image: `gcr.io/distroless/cc-debian12:nonroot`, chosen over `debian-slim` because it has no shell, package manager or setuid binaries, and still carries what the server links against: glibc, libstdc++ (the ONNX runtime behind `/api/ask` is C++), OpenSSL and CA certificates (model download, the LLM call). The builder is Debian 12 too, so the binary's glibc matches. Debugging is through logs and `/health`; there is nothing to `exec` into.
+
+The image runs as uid/gid 65532 (`nonroot`), and `/site` is owned by root and not writable by it. The only path the server writes is the `/api/ask` model cache, `$HOME/.cache/post-cms-fastembed` with `HOME=/tmp/post-cms`, so a read-only root file system works with a writable `/tmp` (`--read-only --tmpfs /tmp`, or an `emptyDir` on `/tmp` in Kubernetes). The model (over 100 MB) is downloaded on the first `/api/ask` after each start, so size the tmpfs for it; without network access to Hugging Face, or without a writable `/tmp`, `/api/ask` falls back to inlining the corpus. There is no `HEALTHCHECK` (no shell or curl in the image): point the platform's probe at `GET /health`.
+
+Runtime environment, set when the container runs and never baked into the image (secrets from the platform's secret store):
+
+| Variable | Image default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | Listen port. Platforms that assign one (Cloud Run) set it. |
+| `POSTCMS_HOST` | `0.0.0.0` | Listen address. The server's own default is 127.0.0.1, which a published port cannot reach. |
+| `SITE_ROOT` | `/site` | Site directory holding `dist/`. |
+| `HOME` | `/tmp/post-cms` | Locates the model cache. |
+| `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_MAX_RAG_CHARS` | unset | `/api/ask` upstream. `LLM_API_KEY` is a secret. |
+| `RATE_LIMIT_PER_MIN`, `ASK_MAX_CONCURRENT` | unset (10, 4) | `/api/ask` limits. |
+| `IAP_AUDIENCE`, `IAP_JWKS_URL` | unset | Identity-Aware Proxy check for `/preview/`, in servers that have it: the backend service audience, and the key set URL (default Google's). Per deployment, so never in the image. |
+
+The image's stop signal is SIGTERM; the server exits 0 on it (see Serve, Stopping).
+
+### Checks
+
+`ci/container-check.sh` builds `git archive HEAD` of this repo twice (the demo site, and the site as a named build context), with canary secrets planted in both contexts (`config/master.key`, `.env`, `*.enc`, `*.pem`, and a `SANITY_READ_TOKEN` build secret). It fails when a canary appears in any layer, the history or the image config; when the image has a secret-like file name, a shell, the site sources or `build-site`; when the image user is root; or when the container, run with `--read-only --tmpfs /tmp --cap-drop ALL` and a non-default `PORT`, does not answer `/health` and `/`, runs a process as uid 0, or does not exit 0 within 10 s of SIGTERM. It removes the containers, images and temp files it creates. Run it in CI on any runner with Docker and BuildKit.
 
 ## Deploy + CDN purge
 
