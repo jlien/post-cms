@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 fn server() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_server"));
     c.env_remove("POSTCMS_HOST").env_remove("SITE_ROOT").env_remove("PORT");
+    c.env_remove("IAP_AUDIENCE").env_remove("IAP_JWKS_URL").env_remove("IAP_JWKS_ALLOW_HTTP");
     c
 }
 
@@ -487,4 +488,204 @@ fn upstream_error_status_and_body_stay_in_the_log() {
     // The upstream echoed the API key; the log has it redacted.
     assert!(line.contains("Bearer [redacted]"), "{line}");
     assert!(!log.contains(api_key), "API key in the log: {log}");
+}
+
+// ---- Draft preview behind IAP (E6), end to end ------------------------------
+
+mod iap_e2e {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const AUD: &str = "/projects/123456789/global/backendServices/987654321";
+
+    fn key() -> EcdsaKeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap()
+    }
+
+    fn jwks(kid: &str, k: &EcdsaKeyPair) -> String {
+        let p = k.public_key().as_ref();
+        serde_json::json!({"keys": [{
+            "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": kid,
+            "x": URL_SAFE_NO_PAD.encode(&p[1..33]), "y": URL_SAFE_NO_PAD.encode(&p[33..65]),
+        }]})
+        .to_string()
+    }
+
+    fn token(kid: &str, k: &EcdsaKeyPair) -> String {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let h = serde_json::json!({"alg": "ES256", "kid": kid});
+        let c = serde_json::json!({
+            "iss": "https://cloud.google.com/iap", "aud": AUD, "iat": now, "exp": now + 600,
+            "email": "reviewer@example.com",
+        });
+        let input = format!("{}.{}", URL_SAFE_NO_PAD.encode(h.to_string()), URL_SAFE_NO_PAD.encode(c.to_string()));
+        let sig = k.sign(&SystemRandom::new(), input.as_bytes()).unwrap();
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
+    }
+
+    /// A loopback HTTP server answering every request with `body`; counts
+    /// requests. Runs until the test process exits (a detached thread that
+    /// only ever touches its own listener).
+    fn jwks_server(body: String) -> (String, Arc<AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/jwk", l.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, hits)
+    }
+
+    fn preview_site(name: &str) -> tempfile::TempDir {
+        let site = temp_site(name);
+        let d = site.path().join("dist/preview/drafts");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("index.html"), "<p>secret draft</p>").unwrap();
+        site
+    }
+
+    fn get_with(addr: SocketAddr, path: &str, host: &str, assertion: Option<&str>) -> String {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        let extra = assertion.map(|t| format!("x-goog-iap-jwt-assertion: {t}\r\n")).unwrap_or_default();
+        write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    fn has_header(resp: &str, line: &str) -> bool {
+        resp.split("\r\n\r\n").next().unwrap_or("").lines().any(|l| l.eq_ignore_ascii_case(line))
+    }
+
+    #[test]
+    fn verified_token_from_a_local_jwks_serves_the_preview() {
+        let site = preview_site("iap-e2e");
+        let k = key();
+        let (url, hits) = jwks_server(jwks("k1", &k));
+        let mut cmd = server();
+        cmd.env("IAP_AUDIENCE", AUD).env("IAP_JWKS_URL", &url).env("IAP_JWKS_ALLOW_HTTP", "1");
+        let (_srv, addr, lines, _rest) = start_cmd(cmd, site.path());
+        assert!(lines.iter().any(|l| l.contains("verified IAP token")), "{lines:?}");
+
+        // No token: 404, private, noindex, and no draft content.
+        let r = get_with(addr, "/preview/drafts/", "preview.example.com", None);
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        assert!(has_header(&r, "cache-control: private, no-store"), "{r}");
+        assert!(has_header(&r, "x-robots-tag: noindex, nofollow"), "{r}");
+        assert!(!r.contains("secret draft"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no key fetch without a token");
+
+        // A fake assertion sent to the public host.
+        let r = get_with(addr, "/preview/drafts/", "www.example.com", Some("x.y.z"));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+
+        // A verified token: served, with the draft headers.
+        let t = token("k1", &k);
+        let r = get_with(addr, "/preview/drafts/", "preview.example.com", Some(&t));
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(has_header(&r, "cache-control: private, no-store"), "{r}");
+        assert!(has_header(&r, "x-robots-tag: noindex, nofollow"), "{r}");
+        assert!(r.contains("secret draft"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Public pages ignore the header either way and keep their caching.
+        let r = get_with(addr, "/", "www.example.com", Some("x.y.z"));
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(!has_header(&r, "cache-control: private, no-store"), "{r}");
+    }
+
+    /// Every /preview response carries the draft headers, including the
+    /// router's 405 for other methods; public paths are unchanged.
+    #[test]
+    fn other_methods_on_preview_keep_the_draft_headers() {
+        let site = preview_site("iap-methods");
+        let k = key();
+        let (url, _hits) = jwks_server(jwks("k1", &k));
+        let mut cmd = server();
+        cmd.env("IAP_AUDIENCE", AUD).env("IAP_JWKS_URL", &url).env("IAP_JWKS_ALLOW_HTTP", "1");
+        let (_srv, addr, _lines, _rest) = start_cmd(cmd, site.path());
+        let t = token("k1", &k);
+        for method in ["POST", "OPTIONS", "PUT", "DELETE"] {
+            for path in ["/preview/drafts/", "/preview"] {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+                write!(
+                    s,
+                    "{method} {path} HTTP/1.1\r\nHost: x\r\nx-goog-iap-jwt-assertion: {t}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut r = String::new();
+                s.read_to_string(&mut r).unwrap();
+                assert!(!r.starts_with("HTTP/1.1 2"), "{method} {path}: {r}");
+                assert!(has_header(&r, "cache-control: private, no-store"), "{method} {path}: {r}");
+                assert!(has_header(&r, "x-robots-tag: noindex, nofollow"), "{method} {path}: {r}");
+                assert!(!r.contains("secret draft"));
+            }
+        }
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "POST /about/ HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        assert!(!r.to_ascii_lowercase().contains("x-robots-tag"), "{r}");
+    }
+
+    #[test]
+    fn unset_audience_warns_once_and_serves_no_preview() {
+        let site = preview_site("iap-off");
+        let k = key();
+        let (_srv, addr, lines, _rest) = start_cmd(server(), site.path());
+        let warnings: Vec<_> = lines.iter().filter(|l| l.contains("IAP_AUDIENCE is unset")).collect();
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        let r = get_with(addr, "/preview/drafts/", "preview.example.com", Some(&token("k1", &k)));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        assert!(!r.contains("secret draft"));
+    }
+
+    #[test]
+    fn bad_iap_config_refuses_to_start() {
+        let site = preview_site("iap-bad");
+        for env in [
+            vec![("IAP_AUDIENCE", "my-backend")],
+            vec![("IAP_AUDIENCE", AUD), ("IAP_JWKS_URL", "http://127.0.0.1:9/jwk")],
+            vec![("IAP_AUDIENCE", AUD), ("IAP_JWKS_URL", "http://example.com/jwk"), ("IAP_JWKS_ALLOW_HTTP", "1")],
+        ] {
+            let mut cmd = server();
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd
+                .env("SITE_ROOT", site.path())
+                .env("PORT", "0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let code = wait_exit(&mut child);
+            let mut err = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+            assert_eq!(code, Some(1), "{env:?}: {err}");
+            assert!(err.contains("IAP_"), "{env:?}: {err}");
+            assert!(!err.contains("origin serving"), "{err}");
+        }
+    }
 }
