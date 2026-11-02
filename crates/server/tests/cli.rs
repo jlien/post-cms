@@ -700,7 +700,7 @@ mod iap_e2e {
     }
 
     /// Every way site.yaml can set Cache-Control (the `cache:` classes, a
-    /// `headers.default`, a `/preview/*` rule) changes public responses and
+    /// `/preview/*` rule) changes public responses and
     /// never a /preview response: served, refused (404) or 405.
     #[test]
     fn site_yaml_cache_rules_never_reach_preview() {
@@ -757,7 +757,8 @@ fn invalid_cache_values_refuse_to_start() {
     for (yaml, want) in [
         ("cache:\n  html: \"public, max-age=1d\"\n", "cache.html"),
         ("cache:\n  pages: no-store\n", "unknown key"),
-        ("headers:\n  default:\n    Cache-Control: \"public, private\"\n", "both public and private"),
+        ("headers:\n  rules:\n    - path: /a\n      headers:\n        Cache-Control: \"public, private\"\n", "both public and private"),
+        ("headers:\n  default:\n    Cache-Control: \"public, max-age=60\"\n", "not allowed here"),
     ] {
         let site = temp_site("cache-bad");
         std::fs::write(site.path().join("site.yaml"), yaml).unwrap();

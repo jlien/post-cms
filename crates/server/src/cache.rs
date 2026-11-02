@@ -227,7 +227,12 @@ pub fn validate(value: &str) -> Result<HeaderValue, String> {
             return Err(format!("Cache-Control {value:?} has an empty directive"));
         }
         let (name, arg) = match part.split_once('=') {
-            Some((n, a)) => (n.trim(), Some(a.trim())),
+            Some((n, a)) => {
+                if n != n.trim() || a != a.trim() {
+                    return Err(format!("Cache-Control {part:?}: no spaces around ="));
+                }
+                (n, Some(a))
+            }
             None => (part, None),
         };
         let lower = name.to_ascii_lowercase();
@@ -310,6 +315,8 @@ mod tests {
             ("cache:\n  html: \"public, max-age=99999999999\"\n", "whole number"),
             ("cache:\n  html: \"public, max-age\"\n", "needs a number"),
             ("cache:\n  html: \"public=1\"\n", "takes no value"),
+            ("cache:\n  html: \"public, max-age =60\"\n", "no spaces around ="),
+            ("cache:\n  html: \"public, max-age= 60\"\n", "no spaces around ="),
             ("cache:\n  html: \"public, maxage=60\"\n", "not a known"),
             ("cache:\n  html: \"public,, max-age=60\"\n", "empty directive"),
             ("cache:\n  html: \"public, private\"\n", "both public and private"),

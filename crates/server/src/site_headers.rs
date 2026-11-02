@@ -79,7 +79,17 @@ impl SiteHeaders {
         let mut out = SiteHeaders::default();
         for (k, val) in map {
             match k.as_str() {
-                Some("default") => out.default = header_map(val, "headers.default")?,
+                Some("default") => {
+                    out.default = header_map(val, "headers.default")?;
+                    // A default Cache-Control would override every class, 404s and
+                    // redirects included. Set it per class under `cache:`, or for
+                    // chosen paths in a rule.
+                    if out.default.iter().any(|(n, _)| n == "cache-control") {
+                        anyhow::bail!(
+                            "headers.default: Cache-Control is not allowed here (it would override 404s and redirects); set it per class under `cache:` or for chosen paths in headers.rules"
+                        );
+                    }
+                }
                 Some("rules") => {
                     let list = val
                         .as_sequence()
@@ -444,7 +454,9 @@ headers:
         assert!(parse(y).unwrap_err().to_string().contains("whole number"));
         let y = "headers:\n  default:\n    Cache-Control: \"public, s-max-age=60\"\n";
         assert!(parse(y).unwrap_err().to_string().contains("not a known"));
-        assert!(parse("headers:\n  default:\n    Cache-Control: \"public, max-age=60\"\n").is_ok());
+        let err = parse("headers:\n  default:\n    Cache-Control: \"public, max-age=60\"\n").unwrap_err().to_string();
+        assert!(err.contains("not allowed here"), "{err}");
+        assert!(parse("headers:\n  rules:\n    - path: /a\n      headers:\n        Cache-Control: \"public, max-age=60\"\n").is_ok());
     }
 
     #[test]
