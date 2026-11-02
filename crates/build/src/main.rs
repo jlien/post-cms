@@ -666,6 +666,11 @@ fn main() -> Result<()> {
     require_site_config(&root)?;
     // A bad POSTCMS_TAILWIND_TIMEOUT_SECS fails here, before dist/ is touched.
     let tailwind_timeout = tailwind::timeout_from_env()?;
+    // So does a bad POSTCMS_REQUIRE_TAILWIND.
+    let css = CssCompile {
+        timeout: tailwind_timeout,
+        require: opts.require_css_compiler || tailwind::require_from_env()?,
+    };
     // So does a bad POSTCMS_EMBED_BATCH.
     let embed_batch = embed_batch_from_env()?;
     // Held until exit: one build-site at a time per site, so two builds
@@ -690,7 +695,7 @@ fn main() -> Result<()> {
     }
     let templates_dir = root.join("templates");
     let mut tera = load_tera(&root, &theme_dir, &templates_dir)?;
-    let style = compile_theme_css(&root, &theme_dir, &theme_name, tailwind_timeout)?;
+    let style = compile_theme_css(&root, &theme_dir, &theme_name, css)?;
     let css_hash = sha256_hex(style.as_bytes());
     let styling = Styling {
         css: style,
@@ -843,7 +848,7 @@ fn main() -> Result<()> {
             let out = preview_dir.join(name);
             let mut ttera = load_tera(&root, &tdir, &templates_dir)?;
             postcms_build::images::register(&mut ttera, cfg.images.clone(), &cfg.base_url);
-            let tcss = compile_theme_css(&root, &tdir, name, tailwind_timeout)?;
+            let tcss = compile_theme_css(&root, &tdir, name, css)?;
             let tcss_hash = sha256_hex(tcss.as_bytes());
             let tstyle = Styling {
                 css: tcss,
@@ -1373,12 +1378,24 @@ fn private_temp_builder(prefix: &str) -> tempfile::Builder<'_, 'static> {
     b
 }
 
+/// How to compile the theme CSS.
+#[derive(Clone, Copy)]
+struct CssCompile {
+    /// Kill the CLI and fail the build after this long.
+    timeout: std::time::Duration,
+    /// Fail the build when the CLI is missing, exits non-zero or writes no
+    /// CSS (`--require-css-compiler` or `POSTCMS_REQUIRE_TAILWIND=1`),
+    /// instead of inlining the raw `theme.css`.
+    require: bool,
+}
+
 /// Compile the theme CSS with the Tailwind CLI (`@import "tailwindcss"` +
-/// @theme tokens + component layers). Falls back to inlining the raw CSS if
-/// the CLI is missing or fails, so a build never hard-fails on styling. The
-/// CLI runs with only the variables in [`tailwind::ENV_ALLOWLIST`]; one that
-/// runs past `timeout` is killed and fails the build.
-fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str, timeout: std::time::Duration) -> Result<String> {
+/// @theme tokens + component layers). By default, falls back to inlining the
+/// raw CSS if the CLI is missing or fails, so a build never hard-fails on
+/// styling; with `css.require` that is an error instead. The CLI runs with
+/// only the variables in [`tailwind::ENV_ALLOWLIST`]; one that runs past
+/// `css.timeout` is killed and fails the build.
+fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str, css: CssCompile) -> Result<String> {
     let input = theme_dir.join("theme.css");
     let raw = fs::read_to_string(&input)
         .with_context(|| format!("read {}", input.display()))?;
@@ -1391,39 +1408,41 @@ fn compile_theme_css(root: &Path, theme_dir: &Path, theme: &str, timeout: std::t
         .context("create a private temp directory for the compiled theme CSS")?;
     let output = scratch.path().join("theme.css");
     // v4 auto-detects template content from cwd
-    let res = tailwind::run(&input, &output, root, timeout)
+    let res = tailwind::run(&input, &output, root, css.timeout)
         .with_context(|| format!("theme {theme:?}: compile theme.css"))?;
-    match res {
+    let why = match res {
         tailwind::Run::Exited(st) if st.success() && output.exists() => {
             let compiled = fs::read_to_string(&output)
                 .with_context(|| format!("read {}", output.display()))?;
-            if compiled.trim().is_empty() {
-                eprintln!("warning: tailwindcss produced empty CSS; inlining raw theme.css");
-                return Ok(raw);
+            if !compiled.trim().is_empty() {
+                eprintln!(
+                    "theme {:?}: tailwindcss minified {} → {} bytes",
+                    theme,
+                    raw.len(),
+                    compiled.len()
+                );
+                return Ok(compiled);
             }
-            eprintln!(
-                "theme {:?}: tailwindcss minified {} → {} bytes",
-                theme,
-                raw.len(),
-                compiled.len()
-            );
-            Ok(compiled)
+            "tailwindcss produced empty CSS".to_string()
         }
-        _ => {
-            let why = match res {
-                tailwind::Run::Exited(st) => format!("exit {st}"),
-                tailwind::Run::NotStarted(e) => format!("{e}"),
-            };
-            eprintln!(
-                "warning: tailwindcss CLI unavailable ({why}); inlining raw theme.css"
-            );
-            Ok(raw)
-        }
+        tailwind::Run::Exited(st) if st.success() => "tailwindcss wrote no output file".to_string(),
+        tailwind::Run::Exited(st) => format!("tailwindcss CLI unavailable (exit {st})"),
+        tailwind::Run::NotStarted(e) => format!("tailwindcss CLI unavailable ({e})"),
+    };
+    if css.require {
+        bail!(
+            "theme {theme:?}: {why}, and a compiled theme CSS is required \
+             (--require-css-compiler or {}=1). Put an absolute path to \
+             tailwindcss on PATH (for example $PWD/node_modules/.bin).",
+            tailwind::REQUIRE_ENV
+        );
     }
+    eprintln!("warning: {why}; inlining raw theme.css");
+    Ok(raw)
 }
 
 const USAGE: &str = "\
-Usage: build-site [--force-clean]
+Usage: build-site [--force-clean] [--require-css-compiler]
 
 Renders the site at SITE_ROOT (else the current directory) into its dist/.
 The site root must contain site.yaml.
@@ -1432,6 +1451,11 @@ Options:
   --force-clean  Replace an existing dist/ that has no build marker
                  (dist/.post-cms-build), such as one written by an older
                  build-site. Use it once; later builds find the marker.
+  --require-css-compiler
+                 Fail when tailwindcss is missing, exits non-zero or
+                 writes no CSS. Without it (and without
+                 POSTCMS_REQUIRE_TAILWIND=1) the build warns and inlines
+                 the raw theme.css.
   --version      Print the engine and linked libwebp versions.
   -h, --help     Print this help.
 ";
@@ -1445,6 +1469,7 @@ const DIST_MARKER_BODY: &str = "Written by post-cms build-site. This directory i
 #[derive(Debug, Default, PartialEq)]
 struct BuildOpts {
     force_clean: bool,
+    require_css_compiler: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1463,6 +1488,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> std::result::Result<Ar
             "-h" | "--help" => return Ok(Args::Help),
             "--version" => return Ok(Args::Version),
             "--force-clean" => opts.force_clean = true,
+            "--require-css-compiler" => opts.require_css_compiler = true,
             _ if a.starts_with('-') => return Err(format!("unknown option {a:?}")),
             _ => return Err(format!("unexpected argument {a:?} (set SITE_ROOT to choose the site)")),
         }
@@ -4318,8 +4344,17 @@ mod tests {
     #[test]
     fn args_accept_only_known_flags() {
         let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
-        assert_eq!(args(&[]), Ok(Args::Build(BuildOpts { force_clean: false })));
-        assert_eq!(args(&["--force-clean"]), Ok(Args::Build(BuildOpts { force_clean: true })));
+        assert_eq!(args(&[]), Ok(Args::Build(BuildOpts::default())));
+        assert_eq!(args(&["--force-clean"]), Ok(Args::Build(BuildOpts { force_clean: true, ..Default::default() })));
+        assert_eq!(
+            args(&["--require-css-compiler"]),
+            Ok(Args::Build(BuildOpts { require_css_compiler: true, ..Default::default() }))
+        );
+        assert_eq!(
+            args(&["--require-css-compiler", "--force-clean"]),
+            Ok(Args::Build(BuildOpts { force_clean: true, require_css_compiler: true }))
+        );
+        assert!(args(&["--require-css-compiler=1"]).is_err());
         assert_eq!(args(&["-h"]), Ok(Args::Help));
         assert_eq!(args(&["--force-clean", "--help"]), Ok(Args::Help));
         assert_eq!(args(&["--version"]), Ok(Args::Version));
