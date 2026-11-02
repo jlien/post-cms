@@ -146,10 +146,19 @@ MAX_KID_LEN = 128
 
 
 def fetch_https(url: str, timeout: float = 10.0) -> bytes:
+    """GET an https URL, following no redirects (no scheme downgrade)."""
     from urllib import request as urlreq
 
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise IapError("jwks url must be https")
+
+    class _NoRedirect(urlreq.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urlreq.build_opener(_NoRedirect)
     req = urlreq.Request(url, headers={"Accept": "application/json"})
-    with urlreq.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - https only, checked at startup
+    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 - https checked above
         body = resp.read(MAX_JWKS_BYTES + 1)
     if len(body) > MAX_JWKS_BYTES:
         raise IapError("jwks too large")

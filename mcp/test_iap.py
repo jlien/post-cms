@@ -348,6 +348,11 @@ class JwksTest(unittest.TestCase):
         with self.assertRaises(iap.IapError):
             v.verify(token(key))
 
+    def test_fetch_refuses_non_https(self):
+        for url in ("http://127.0.0.1:1/jwks", "file:///etc/passwd", "ftp://x/y", ""):
+            with self.assertRaises(iap.IapError):
+                iap.fetch_https(url)
+
     def test_invalid_jwks_entries_skipped(self):
         key = Key("good")
         bad = {**Key("bad").jwk(), "y": Key("x").jwk()["y"]}   # off the curve
