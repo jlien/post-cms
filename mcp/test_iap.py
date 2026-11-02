@@ -710,6 +710,9 @@ class StartupTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
 
 
+REVIEWED_HEAD = "a" * 40
+
+
 class ApproverTest(unittest.TestCase):
     """The author/approver check, unchanged, on top of IAP identities."""
 
@@ -729,8 +732,9 @@ class ApproverTest(unittest.TestCase):
         srv._proposal_branch = lambda slug: f"agent/{slug}-1"
         srv._author_of = lambda branch: ("Alice", "Alice@Example.com")
 
-        def approve_one(slug, name, email, source):
+        def approve_one(slug, name, email, source, head=None):
             self.approved.append((slug, name, email, source))
+            assert head == REVIEWED_HEAD
             return {"slug": slug, "merged": True}
         srv._approve_one = approve_one
         os.environ["MCP_ALLOW_APPROVE"] = "1"
@@ -749,7 +753,8 @@ class ApproverTest(unittest.TestCase):
         ident = self.v.verify(token(self.key, claims(email=email)))
         tok = self.srv._HTTP_IDENTITY.set(ident)
         try:
-            return self.srv.tool_approve_proposal({"slug": "post", "deploy": False, **args})
+            return self.srv.tool_approve_proposal({"slug": "post", "deploy": False,
+                                                   "reviewed_head": REVIEWED_HEAD, **args})
         finally:
             self.srv._HTTP_IDENTITY.reset(tok)
 

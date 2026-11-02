@@ -364,6 +364,40 @@ commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
 python3 -m unittest discover -s mcp -p 'test_*.py'
 ```
 
+## MCP forge: GitHub or GitLab
+
+Proposals become pull requests (GitHub) or merge requests (GitLab). The
+propose, approve, reject, revert and queue tools reach the forge only
+through `mcp/forge.py`.
+
+| Variable | Meaning |
+|---|---|
+| `FORGE` | `github` (default) or `gitlab`. |
+| `GITLAB_URL` | Base URL, `https://` only (for example `https://gitlab.example.com`, or a path prefix for a self-managed install). No credentials, query or fragment. |
+| `GITLAB_PROJECT` | Numeric project id, or the project path (`group/project`, plain or url-encoded). |
+| `GITLAB_TOKEN` | Token with the `api` scope. Sent only in the `PRIVATE-TOKEN` header, never in a URL, log line or error. Maintainer role to merge into a protected branch. |
+| `GITLAB_ALLOW_HTTP_LOOPBACK` | Tests only: `1` allows `http://` for `127.0.0.1`, `localhost` or `::1`. |
+
+Both forges:
+
+- Every change the server opens or revises is recorded as branch, change id and the head commit the server pushed, in `changes.json` in the server state dir: `$PCMS_STATE_DIR` (an absolute path outside the repository, mode 0700, required over HTTP), default `.tenants/.state` (gitignored). Writes hold an `flock` on `changes.lock` and replace the file through an `O_EXCL|O_NOFOLLOW` temp file.
+- `approve_proposal` needs `reviewed_head` (or `reviewed_heads` `{slug: sha}` for a batch): the `head` that `list_proposals` and the propose and revise results show. It merges the recorded change id only, pinned to that head, and refuses when the head is missing, differs from the recorded head, or the change moved, was retargeted away from `main`, or was not opened or revised by this server. `list_proposals` also returns `forge_head` and `moved`. `merge=true` on a propose tool pins to the head that same call pushed.
+- `revise_proposal` only revises a change the server recorded, starting from the recorded head: if `origin/<branch>` has moved (someone else pushed), it refuses. Its push leases on the recorded head.
+- Changes from forks are refused everywhere (look up, merge, close, the queue, revert): a GitHub PR must have `isCrossRepository` false and its head repository and owner equal to the base repository; a GitLab MR must have source and target project equal to `GITLAB_PROJECT`. Branch lookups match the exact head ref.
+- `revert_proposal` takes the same gate as every merge (`MCP_ALLOW_APPROVE`). On GitLab, when merging is not allowed, the revert merge request still opens and is left for a person to merge.
+
+`FORGE=github` runs the `gh` CLI (approval identity from `gh api user`).
+`FORGE=gitlab` needs no CLI:
+
+- Proposals open a merge request into `main` that deletes its source branch on merge.
+- Approve merges through the merge endpoint. A pinned head goes in its `sha` parameter, so GitLab refuses the merge (409) when a commit landed after the check.
+- A project whose merge method is fast-forward (or semi-linear) only merges a branch that sits on `main`. A branch that is behind fails with a clear error; the server never rebases, because a rebase makes a new head that nobody approved.
+- Reject posts a `REJECTED:` note, closes the merge request and deletes the branch.
+- The commit list and every author and committer of a change come from the merge request commits API, all pages.
+- Revert opens a revert merge request: a new `revert/<branch>-<time>` branch from `main`, GitLab's commit revert endpoint applied there (the merge commit, or each commit newest first for fast-forward merges), then a merge pinned to the revert head. Nothing is pushed to `main` directly, so protected-branch rules, pipelines and approval rules apply to a revert too. If GitLab cannot merge it (for example a required pipeline), the tool fails and names the open revert merge request.
+- On stdio the approver identity is the token's user (`GET /user`); over HTTP it is the OAuth identity, as before. The email recorded in notes is the user's public email or GitLab's noreply form (`<id>-<username>@users.noreply.<host>`), never the private primary address.
+- Each read waits at most 20 seconds and each request at most 60 seconds overall; a response is capped at 4 MB, a paged read at 16 MB in total, JSON nesting at 64 levels. Proxy settings (`HTTP_PROXY` and similar) are ignored for the API, redirects are refused, and 401, 403, 404, 405, 406, 409 and 422 map to plain tool errors.
+
 ## MCP roles
 
 Every tool call is checked against the caller's role (`mcp/authz.py`). Roles
