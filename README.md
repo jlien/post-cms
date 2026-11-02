@@ -48,8 +48,8 @@ an AI agent do all content operations.
 ## Build
 
 ```bash
-cargo run -p build      # renders dist/
-cargo run -p build -- --version   # prints the engine and linked libwebp versions
+cargo run -p build --bin build-site      # renders dist/
+cargo run -p build --bin build-site -- --version   # prints the engine and linked libwebp versions
 SITE_ROOT=/path/to/site build-site
 ```
 
@@ -57,7 +57,7 @@ The site root is `SITE_ROOT`, else the current directory. Guards against buildin
 
 - The site root must contain `site.yaml`. Anything else (an unrelated repo, a home directory) exits non-zero before `dist/` is touched.
 - Every build writes `dist/.post-cms-build`. An existing `dist/` is deleted and recreated only when it has that marker. A `dist/` without it is refused with an error naming the directory, and a `dist` that is a symlink or a file is always refused. A missing or empty `dist/` is used as is.
-- A `dist/` from a build-site older than the marker is refused once: check it is build output, then run `build-site --force-clean` (or `cargo run -p build -- --force-clean`). Later builds find the marker. The engine does not guess from contents such as `sitemap.xml`, since other generators write those too.
+- A `dist/` from a build-site older than the marker is refused once: check it is build output, then run `build-site --force-clean` (or `cargo run -p build --bin build-site -- --force-clean`). Later builds find the marker. The engine does not guess from contents such as `sitemap.xml`, since other generators write those too.
 - One build at a time per site: build-site takes an advisory lock on the site root directory (released when it exits, even on a crash). A second build-site on the same site exits non-zero with `another build-site is already building <root>` before `dist/` is touched. Build a separate copy of the site to run builds in parallel; separate copies may share `IMAGES_CACHE_DIR`.
 - Unknown flags and arguments (`-V`, a path) are a usage error (exit 2) with nothing built or deleted. `--help` prints the usage and `--version` the versions, both without building. The server takes only `--host` and `--help` (`server --help` prints its usage and exits without listening), and the AVIF decode-only mode takes exactly its three numbers.
 
@@ -333,9 +333,10 @@ rights too. In order:
    are a second check on top. `origin/main` is fetched explicitly; if it is
    missing, or the ledger or author set is empty, the gate refuses.
    `approve_proposal` pins the merge to the head it checked
-   (`gh pr merge --match-head-commit`). `merge: true` is an approval of a
-   change the same session authors, so wherever this check applies it is
-   refused before anything is pushed.
+   (`gh pr merge --match-head-commit`) and posts the "Approved by" note only
+   after that merge succeeds. `merge: true` is an approval of a change the
+   same session authors: it is refused over HTTP, and on stdio it runs this
+   gate before anything is pushed.
 
 | Rule | Over HTTP | On stdio |
 | --- | --- | --- |
@@ -384,7 +385,23 @@ so it first refuses a branch that contains any symlink or changes anything
 outside `content/<collection>/<slug>/` (its preview runs the repository's
 build code). Slugs, collections and proposal IDs must match
 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, and every value in a preview command is
-shell-quoted. On stdio, proposals use the shared
+shell-quoted. `revise_proposal` resolves the branch to one commit, checks
+out exactly that commit, runs every check and the build against it, and
+pushes with `--force-with-lease` to it, so a branch moved mid-call fails the
+push instead of swapping the tree.
+
+**Builds run without the server's environment.** Every build the server
+runs (`cargo run -q -p build --bin build-site`, for validation, previews,
+`build_site` and `build_preview`) gets a cleared environment: only `PATH`,
+`LANG`, `LC_ALL`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`,
+`CARGO_BUILD_JOBS`, `CARGO_TARGET_DIR`, `SITE_BASE_URL`, `SITE_THEME`,
+`IMAGES_OFFLINE`, `IMAGES_CACHE_DIR` and `SANITY_OFFLINE` pass through, plus
+`SITE_ROOT`, `DRAFTS` and `SITE_PREVIEW_THEMES` where needed, and `HOME`
+points at a scratch dir. Tokens (including `SANITY_READ_TOKEN`) never reach
+these builds, so a template cannot read them; use `ci/deploy.sh` for builds
+that need CMS credentials. Build errors returned to a caller are stripped of
+control sequences, redacted of any server environment value, and cut to the
+last 15 lines. On stdio, proposals use the shared
 checkout or the tenant's worktree, serialized by a lock file in `.git/`
 (`pcms-root.lock`, `pcms-tenant-<name>.lock`), as do reverts, deploys and
 `create_draft`/`update_post` commits. A failed write fails the tool, and

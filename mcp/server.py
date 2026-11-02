@@ -31,7 +31,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT = ROOT / "content" / "posts"
-TEMPLATES_FOR_BUILD = "cargo run -p build"
 PROTOCOL_VERSION = "2024-11-05"
 
 TOOLS = [
@@ -90,7 +89,7 @@ TOOLS = [
     },
     {
         "name": "build_site",
-        "description": "Rebuild the static site (cargo run -p build); returns output tail.",
+        "description": "Rebuild the static site (cargo run -p build --bin build-site); returns output tail.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -570,10 +569,63 @@ def _reset_worktree(wt: Path, created: list[Path]) -> None:
     _git("checkout", "--detach", "origin/main", worktree=wt)
 
 
-def _build_env() -> dict[str, str]:
-    """Builds in throwaway worktrees share the repo's target dir."""
-    return {**os.environ,
-            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR") or str(ROOT / "target")}
+# Builds render templates and content, and the template engine can read the
+# process environment (get_env) and echo it into an error (throw). So every
+# build runs with a cleared environment plus this allowlist: no tokens, no
+# server secrets, HOME pointed at a scratch dir. Error output returned to a
+# caller is sanitized and truncated.
+BUILD_CMD = ["cargo", "run", "-q", "-p", "build", "--bin", "build-site"]
+BUILD_SHELL = "cargo run -q -p build --bin build-site"
+_BUILD_ENV_PASS = ("PATH", "LANG", "LC_ALL", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME",
+                   "RUSTUP_TOOLCHAIN", "CARGO_BUILD_JOBS", "CARGO_TARGET_DIR",
+                   "SITE_BASE_URL", "SITE_THEME", "IMAGES_OFFLINE", "IMAGES_CACHE_DIR",
+                   "SANITY_OFFLINE")
+_SCRATCH_HOME: Path | None = None
+
+
+def _scratch_home() -> str:
+    global _SCRATCH_HOME
+    if _SCRATCH_HOME is None or not _SCRATCH_HOME.is_dir():
+        _SCRATCH_HOME = Path(tempfile.mkdtemp(prefix="pcms-build-home-"))
+    return str(_SCRATCH_HOME)
+
+
+def _build_env(site: Path | None = None, **extra: str) -> dict[str, str]:
+    """A cleared environment for cargo builds: only _BUILD_ENV_PASS from the
+    server's environment, HOME at a scratch dir (with CARGO_HOME and
+    RUSTUP_HOME kept on the real toolchain), SITE_ROOT set explicitly."""
+    real_home = Path(os.environ.get("HOME") or str(Path.home()))
+    env = {k: os.environ[k] for k in _BUILD_ENV_PASS if os.environ.get(k)}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env.setdefault("CARGO_HOME", str(real_home / ".cargo"))
+    env.setdefault("RUSTUP_HOME", str(real_home / ".rustup"))
+    env.setdefault("CARGO_TARGET_DIR", str(ROOT / "target"))
+    env["HOME"] = _scratch_home()
+    if site is not None:
+        env["SITE_ROOT"] = str(site)
+    env.update(extra)
+    return env
+
+
+def _run_build(site: Path, **extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(BUILD_CMD, cwd=str(site), capture_output=True, text=True,
+                          env=_build_env(site, **extra), timeout=1200)
+
+
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]|\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _build_error_tail(res: subprocess.CompletedProcess, lines: int = 15,
+                      limit: int = 2000) -> str:
+    """Last lines of a failed build's output, safe to return to a caller:
+    control and escape sequences stripped, any value of the server's own
+    environment redacted, truncated."""
+    text = _CTRL_RE.sub("", (res.stderr or "") + (res.stdout or ""))
+    for k, v in os.environ.items():
+        if v and len(v) >= 8 and k not in ("PATH", "HOME", "PWD", "SHELL", "TMPDIR"):
+            text = text.replace(v, "[redacted]")
+    tail = "\n".join(text.strip().splitlines()[-lines:])
+    return tail[-limit:]
 
 
 def _open_pr(wt: Path, branch: str, title: str, pr_body: str, head: str | None = None):
@@ -619,20 +671,16 @@ def _render_preview_artifact(wt: Path, collection: str, slug: str) -> str | None
     draft banner, agent_notes), and the rendered HTML is copied to a stable
     path the agent attaches in the chat window. Returns the artifact path or
     None when the item did not render (never blocks the proposal)."""
-    build = subprocess.run(
-        ["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-        capture_output=True, text=True,
-        env={**os.environ, "DRAFTS": "1", "CARGO_TARGET_DIR": str(ROOT / "target")})
+    build = _run_build(wt, DRAFTS="1")
     if build.returncode != 0:
         return None
-    src = wt / "dist" / "preview" / "drafts" / collection / slug / "index.html"
-    if not src.exists():
+    try:
+        html = _wt_read(wt, f"dist/preview/drafts/{collection}/{slug}/index.html")
+    except ValueError:
         return None
-    out_dir = Path(tempfile.gettempdir()) / "pcms-artifacts"
-    out_dir.mkdir(exist_ok=True)
-    out = out_dir / f"{collection}-{slug}.html"
-    shutil.copyfile(src, out)
-    return str(out)
+    if html is None:
+        return None
+    return _save_artifact(f"{collection}-{slug}.html", html)
 
 
 # ---- throwaway worktrees: capped, swept ----------------------------------
@@ -894,10 +942,9 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
 
     try:
         # Validation: a real build compiles every template in templates/.
-        build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-                               capture_output=True, text=True, env=_build_env())
+        build = _run_build(wt)
         if build.returncode != 0:
-            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            tail = _build_error_tail(build)
             _reset_worktree(wt, [] if existed else [tpl_path])
             raise ValueError(f"template failed build validation:\n{tail}")
 
@@ -924,9 +971,9 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
         if ws.throwaway:
             preview_cmd = (f"cd {shlex.quote(str(ROOT))} && git fetch origin "
                            f"{shlex.quote(branch)} && git switch {shlex.quote(branch)} && "
-                           f"cargo run -q -p build && python3 -m http.server 8000 -d dist")
+                           f"cargo run -q -p build --bin build-site && python3 -m http.server 8000 -d dist")
         else:
-            preview_cmd = (f"cd {shlex.quote(str(wt))} && cargo run -q -p build && "
+            preview_cmd = (f"cd {shlex.quote(str(wt))} && cargo run -q -p build --bin build-site && "
                            f"python3 -m http.server 8000 -d dist{root_arg}")
         pr_body = (f"Agent-authored template by {author_name}.\n\n"
                    f"Use: set `item_template: {name}.html` (or index_template) in a "
@@ -954,18 +1001,19 @@ def _propose_template(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str,
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
             # Gate already passed up front; record the approval, merge.
-            comment = subprocess.run(
-                ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_template(merge=true) "
-                 f"[identity: {apn_src}]"],
-                cwd=str(wt), capture_output=True, text=True)
-            result["approval_recorded"] = comment.returncode == 0
-            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
-                                   cwd=str(wt), capture_output=True, text=True)
+            # Pinned to the commit made here; the approval note is posted
+            # only after that merge succeeded.
+            merge = _merge_pinned(branch, _git("rev-parse", "HEAD", worktree=wt).stdout.strip())
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                comment = subprocess.run(
+                    ["gh", "pr", "comment", branch, "--body",
+                     f"Approved by {apn} <{ape}> via propose_template(merge=true) "
+                     f"[identity: {apn_src}]"],
+                    cwd=str(wt), capture_output=True, text=True)
+                result["approval_recorded"] = comment.returncode == 0
                 _ledger_record_merge("propose_template", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_change does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
@@ -1101,12 +1149,9 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         # Validate with a real build BEFORE committing anything: a schema
         # violation or broken item fails here with the exact compiler error,
         # so a proposal never opens a PR it can't render.
-        build = subprocess.run(
-            ["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-            capture_output=True, text=True,
-            env={**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")})
+        build = _run_build(wt)
         if build.returncode != 0:
-            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            tail = _build_error_tail(build)
             raise ValueError(f"proposal failed build validation:\n{tail}")
 
         commit_env = {
@@ -1130,7 +1175,7 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         preview_cmd = (f"cd {shlex.quote(str(ROOT if ws.throwaway else wt))} && "
                        f"git fetch origin {shlex.quote(branch)} && "
                        f"git switch {shlex.quote(branch)} && "
-                       f"DRAFTS=1 cargo run -q -p build && "
+                       f"DRAFTS=1 cargo run -q -p build --bin build-site && "
                        f"python3 -m http.server 8000 -d dist")
         preview_url = f"http://localhost:8000/preview/drafts/{collection}/{slug}/"
         # Risk class: the queue uses this to batch copy edits and page a
@@ -1180,18 +1225,19 @@ def _propose_change(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
             # Gate already passed up front; record the approval, merge.
-            comment = subprocess.run(
-                ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_change(merge=true) "
-                 f"[identity: {apn_src}]"],
-                cwd=str(wt), capture_output=True, text=True)
-            result["approval_recorded"] = comment.returncode == 0
-            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
-                                   cwd=str(wt), capture_output=True, text=True)
+            # Pinned to the commit made here; the approval note is posted
+            # only after that merge succeeded.
+            merge = _merge_pinned(branch, _git("rev-parse", "HEAD", worktree=wt).stdout.strip())
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                comment = subprocess.run(
+                    ["gh", "pr", "comment", branch, "--body",
+                     f"Approved by {apn} <{ape}> via propose_change(merge=true) "
+                     f"[identity: {apn_src}]"],
+                    cwd=str(wt), capture_output=True, text=True)
+                result["approval_recorded"] = comment.returncode == 0
                 _ledger_record_merge("propose_change", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_template does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
@@ -1375,10 +1421,9 @@ def _propose_plugin(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
         # never reaches a PR. The build output doubles as the review artifact:
         # dist/index.html has the plugin injected at its declared mount, so
         # the reviewer sees exactly what a visitor's browser would run.
-        build = subprocess.run(["cargo", "run", "-q", "-p", "build"], cwd=str(wt),
-                               capture_output=True, text=True, env=_build_env())
+        build = _run_build(wt)
         if build.returncode != 0:
-            tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+            tail = _build_error_tail(build)
             raise ValueError(f"plugin failed build validation:\n{tail}")
         rendered_artifact = None
         if not remove:
@@ -1435,18 +1480,19 @@ def _propose_plugin(args: dict[str, Any], ws: _ProposalWorkspace) -> dict[str, A
             result["pr_error"] = pr_or_err
         if ok and args.get("merge"):
             # Gate already validated up-front; record the approval, merge.
-            comment = subprocess.run(
-                ["gh", "pr", "comment", branch, "--body",
-                 f"Approved by {apn} <{ape}> via propose_plugin(merge=true) "
-                 f"[identity: {apn_src}]"],
-                cwd=str(wt), capture_output=True, text=True)
-            result["approval_recorded"] = comment.returncode == 0
-            merge = subprocess.run(["gh", "pr", "merge", branch, "--merge", "--delete-branch"],
-                                   cwd=str(wt), capture_output=True, text=True)
+            # Pinned to the commit made here; the approval note is posted
+            # only after that merge succeeded.
+            merge = _merge_pinned(branch, _git("rev-parse", "HEAD", worktree=wt).stdout.strip())
             result["merged"] = merge.returncode == 0
             if merge.returncode != 0:
                 result["merge_error"] = merge.stderr.strip()[:300]
             else:
+                comment = subprocess.run(
+                    ["gh", "pr", "comment", branch, "--body",
+                     f"Approved by {apn} <{ape}> via propose_plugin(merge=true) "
+                     f"[identity: {apn_src}]"],
+                    cwd=str(wt), capture_output=True, text=True)
+                result["approval_recorded"] = comment.returncode == 0
                 _ledger_record_merge("propose_plugin", branch, branch, wt, apn_i)
                 result["deploy"] = ("skipped: propose_plugin does not deploy; "
                                     "use approve_proposal for build+deploy+purge")
@@ -1557,14 +1603,26 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
     # controlled by whoever can push the branch, so before anything runs
     # in it: no symlink anywhere in the tree, and the branch may change
     # nothing but this item (the preview below runs the repo's build code).
-    tmp = _add_work_worktree(
-        "revise", f"origin/{branch}",
-        ["+refs/heads/main:refs/remotes/origin/main",
-         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
+    # Resolve the branch and main ONCE: every check, the build and the push
+    # use these exact shas, so a concurrent fetch moving origin/<branch>
+    # cannot swap the tree after it was checked.
+    with _flock("repo"):
+        for spec in ("+refs/heads/main:refs/remotes/origin/main",
+                     f"+refs/heads/{branch}:refs/remotes/origin/{branch}"):
+            f = _git("fetch", "--quiet", "origin", spec)
+            if f.returncode != 0:
+                raise ValueError(f"git fetch failed: {f.stderr.strip()[:300]}")
+        head_sha = _git("rev-parse", "--verify", "--quiet", f"origin/{branch}^{{commit}}").stdout.strip()
+        main_sha = _git("rev-parse", "--verify", "--quiet", "origin/main^{commit}").stdout.strip()
+    if not _SHA_RE.fullmatch(head_sha) or not _SHA_RE.fullmatch(main_sha):
+        raise ValueError(f"cannot resolve {branch} or main")
+    tmp = _add_work_worktree("revise", head_sha, [])
     try:
-        _refuse_symlinks_in_tree(f"origin/{branch}")
+        if _git("rev-parse", "HEAD", worktree=tmp).stdout.strip() != head_sha:
+            raise ValueError("revise worktree is not at the checked commit")
+        _refuse_symlinks_in_tree(head_sha)
         item_rel = f"content/{collection}/{slug}"
-        _refuse_branch_outside(branch, [item_rel])
+        _refuse_branch_outside(branch, [item_rel], head=head_sha, base=main_sha)
         item_dir = tmp / item_rel
         if not _wt_is_dir(tmp, item_rel):
             raise ValueError(f"{collection}/{slug} not on {branch}")
@@ -1593,16 +1651,19 @@ def tool_revise_proposal(args: dict[str, Any]) -> dict[str, Any]:
             # Only the commit made here is recorded, never the branch head
             # it started from (which may hold commits made outside).
             _ledger_record_commit("revise_proposal", branch, tmp, before, author_i, own)
-        push = _git("push", "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
+        # Push only if the branch is still at the commit that was checked.
+        push = _git("push", f"--force-with-lease=refs/heads/{branch}:{head_sha}",
+                    "origin", f"HEAD:refs/heads/{branch}", worktree=tmp)
         if push.returncode != 0:
-            raise ValueError(f"git push failed: {push.stderr.strip()[:300]}")
+            raise ValueError(f"git push failed (the branch may have moved since it "
+                             f"was checked): {push.stderr.strip()[:300]}")
         return {"revised": True, "branch": branch,
                 "pr_url": _open_pr_for_branch(branch),
                 "preview_artifact": _artifact_payload(
                     _render_preview_artifact(tmp, collection, slug)),
                 "preview_command": (
                     f"cd {shlex.quote(str(ROOT))} && git fetch origin {shlex.quote(branch)} "
-                    f"&& git switch {shlex.quote(branch)} && DRAFTS=1 cargo run -q -p build "
+                    f"&& git switch {shlex.quote(branch)} && DRAFTS=1 cargo run -q -p build --bin build-site "
                     f"&& python3 -m http.server 8000 -d dist")}
     finally:
         _remove_work_worktree(tmp)
@@ -1635,9 +1696,12 @@ def tool_list_proposals(args: dict[str, Any]) -> dict[str, Any]:
             "slug": slug,
             "url": p.get("url"),
             "author": (p.get("author") or {}).get("name"),
-            "preview_command": f"cd {ROOT} && git fetch origin {head} && "
-                               f"git switch {head} && DRAFTS=1 cargo run -q -p build && "
-                               f"python3 -m http.server 8000 -d dist",
+            # Quoted: the branch name comes from the forge. Running it builds
+            # the branch's own code on the reviewer's machine.
+            "preview_command": f"cd {shlex.quote(str(ROOT))} && git fetch origin "
+                               f"{shlex.quote(head)} && git switch {shlex.quote(head)} && "
+                               f"DRAFTS=1 {BUILD_SHELL} && python3 -m http.server 8000 -d dist",
+            "preview_note": "the preview command builds and runs this branch's code",
         }
         body = str(p.get("body") or "")
         m = re.search(r"^risk:\s*(\S+)", body, re.MULTILINE)
@@ -2125,10 +2189,15 @@ def _branch_head_and_commits(branch: str, what: str
         _fetch_origin_main_locked()
         _git("fetch", "--quiet", "origin",
              f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
-    rev = _git("rev-parse", "--verify", "--quiet", f"origin/{branch}")
-    if rev.returncode != 0:
+        # Resolve both refs once, under the lock; everything after uses shas.
+        head = _git("rev-parse", "--verify", "--quiet",
+                    f"origin/{branch}^{{commit}}").stdout.strip()
+        main = _git("rev-parse", "--verify", "--quiet", "origin/main^{commit}").stdout.strip()
+    if not _SHA_RE.fullmatch(head):
         raise ValueError(f"{what}: branch {branch!r} not found on origin")
-    return rev.stdout.strip(), _commits(f"origin/main..origin/{branch}")
+    if not _SHA_RE.fullmatch(main):
+        raise ValueError(f"{what}: cannot resolve origin/main")
+    return head, _commits(f"{main}..{head}")
 
 
 def _merge_review(merge_sha: str, what: str) -> dict[str, Any]:
@@ -2219,6 +2288,11 @@ def _merge_now_gate(args: dict[str, Any], tool: str, author_i: dict[str, Any],
     session as the only actor. Called before any side effect: a refused
     merge leaves no pushed branch or open PR behind. Returns the approver's
     (name, email, identity source, identity)."""
+    if os.environ.get("PCMS_TRANSPORT") == "http":
+        raise ValueError(
+            f"{tool}(merge=true) is refused over HTTP: a proposal is approved "
+            "by a different approver with approve_proposal (merge=true is for "
+            "a local single user on stdio)")
     apn_i = _check_declared_identity(
         (args.get("approver_name") or "").strip(),
         (args.get("approver_email") or "").strip())
@@ -2268,16 +2342,17 @@ def _approve_one(slug: str, approver_name: str, approver_email: str,
     if pr_number is None:
         raise ValueError(f"no open PR on {branch} — nothing to approve")
     out: dict[str, Any] = {"slug": slug, "branch": branch, "pr": pr_number}
+    merge = _merge_pinned(pr_number, head)
+    if merge.returncode != 0:
+        raise ValueError(f"merge failed for {slug}: {merge.stderr.strip()[:300]}")
+    out["merged"] = True
+    # The approval note is posted only once the pinned merge succeeded.
     comment = subprocess.run(
         ["gh", "pr", "comment", str(pr_number), "--body",
          f"Approved by {approver_name} <{approver_email}> via approve_proposal "
          f"[identity: {identity_source}]"],
         cwd=str(ROOT), capture_output=True, text=True)
     out["approval_recorded"] = comment.returncode == 0
-    merge = _merge_pinned(pr_number, head)
-    if merge.returncode != 0:
-        raise ValueError(f"merge failed for {slug}: {merge.stderr.strip()[:300]}")
-    out["merged"] = True
     _ledger_record_merge("approve_proposal", branch, pr_number, ROOT,
                          ident if ident is not None else _gh_identity())
     return out
@@ -2415,11 +2490,13 @@ def _revert_on_shared_tree(merge_sha: str) -> None:
             raise ValueError(f"push of revert failed: {push.stderr.strip()[:300]}")
 
 
-def _refuse_branch_outside(branch: str, roots: list[str]) -> None:
-    """Refuse a proposal branch that changes anything outside `roots` since
-    its merge base with origin/main (renames count as both sides)."""
+def _refuse_branch_outside(branch: str, roots: list[str], *, head: str,
+                           base: str) -> None:
+    """Refuse a proposal branch whose commit `head` changes anything outside
+    `roots` since its merge base with `base` (renames count as both sides).
+    Both are shas resolved once by the caller, never re-read refs."""
     diff = _git("-c", "diff.relative=false", "diff", "--no-renames", "--no-ext-diff",
-                "--name-only", "-z", f"origin/main...origin/{branch}")
+                "--name-only", "-z", f"{base}...{head}")
     if diff.returncode != 0:
         raise ValueError(f"cannot diff {branch}: {diff.stderr.strip()[:200]}")
     roots = [r.rstrip("/") for r in roots]
@@ -2630,26 +2707,25 @@ def tool_update_post(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_build_site(_args: dict[str, Any]) -> dict[str, Any]:
-    res = subprocess.run(TEMPLATES_FOR_BUILD, shell=True, cwd=ROOT,
-                         capture_output=True, text=True, timeout=600)
-    output = (res.stdout + res.stderr)[-2000:]
+    res = _run_build(ROOT)
     if res.returncode != 0:
-        raise RuntimeError(f"build failed (exit {res.returncode}): {output[-500:]}")
-    return {"ok": True, "tail": output.strip().splitlines()[-5:]}
+        raise RuntimeError(f"build failed (exit {res.returncode}): "
+                           f"{_build_error_tail(res, lines=8, limit=500)}")
+    return {"ok": True, "tail": _build_error_tail(res, lines=5).splitlines()}
 
 
 def tool_build_preview(args: dict[str, Any]) -> dict[str, Any]:
     """Build every theme (or a comma list) under /preview/<theme>/ without
     changing the live site. `themes`: 'all' or e.g. 'astra,neve'."""
     spec = str(args.get("themes", "all"))
-    env = {**os.environ, "SITE_PREVIEW_THEMES": spec}
-    res = subprocess.run(TEMPLATES_FOR_BUILD, shell=True, cwd=ROOT,
-                         capture_output=True, text=True, timeout=600, env=env)
-    output = (res.stdout + res.stderr)[-2000:]
+    if not re.fullmatch(r"[A-Za-z0-9_,-]{1,200}", spec):
+        raise ValueError("themes must be 'all' or a comma list of theme names")
+    res = _run_build(ROOT, SITE_PREVIEW_THEMES=spec)
     if res.returncode != 0:
-        raise RuntimeError(f"preview build failed (exit {res.returncode}): {output[-500:]}")
+        raise RuntimeError(f"preview build failed (exit {res.returncode}): "
+                           f"{_build_error_tail(res, lines=8, limit=500)}")
     return {"ok": True, "urls": ["/preview/<theme>/", "/preview/"],
-            "tail": output.strip().splitlines()[-5:]}
+            "tail": _build_error_tail(res, lines=5).splitlines()}
 
 
 def tool_publish_status(_args: dict[str, Any]) -> dict[str, Any]:
