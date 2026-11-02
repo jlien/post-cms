@@ -115,16 +115,19 @@ TOOLS = [
         "description": (
             "Upload a binary file (image/video/audio/pdf) to the media bucket at "
             "upload-time with resized variants for images; returns markdown/HTML "
-            "snippets to embed in a post. Binaries never go in git."
+            "snippets to embed in a post. Binaries never go in git. Send the "
+            "file as content_base64; the type is read from its content."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Post slug to namespace media under."},
-                "file_path": {"type": "string", "description": "Local path of the file to upload."},
+                "content_base64": {"type": "string", "description": "The file, base64 (size cap MCP_MEDIA_MAX_BYTES, default 25 MiB)."},
+                "filename": {"type": "string", "description": "Name for the uploaded file; only its stem is used."},
+                "file_path": {"type": "string", "description": "stdio only: a file inside the uploads dir (MCP_UPLOADS_DIR, default uploads/), no symlinks."},
                 "alt": {"type": "string", "description": "Alt text / link label."},
             },
-            "required": ["slug", "file_path"],
+            "required": ["slug"],
         },
     },
     {
@@ -1895,11 +1898,27 @@ def tool_publish_status(_args: dict[str, Any]) -> dict[str, Any]:
 def tool_add_media(args: dict[str, Any]) -> dict[str, Any]:
     import media as media_mod
 
-    if not _post_dir(args["slug"]).is_dir():
-        raise ValueError(f"post not found: {args['slug']} (create the draft first)")
-    return media_mod.add_media(
-        args["slug"], args["file_path"], args.get("alt", "")
-    )
+    slug = args.get("slug")
+    if not isinstance(slug, str) or not _slug_ok(slug):
+        raise ValueError(f"invalid slug: {slug!r}")
+    if not _post_dir(slug).is_dir():
+        raise ValueError(f"post not found: {slug} (create the draft first)")
+    alt = args.get("alt", "")
+    alt = alt if isinstance(alt, str) else ""
+    if ("content_base64" in args) == ("file_path" in args):
+        raise ValueError("pass exactly one of content_base64 or file_path")
+    if "file_path" in args:
+        # A server path names the server's disk: stdio only, and only
+        # inside the uploads dir.
+        if _caller_role()[1]:
+            raise ValueError("file_path is not accepted over HTTP; send the "
+                             "file as content_base64")
+        data = media_mod.read_confined(args["file_path"], media_mod.uploads_dir(ROOT))
+        name = args["file_path"]
+    else:
+        data = media_mod.decode_upload(args["content_base64"])
+        name = args.get("filename") or "upload"
+    return media_mod.add_media_bytes(slug, data, name, alt)
 
 
 def tool_set_theme(args: dict[str, Any]) -> dict[str, Any]:
@@ -1975,16 +1994,26 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": "2.0", "id": req_id, "result": {
             "tools": authz.visible_tools(TOOLS, role, http=http)}}
     if method == "tools/call":
-        params = req.get("params", {})
+        params = req.get("params")
+        params = {} if params is None else params
+        if not isinstance(params, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "params must be an object"}}
         name = params.get("name")
-        args = params.get("arguments", {})
+        args = params.get("arguments")
+        args = {} if args is None else args
+        if not isinstance(name, str):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "tool name must be a string"}}
+        if not isinstance(args, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32602, "message": "arguments must be an object"}}
         handler = HANDLERS.get(name)
         if handler is None:
             return {"jsonrpc": "2.0", "id": req_id, "error": {
                 "code": -32601, "message": f"unknown tool: {name}"}}
         role, http = _caller_role()
-        refusal = authz.allowed(role, name, http=http,
-                                args=args if isinstance(args, dict) else None)
+        refusal = authz.allowed(role, name, http=http, args=args)
         if refusal is not None:
             return {"jsonrpc": "2.0", "id": req_id, "result": {
                 "content": [{"type": "text", "text": f"forbidden: {refusal}"}],

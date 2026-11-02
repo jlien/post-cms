@@ -21,6 +21,7 @@ import hmac
 import http.client
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import urllib.parse
@@ -280,3 +281,131 @@ def add_media(slug: str, file_path: str, alt: str = "") -> dict[str, Any]:
         result["html"] = result["markdown"]
 
     return result
+
+
+# ------------------------------------------------------- upload input checks
+#
+# add_media never trusts a caller-supplied extension or a server path:
+#   * the file type comes from magic bytes (sniff_ext); SVG and anything
+#     without a known signature is refused (SVG can carry script);
+#   * over HTTP the bytes arrive in the call (decode_upload), capped;
+#   * on stdio a file_path is read only from inside the uploads dir
+#     (MCP_UPLOADS_DIR, default <repo>/uploads), never through a symlink.
+
+DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def max_upload_bytes() -> int:
+    raw = os.environ.get("MCP_MEDIA_MAX_BYTES", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_MAX_UPLOAD_BYTES
+
+
+def sniff_ext(data: bytes) -> str | None:
+    """File extension from the leading bytes, or None when unrecognized."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return ".wav"
+    if data.startswith(b"%PDF-"):
+        return ".pdf"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    if data[4:8] == b"ftyp" and len(data) >= 12:
+        brand = data[8:12]
+        if brand == b"qt  ":
+            return ".mov"
+        if brand in (b"M4A ", b"M4B "):
+            return ".m4a"
+        return ".mp4"
+    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF
+                                   and data[1] & 0xE0 == 0xE0):
+        return ".mp3"
+    return None
+
+
+def safe_stem(name: Any) -> str:
+    stem = Path(name).stem if isinstance(name, str) else ""
+    stem = "".join(c if (c.isascii() and (c.isalnum() or c in "-_")) else "-"
+                   for c in stem)[:64].strip("-_")
+    return stem or "upload"
+
+
+def decode_upload(content_base64: Any) -> bytes:
+    """Strict base64 to bytes, refusing anything over the size cap before
+    decoding it."""
+    import base64
+    import binascii
+
+    if not isinstance(content_base64, str) or not content_base64:
+        raise ValueError("content_base64 must be a non-empty base64 string")
+    cap = max_upload_bytes()
+    if len(content_base64) > 4 * ((cap + 2) // 3):
+        raise ValueError(f"upload is over the {cap}-byte limit (MCP_MEDIA_MAX_BYTES)")
+    try:
+        data = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("content_base64 is not valid base64") from None
+    if not data:
+        raise ValueError("upload is empty")
+    if len(data) > cap:
+        raise ValueError(f"upload is over the {cap}-byte limit (MCP_MEDIA_MAX_BYTES)")
+    return data
+
+
+def uploads_dir(repo_root: Path) -> Path:
+    raw = os.environ.get("MCP_UPLOADS_DIR", "").strip()
+    return Path(raw) if raw else repo_root / "uploads"
+
+
+def read_confined(file_path: Any, root_dir: Path) -> bytes:
+    """Bytes of a regular file inside root_dir. Refuses paths outside it,
+    any symlink on the way (realpath must equal the plain absolute path),
+    and files over the size cap."""
+    if not isinstance(file_path, str) or not file_path:
+        raise ValueError("file_path must be a non-empty string")
+    root = os.path.realpath(root_dir)
+    if not os.path.isdir(root):
+        raise ValueError(f"uploads dir not found: {root_dir} (set MCP_UPLOADS_DIR)")
+    path = os.path.abspath(file_path if os.path.isabs(file_path)
+                           else os.path.join(root, file_path))
+    if path == root or os.path.commonpath([root, path]) != root:
+        raise ValueError(f"file_path must be inside the uploads dir {root}")
+    if os.path.realpath(path) != path:
+        raise ValueError("file_path may not be or pass through a symlink")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise ValueError(f"cannot open {file_path!r}: {exc.strerror}") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError("file_path is not a regular file")
+    with os.fdopen(fd, "rb") as fh:
+        cap = max_upload_bytes()
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"file is over the {cap}-byte limit (MCP_MEDIA_MAX_BYTES)")
+    if not data:
+        raise ValueError("file is empty")
+    return data
+
+
+def add_media_bytes(slug: str, data: bytes, name: Any, alt: str = "") -> dict[str, Any]:
+    """Type-check bytes by magic and upload them through add_media from a
+    private temp copy named <safe stem><sniffed extension>."""
+    ext = sniff_ext(data)
+    if ext is None:
+        raise ValueError("unsupported media type: the content is not a recognized "
+                         "image, video, audio or PDF file (checked by content, not name)")
+    with tempfile.TemporaryDirectory(prefix="postcms-upload-") as tmp:
+        path = Path(tmp) / f"{safe_stem(name)}{ext}"
+        path.write_bytes(data)
+        return add_media(slug, str(path), alt)

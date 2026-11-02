@@ -64,8 +64,9 @@ CONFIG = {
         {"email": "arno@example.com", "role": "author"},
         {"email": "pia@example.com", "role": "approver"},
         {"email": "ada@example.com", "role": "admin"},
-        {"github": "Octo-Reader", "role": "reader"},
-        {"github": "octo-admin", "role": "admin"},
+        {"id": "github:1001", "email": "octo.reader@example.com", "role": "reader"},
+        {"id": "github:1002", "role": "admin"},
+        {"id": "https://issuer.example.com|sub-7", "role": "approver"},
     ],
 }
 
@@ -156,6 +157,21 @@ class ToolRoleMapTest(_Env):
         self.assertTrue(_forbidden(_call("propose_change", {"merge": True})))
 
 
+class DispatchInputTest(_Env):
+    def test_non_object_arguments_are_rejected_before_any_check(self):
+        self.as_http({"login": "x", "role": "admin"})
+        for args in ([1], "merge", 3, True):
+            with self.subTest(args=args):
+                r = srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                        "params": {"name": "propose_change", "arguments": args}})
+                self.assertEqual(r["error"]["code"], -32602)
+
+    def test_missing_arguments_mean_empty(self):
+        r = srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                "params": {"name": "list_posts", "arguments": None}})
+        self.assertFalse(r["result"]["isError"])
+
+
 class DirectCommitTest(_Env):
     def test_direct_commit_off_over_http_even_for_admin(self):
         self.as_http({"login": "x", "role": "admin"})
@@ -220,15 +236,36 @@ class IdentityTest(_Env):
         os.environ["PCMS_TRANSPORT"] = "http"
         self.assertTrue(_forbidden(_call("list_posts")))
 
-    def test_github_matches_login_not_email(self):
-        gh = {"login": "octo-reader", "kind": "github", "email": "ada@example.com"}
+    def test_github_matches_numeric_id_not_login_or_email(self):
+        gh = {"id": "github:1001", "login": "renamed", "kind": "github"}
         self.assertEqual(authz.role_for(gh, self.cfg), "reader")
-        gh = {"login": "someone", "kind": "github", "email": "ada@example.com"}
+        # A re-registered login or a listed email on another account: nothing.
+        gh = {"id": "github:9999", "login": "octo-admin", "kind": "github",
+              "email": "ada@example.com", "email_verified": True}
         self.assertIsNone(authz.role_for(gh, self.cfg))
 
-    def test_oidc_does_not_match_github_entries(self):
-        ident = {**_oidc("x@example.com"), "login": "octo-admin"}
+    def test_oidc_matches_iss_sub_id(self):
+        ident = {**_oidc("someone@example.org", verified=False),
+                 "id": "https://issuer.example.com|sub-7"}
+        self.assertEqual(authz.role_for(ident, self.cfg), "approver")
+        ident["id"] = "https://other.example.com|sub-7"
         self.assertIsNone(authz.role_for(ident, self.cfg))
+
+    def test_email_on_an_id_entry_is_display_only(self):
+        self.assertIsNone(authz.role_for(_oidc("octo.reader@example.com"), self.cfg))
+
+    def test_unicode_lookalike_email_is_refused(self):
+        # U+212A KELVIN SIGN lowercases to "k".
+        self.assertIsNone(authz.role_for(_oidc("\u212ada@example.com"), {
+            **self.cfg, "email": {"kda@example.com": "admin"}}))
+        self.assertIsNone(authz.role_for(_oidc("ad\u0430@example.com"), self.cfg))
+        self.assertIsNone(authz.role_for(_oidc("ada@ex\u0430mple.com"), self.cfg))
+        with self.assertRaises(authz.ConfigError):
+            authz.parse_config({"allowed_domains": ["example.com"], "users": [
+                {"email": "\u212ate@example.com", "role": "admin"}]}, require_domains=True)
+        with self.assertRaises(authz.ConfigError):
+            authz.parse_config({"allowed_domains": ["ex\u0430mple.com"], "users": []},
+                               require_domains=True)
 
     def test_invalid_configs(self):
         bad = [
@@ -237,9 +274,21 @@ class IdentityTest(_Env):
             {"allowed_domains": ["example.com"], "users": [{"email": "a@example.com"}]},
             {"allowed_domains": ["example.com"], "users": [{"email": "a@example.com", "role": "root"}]},
             {"allowed_domains": ["example.com"],
-             "users": [{"email": "a@example.com", "github": "a", "role": "reader"}]},
+             "users": [{"github": "a", "role": "reader"}]},
             {"allowed_domains": ["example.com"],
-             "users": [{"github": "a", "role": "reader"}, {"github": "A", "role": "admin"}]},
+             "users": [{"id": "github:1", "role": "reader"}, {"id": "github:1", "role": "admin"}]},
+            {"allowed_domains": ["example.com"],
+             "users": [{"email": "a@example.com", "role": "reader"},
+                       {"email": "A@example.com", "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"id": "github:octo", "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"id": "github:01", "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"id": "no-separator", "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"id": 5, "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"email": "a@example.com", "role": ["admin"]}]},
+            {"allowed_domains": ["example.com"], "users": [{"email": "a@example.com", "role": {"a": 1}}]},
+            {"allowed_domains": ["example.com"], "users": [{"email": ["a@example.com"], "role": "admin"}]},
+            {"allowed_domains": ["example.com"], "users": [{"email": "a b@example.com", "role": "admin"}]},
             {"allowed_domains": "example.com", "users": []},
         ]
         for data in bad:
@@ -275,12 +324,34 @@ class StartupTest(_Env):
             self._startup()
 
     def test_http_with_no_domain_list_refuses_to_start(self):
-        os.environ["MCP_ROLES_FILE"] = self._write({"users": [{"github": "a", "role": "admin"}]})
+        os.environ["MCP_ROLES_FILE"] = self._write({"users": [{"id": "github:1", "role": "admin"}]})
         with self.assertRaises(SystemExit):
             self._startup("github")
 
     def test_http_with_invalid_json_refuses_to_start(self):
         os.environ["MCP_ROLES_FILE"] = self._write("{not json")
+        with self.assertRaises(SystemExit):
+            self._startup()
+
+    def test_duplicate_json_keys_refuse_to_start(self):
+        os.environ["MCP_ROLES_FILE"] = self._write(
+            '{"allowed_domains": ["example.com"], "users": ['
+            '{"email": "a@example.com", "role": "reader", "role": "admin"}]}')
+        with self.assertRaises(SystemExit):
+            self._startup()
+        with self.assertRaises(authz.ConfigError):
+            authz.load_config(Path(os.environ["MCP_ROLES_FILE"]))
+
+    def test_world_writable_roles_file_refuses_to_start(self):
+        os.environ["MCP_ROLES_FILE"] = self._write(CONFIG)
+        os.chmod(os.environ["MCP_ROLES_FILE"], 0o666)
+        with self.assertRaises(SystemExit):
+            self._startup()
+        os.chmod(os.environ["MCP_ROLES_FILE"], 0o644)
+        self._startup()
+
+    def test_non_file_roles_path_refuses_to_start(self):
+        os.environ["MCP_ROLES_FILE"] = str(Path(self._write(CONFIG)).parent)
         with self.assertRaises(SystemExit):
             self._startup()
 
@@ -316,14 +387,16 @@ class HttpEndToEndTest(_Env):
             p = mock.patch.object(target, value, cfg if value == "ROLES_CFG" else "github")
             p.start()
             self.addCleanup(p.stop)
-        users = {"tok-admin": "octo-admin", "tok-reader": "Octo-Reader",
-                 "tok-stranger": "any-account-in-the-world"}
+        # The stranger holds the admin's old login on a different account.
+        users = {"tok-admin": ("octo-admin", 1002), "tok-reader": ("Octo-Reader", 1001),
+                 "tok-stranger": ("octo-admin", 424242)}
 
         def fake_github(url: str, token: str | None = None) -> dict:
             self.assertEqual(url, "https://api.github.com/user")
             if token not in users:
                 raise hs.AuthError("bad token")
-            return {"login": users[token], "name": "", "email": "ada@example.com"}
+            login, uid = users[token]
+            return {"login": login, "id": uid, "name": "", "email": "ada@example.com"}
         p = mock.patch.object(hs, "_http_json", fake_github)
         p.start()
         self.addCleanup(p.stop)
@@ -359,9 +432,25 @@ class HttpEndToEndTest(_Env):
         self.assertEqual(code, 403)
 
     def test_github_profile_email_grants_nothing(self):
-        # The stranger's profile email is an admin's address; login decides.
+        # Same login and profile email as an admin; the numeric id decides.
         code, _ = self.tool("tok-stranger", "build_site")
         self.assertEqual(code, 403)
+
+    def test_github_token_without_numeric_id_is_401(self):
+        with mock.patch.object(hs, "_http_json",
+                               lambda u, t=None: {"login": "octo-admin", "id": "1002"}):
+            code, _ = self.tool("tok-other", "list_posts")
+        self.assertEqual(code, 401)
+
+    def test_non_string_tool_name_gets_a_json_rpc_error(self):
+        for params in ({"name": 5}, {"name": ["list_posts"]}, {"name": None},
+                       {"name": "list_posts", "arguments": [1]},
+                       {"name": "list_posts", "arguments": "x"}, ["list_posts"]):
+            with self.subTest(params=params):
+                code, body = self.post("tok-admin", {"jsonrpc": "2.0", "id": 7,
+                                                     "method": "tools/call", "params": params})
+                self.assertEqual(code, 200)
+                self.assertEqual(body["error"]["code"], -32602)
 
     def test_bad_token_is_401(self):
         code, _ = self.tool("nope", "list_posts")

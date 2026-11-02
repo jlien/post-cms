@@ -18,8 +18,10 @@ still disables merging on the server as a whole.
 
 Authorization (mcp/authz.py): every validated identity must have a role in
 the roles file (MCP_ROLES_FILE, default mcp/roles.json): reader, author,
-approver or admin. GitHub identities match by login, OIDC identities by
-verified email on an allowed domain. No role means 403. The server refuses
+approver or admin. Identities match by stable id ("github:<numeric id>",
+"<iss>|<sub>"); OIDC identities may also match an email-only entry by
+verified ASCII email on an allowed domain. The file is read once at startup:
+restart to apply a change. No role means 403. The server refuses
 to start without a valid roles file with a non-empty allowed_domains list.
 
 Endpoints:
@@ -102,7 +104,12 @@ def _identity_github(token: str) -> dict:
     login = u.get("login") or ""
     if not login:
         raise AuthError("github token introspection returned no login")
+    uid = u.get("id")
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+        raise AuthError("github token introspection returned no numeric id")
     return {
+        # Stable actor id: logins can be renamed and re-registered.
+        "id": f"github:{uid}",
         "login": login,
         "name": u.get("name") or "",
         "email": u.get("email") or "",
@@ -129,7 +136,12 @@ def _identity_oidc(token: str) -> dict:
     login = claims.get("preferred_username") or claims.get("sub") or ""
     if not login:
         raise AuthError("token has no principal (preferred_username/sub)")
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise AuthError("token has no sub claim")
     return {
+        # Stable actor id: issuer plus subject, never the display username.
+        "id": f"{OAUTH_ISSUER}|{sub}",
         "login": login,
         "name": claims.get("name") or "",
         "email": claims.get("email") or "",

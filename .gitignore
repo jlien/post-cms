@@ -6,6 +6,7 @@ ci/purge.log
 .minio-data/
 mcp/__pycache__/
 mcp/roles.json
+/uploads/
 
 # multi-tenant simulation worktrees
 .tenants/

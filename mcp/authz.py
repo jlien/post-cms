@@ -12,13 +12,19 @@ Roles come from a JSON file (MCP_ROLES_FILE, default mcp/roles.json):
     {
       "allowed_domains": ["example.com"],
       "users": [
-        {"email": "alice@example.com", "role": "admin"},
-        {"github": "octocat", "role": "author"}
+        {"id": "https://issuer.example.com|0f3c9a", "email": "alice@example.com", "role": "admin"},
+        {"id": "github:583231", "email": "octocat@example.com", "role": "author"},
+        {"email": "bob@example.com", "role": "reader"}
       ]
     }
 
-Identities match by verified email (OIDC, and identity-aware proxies later)
-or by forge login (GitHub). Anything else has no role and is refused.
+Prefer "id": the stable actor id, "<iss>|<sub>" for OIDC and identity-aware
+proxies, "github:<numeric user id>" for GitHub. Logins and emails can be
+renamed and re-registered; ids cannot. On an id entry "email" is display
+only. An email-only entry matches an OIDC/IAP identity whose email is
+verified, ASCII, on allowed_domains and equal to it (ASCII case-insensitive).
+Anything else has no role and is refused. The file is read once at startup;
+restart the server to apply a change.
 
 Transports:
   * HTTP (mcp/http_server.py): the roles file is required and its
@@ -32,6 +38,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -85,18 +93,47 @@ def _domain(email: str) -> str:
     return email.rpartition("@")[2].lower() if "@" in email else ""
 
 
+_GITHUB_ID = re.compile(r"github:[1-9][0-9]{0,19}")
+_PRINTABLE_ASCII = re.compile(r"[\x21-\x7e]+")
+
+
+def ascii_email(value: Any) -> str | None:
+    """Lowercased email when it is plain printable ASCII with one @ and a
+    non-empty local part and domain; None otherwise. Non-ASCII addresses
+    are refused outright so Unicode lookalikes (a KELVIN SIGN for K) can
+    never case-map onto a listed address."""
+    if not isinstance(value, str) or not value or not value.isascii():
+        return None
+    if not _PRINTABLE_ASCII.fullmatch(value) or value.count("@") != 1:
+        return None
+    local, _, domain = value.partition("@")
+    if not local or not domain or "." not in domain:
+        return None
+    return value.lower()
+
+
+def _valid_id(value: Any) -> bool:
+    if not isinstance(value, str) or not _PRINTABLE_ASCII.fullmatch(value):
+        return False
+    if value.startswith("github:"):
+        return bool(_GITHUB_ID.fullmatch(value))
+    iss, sep, sub = value.rpartition("|")
+    return bool(sep and iss and sub)
+
+
 def parse_config(data: Any, *, require_domains: bool) -> dict[str, Any]:
-    """Validate a decoded roles file. Unknown keys, unknown roles, duplicate
-    identities and emails outside allowed_domains are errors: a typo must
-    never widen access."""
+    """Validate a decoded roles file. Unknown keys, unknown or non-string
+    roles, malformed ids, non-ASCII emails, duplicate identities and emails
+    outside allowed_domains are errors: a typo must never widen access."""
     if not isinstance(data, dict):
         raise ConfigError("roles file must be a JSON object")
     extra = set(data) - {"allowed_domains", "users"}
     if extra:
         raise ConfigError(f"unknown keys in roles file: {sorted(extra)}")
     domains = data.get("allowed_domains", [])
-    if not isinstance(domains, list) or not all(isinstance(d, str) and d.strip() for d in domains):
-        raise ConfigError("allowed_domains must be a list of domain names")
+    if not isinstance(domains, list) or not all(
+            isinstance(d, str) and d.strip() and d.isascii() for d in domains):
+        raise ConfigError("allowed_domains must be a list of ASCII domain names")
     domains = [d.strip().lower().lstrip("@") for d in domains]
     if require_domains and not domains:
         raise ConfigError("allowed_domains is missing or empty; over HTTP the "
@@ -104,44 +141,69 @@ def parse_config(data: Any, *, require_domains: bool) -> dict[str, Any]:
     users = data.get("users", [])
     if not isinstance(users, list):
         raise ConfigError("users must be a list")
+    by_id: dict[str, str] = {}
     by_email: dict[str, str] = {}
-    by_github: dict[str, str] = {}
     for i, u in enumerate(users):
         if not isinstance(u, dict):
             raise ConfigError(f"users[{i}] must be an object")
-        extra = set(u) - {"email", "github", "role"}
+        extra = set(u) - {"id", "email", "role"}
         if extra:
-            raise ConfigError(f"users[{i}] has unknown keys: {sorted(extra)}")
+            raise ConfigError(f"users[{i}] has unknown keys: {sorted(extra)} "
+                              "(use id, email, role)")
         role = u.get("role")
-        if role not in _RANK:
+        if not isinstance(role, str) or role not in _RANK:
             raise ConfigError(f"users[{i}].role must be one of {list(ROLES)}")
-        keys = [k for k in ("email", "github") if k in u]
-        if len(keys) != 1:
-            raise ConfigError(f"users[{i}] needs exactly one of email or github")
-        value = u[keys[0]]
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError(f"users[{i}].{keys[0]} must be a non-empty string")
-        value = value.strip().lower()
-        if keys[0] == "email":
-            if not _domain(value):
-                raise ConfigError(f"users[{i}].email is not an email address")
-            if domains and _domain(value) not in domains:
+        email = None
+        if "email" in u:
+            email = ascii_email(u["email"])
+            if email is None:
+                raise ConfigError(f"users[{i}].email must be a plain ASCII email address")
+            if domains and _domain(email) not in domains:
                 raise ConfigError(f"users[{i}].email is outside allowed_domains")
-            table = by_email
+        if "id" in u:
+            ident = u["id"]
+            if not _valid_id(ident):
+                raise ConfigError(f"users[{i}].id must be \"<iss>|<sub>\" or "
+                                  "\"github:<numeric user id>\"")
+            if ident in by_id:
+                raise ConfigError(f"users[{i}] repeats id {ident!r}")
+            by_id[ident] = role
+        elif email is not None:
+            if email in by_email:
+                raise ConfigError(f"users[{i}] repeats email {email!r}")
+            by_email[email] = role
         else:
-            table = by_github
-        if value in table:
-            raise ConfigError(f"users[{i}] repeats {keys[0]} {value!r}")
-        table[value] = role
-    return {"allowed_domains": domains, "email": by_email, "github": by_github}
+            raise ConfigError(f"users[{i}] needs an id (preferred) or an email")
+    return {"allowed_domains": domains, "id": by_id, "email": by_email}
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ConfigError(f"duplicate key {k!r} in roles file")
+        seen[k] = v
+    return seen
 
 
 def load_config(path: Path | None = None, *, require_domains: bool = True) -> dict[str, Any]:
+    """Read and validate the roles file. Refuses a file that is not a
+    regular file or that is world-writable."""
     path = path or roles_file()
     try:
-        data = json.loads(path.read_text())
+        st = path.stat()
     except FileNotFoundError:
         raise ConfigError(f"roles file not found: {path} (set MCP_ROLES_FILE)") from None
+    except OSError as exc:
+        raise ConfigError(f"roles file unreadable: {path}: {exc}") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise ConfigError(f"roles file is not a regular file: {path}")
+    if st.st_mode & stat.S_IWOTH:
+        raise ConfigError(f"roles file is world-writable: {path} (chmod o-w)")
+    try:
+        data = json.loads(path.read_text(), object_pairs_hook=_no_duplicate_keys)
+    except ConfigError:
+        raise
     except (OSError, ValueError) as exc:
         raise ConfigError(f"roles file unreadable: {path}: {exc}") from None
     return parse_config(data, require_domains=require_domains)
@@ -149,32 +211,36 @@ def load_config(path: Path | None = None, *, require_domains: bool = True) -> di
 
 def approvers(cfg: dict[str, Any]) -> list[str]:
     """Identities with approve rights (approver or admin)."""
-    return sorted(k for table in ("email", "github") for k, r in cfg[table].items()
+    return sorted(k for table in ("id", "email") for k, r in cfg[table].items()
                   if _RANK[r] >= _RANK["approver"])
 
 
 def role_for(ident: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
     """Role of a validated identity, or None (refused).
 
-    kind github: matched by login only; a GitHub profile email is not
-    verified by us, so it never grants a role.
-    kind oidc / iap: matched by email only, and only when the issuer marked
-    it verified and its domain is on allowed_domains.
+    By stable id first ("github:<id>", "<iss>|<sub>"). Then, for OIDC/IAP
+    only, an email-only entry when the email is verified, plain ASCII, on
+    allowed_domains and equal to it. A GitHub login or profile email never
+    grants a role.
     """
     if not ident:
         return None
     kind = ident.get("kind")
+    if kind not in ("github", "oidc", "iap"):
+        return None
+    actor = ident.get("id")
+    if isinstance(actor, str) and actor in cfg["id"]:
+        return cfg["id"][actor]
     if kind == "github":
-        login = (ident.get("login") or "").strip().lower()
-        return cfg["github"].get(login) if login else None
-    if kind in ("oidc", "iap"):
-        email = (ident.get("email") or "").strip().lower()
-        if not email or ident.get("email_verified") is not True:
-            return None
-        if cfg["allowed_domains"] and _domain(email) not in cfg["allowed_domains"]:
-            return None
-        return cfg["email"].get(email)
-    return None
+        return None
+    if ident.get("email_verified") is not True:
+        return None
+    email = ascii_email(ident.get("email"))
+    if email is None:
+        return None
+    if cfg["allowed_domains"] and _domain(email) not in cfg["allowed_domains"]:
+        return None
+    return cfg["email"].get(email)
 
 
 def direct_commit_enabled() -> bool:

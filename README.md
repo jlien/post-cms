@@ -324,6 +324,14 @@ tree with no review. Over HTTP they are off, even for admins, unless
 `MCP_ALLOW_DIRECT_COMMIT=1`. `tools/list` shows only the tools the caller may
 call.
 
+`add_media` reads the file type from the content (magic bytes), never the
+name, and accepts PNG, JPEG, GIF, WebP, PDF, MP4, MOV, WebM, MP3, WAV and M4A
+(not SVG). The size cap is `MCP_MEDIA_MAX_BYTES` (default 25 MiB). Send the
+file as `content_base64` (with an optional `filename`). Over HTTP that is the
+only way: a server `file_path` is refused. On stdio `file_path` also works,
+but only for a regular file inside `MCP_UPLOADS_DIR` (default `uploads/`,
+gitignored), and never through a symlink.
+
 **stdio** (`python3 mcp/server.py`): one local user, who already holds the
 checkout. The default role is admin; set `MCP_STDIO_ROLE=reader|author|approver`
 to narrow it. No roles file is read.
@@ -335,23 +343,34 @@ to narrow it. No roles file is read.
 {
   "allowed_domains": ["example.com"],
   "users": [
-    {"email": "alice@example.com", "role": "admin"},
-    {"email": "bob@example.com", "role": "approver"},
-    {"github": "octocat", "role": "author"}
+    {"id": "https://issuer.example.com|0f3c9a", "email": "alice@example.com", "role": "admin"},
+    {"id": "github:583231", "email": "octocat@example.com", "role": "author"},
+    {"email": "bob@example.com", "role": "reader"}
   ]
 }
 ```
 
-- `OAUTH_MODE=oidc` matches `email` entries only, and only when the token's
-  `email_verified` claim is true and the domain is on `allowed_domains`.
-- `OAUTH_MODE=github` matches `github` entries by login only. A GitHub profile
-  email is not verified, so it never grants a role.
+- Prefer `id`, the stable actor id: `<iss>|<sub>` for OIDC (the token's
+  issuer and subject), `github:<numeric user id>` for GitHub (`id` from
+  `GET /user`). Logins and emails can be renamed and re-registered; ids
+  cannot. On an entry with `id`, `email` is for display only.
+- An email-only entry matches only an OIDC identity whose `email_verified`
+  claim is true, whose email is plain ASCII on `allowed_domains`, and which
+  equals the entry (ASCII case-insensitive). Non-ASCII emails are refused,
+  so Unicode lookalikes cannot match.
+- `OAUTH_MODE=github` matches by numeric id only. A GitHub login or profile
+  email never grants a role.
 - An identity with no entry gets HTTP 403 on every request, including
   `initialize`. A valid GitHub or OIDC token alone grants nothing.
-- The server refuses to start when the file is missing, is not valid JSON,
-  has an unknown key or role, lists one identity twice, lists an email outside
-  `allowed_domains`, or has no non-empty `allowed_domains` (fail closed; the
-  list is required in GitHub mode too).
+- The server refuses to start when the file is missing, is not a regular
+  file, is world-writable, is not valid JSON, repeats a JSON key, has an
+  unknown key or role, has a malformed id or a non-ASCII email, lists one
+  identity twice, lists an email outside `allowed_domains`, or has no
+  non-empty `allowed_domains` (fail closed; the list is required in GitHub
+  mode too).
+- The file is read once at startup. Restart the server to apply a change,
+  including a revocation; a validated token is also cached for up to five
+  minutes.
 - Approver rights come only from this file: the server refuses to start when
   `MCP_APPROVERS` is set. With no approver or admin listed it warns at
   startup, and approve, reject and revert are refused for everyone.
