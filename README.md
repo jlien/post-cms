@@ -301,6 +301,37 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
+## Hosted MCP behind an identity-aware proxy
+
+`mcp/http_server.py` serves the MCP tools over HTTP. `OAUTH_MODE` picks the
+identity source: `github`, `oidc` (bearer tokens), or `iap`.
+
+With `OAUTH_MODE=iap` the server sits behind Google Cloud Identity-Aware
+Proxy and trusts only the proxy's signed `x-goog-iap-jwt-assertion` header.
+The `Authorization` header is ignored, so there is one identity source.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IAP_AUDIENCE` | none, required | Expected `aud`, for example `/projects/<number>/global/backendServices/<id>`. The server refuses to start without it. |
+| `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | Proxy signing keys (JWKS). Must be `https://`. |
+
+Each request's assertion must be ES256 (exactly), signed by a key in the
+JWKS, with `iss` `https://cloud.google.com/iap`, `aud` equal to
+`IAP_AUDIENCE`, and `exp`, `iat` and `nbf` within 30 seconds of skew. The
+keys are cached for an hour; an unknown `kid` triggers at most one refresh
+every 30 seconds, and a failed fetch keeps the keys already held. The
+identity is the `email` claim, lowercased, with `sub` kept. A missing or
+invalid assertion gets a bare `401 {"error": "unauthorized"}`; the reason goes
+to the server log only.
+
+Approvals (`approve_proposal`, `merge=true`) take the approver from this
+identity, and the distinct-approver check compares it with the proposal's
+commit author. The verifier is `mcp/iap.py`, standard library only. Tests:
+
+```bash
+python3 -m unittest discover -s mcp -p 'test_*.py'
+```
+
 ## Deploy + CDN purge
 
 ```bash
