@@ -284,7 +284,7 @@ Earlier versions always listened on `0.0.0.0`; a deployment that relied on that 
 
 **Stopping.** SIGTERM or SIGINT stops the server accepting connections, logs `origin: SIGTERM, shutting down` (or `SIGINT`), lets open requests finish for up to `POSTCMS_SHUTDOWN_TIMEOUT_SECS` (default 25, so it fits a 30 s platform grace period), then drops whatever is still open (logging `origin: <n> connection(s) still open after <s>s ...`), logs `origin stopped`, and exits 0. Idle keep-alive connections close at once. Set the timeout below your platform's grace period (Cloud Run and `docker stop` give 10 s).
 
-**Timeouts.** A client has `POSTCMS_HEADER_READ_TIMEOUT_SECS` (default 10) to send a complete request head; a connection that sends part of one and stalls is closed. Both settings take whole seconds from 1 to 3600; any other value refuses to start (exit 2).
+**Timeouts and limits.** A client has `POSTCMS_HEADER_READ_TIMEOUT_SECS` (default 10) to send a complete request head; a connection that sends part of one and stalls is closed. `POST /api/ask` and `POST /mcp` must deliver the whole body within `POSTCMS_BODY_READ_TIMEOUT_SECS` (default 15, a total, so a slow drip does not reset it), else `408`. Bodies are capped at 16 KiB for `/api/ask` and 256 KiB for `/mcp` (`413`, refused up front when `Content-Length` is larger); a body that is not `application/json` gets `415`, and malformed JSON `400`. `/api/ask` applies its rate limit and in-flight cap before reading the body, so stalled bodies count against both. At most `POSTCMS_MAX_CONNECTIONS` (default 512) connections are open at once; further connections are closed as soon as they are accepted, with one log line per 10 s. Timeouts take whole seconds from 1 to 3600 and the cap a whole number from 1 to 65535; any other value refuses to start (exit 2).
 
 Routes: `/`, `/posts/<slug>`, `/rss.xml`, `/sitemap.xml`, `/robots.txt`,
 `/health`, 404 fallback → `404.html`.
@@ -331,7 +331,7 @@ Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `Dockerfile` builds an image holding the origin server and one site's built `dist/`. It needs BuildKit (`docker buildx`, the default builder in current Docker).
 
 ```bash
-docker build -t demo-site .                                    # the demo site in this repo
+docker build -t demo-site --build-arg SITE_CACHE_ID=demo .     # the demo site in this repo
 ci/site-context.sh ../my-site /tmp/my-site-ctx                 # stage a site: tracked files only
 docker build -t my-site --build-context site=/tmp/my-site-ctx --build-arg SITE_CACHE_ID=my-site .
 docker run --rm --read-only --tmpfs /tmp -p 8080:8080 my-site  # http://127.0.0.1:8080/health
@@ -344,8 +344,8 @@ Stages: `engine` compiles `server` and `build-site` (dependencies in their own l
 | Input | How | Meaning |
 |---|---|---|
 | engine | build context (`.`) | A post-cms checkout. `.dockerignore` is an allowlist: only `Cargo.*`, `crates/` and the demo site files enter the context, and `.env*`, `*.key`, `*.enc`, `*.pem`, `credentials*.json`, `.cache`, `node_modules`, `target` and `dist` are dropped even inside those. |
-| site | `--build-context site=<dir>` (default: the demo site in this repo) | A directory staged by `ci/site-context.sh <site-checkout> <dir>`: the files git tracks at `HEAD`, without `.git`, untracked or ignored files (a local `master.key`, `.env`, `node_modules`) or uncommitted edits, and with tracked `.env*`, `*.key`, `*.enc` and `*.pem` removed. Stage it because a named context is sent to BuildKit whole (its cache, or a remote builder) and this repo's `.dockerignore` does not filter it; the build refuses a site context holding `.git`, `.env*`, `*.key`, `*.enc` or `*.pem`. The site is bind-mounted into the `build-site` step, never copied into a layer; only `dist/`, `site.yaml` and `redirects.yaml` reach the image. |
-| `SITE_CACHE_ID` | `--build-arg` (default `demo`) | Scopes the build's model and image cache mounts. Give each site its own id, so on a shared builder one site's build never reuses cache entries another site wrote. |
+| site | `--build-context site=<dir>` (default: the demo site in this repo) | A directory staged by `ci/site-context.sh <site-checkout> <dir> [extra-path...]`: only `site.yaml`, `redirects.yaml`, `content/`, `templates/`, `themes/`, `plugins/` and any extra paths named, as git tracks them at `HEAD`. No `.git`, untracked or ignored files (a local `master.key`, `.env`, `node_modules`), uncommitted edits or other tracked paths (`config/`, `scripts/`), and tracked secret-named files inside the allowed paths are removed (`.env*`, `*.key`, `*.enc`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `credentials*.json`, `.npmrc`, `.netrc`). Stage it because a named context is sent to BuildKit whole (its cache, or a remote builder) and this repo's `.dockerignore` does not filter it; the build refuses a site context holding `.git`, `.env*`, `*.key`, `*.enc` or `*.pem`. The site is bind-mounted into the `build-site` step, never copied into a layer; only `dist/`, `site.yaml` and `redirects.yaml` reach the image. |
+| `SITE_CACHE_ID` | `--build-arg`, required | One id per site (letters, digits, `.`, `_`, `-`); the build fails without it. Scopes the build's model and image cache mounts, so on a shared builder one site's build never reuses cache entries another site wrote. Never share an id between sites. |
 | `SANITY_READ_TOKEN` | `--secret id=SANITY_READ_TOKEN,env=SANITY_READ_TOKEN` (or `src=<file>`) | Read token for sites that pull from Sanity. Mounted for the `build-site` step only; never in a layer, the history or the image config. |
 | `SITE_BASE_URL`, `SITE_THEME`, `DRAFTS`, `POSTCMS_EMBED_BATCH`, `IMAGES_OFFLINE`, `SANITY_OFFLINE` | `--build-arg` | The `build-site` settings of the same names (see Build). Unset or empty means the engine default. Build args are visible in `docker history`: never pass a secret this way. |
 | `TAILWINDCSS_URL`, `TAILWINDCSS_SHA256` | `--build-arg`, both or neither | Standalone Tailwind CLI for themes that compile CSS (see Tailwind CLI). The download must match the SHA-256 and be https. |
@@ -371,6 +371,8 @@ Runtime environment, set when the container runs and never baked into the image 
 | `HOME` | `/tmp/post-cms` | Locates the model cache. |
 | `POSTCMS_SHUTDOWN_TIMEOUT_SECS` | unset (25) | Seconds open connections get after SIGTERM (see Serve, Stopping). |
 | `POSTCMS_HEADER_READ_TIMEOUT_SECS` | unset (10) | Seconds a client has to send a request head. |
+| `POSTCMS_BODY_READ_TIMEOUT_SECS` | unset (15) | Seconds a client has to send a whole POST body. |
+| `POSTCMS_MAX_CONNECTIONS` | unset (512) | Connections open at once; more are closed on accept. |
 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_MAX_RAG_CHARS` | unset | `/api/ask` upstream. `LLM_API_KEY` is a secret. |
 | `RATE_LIMIT_PER_MIN`, `ASK_MAX_CONCURRENT` | unset (10, 4) | `/api/ask` limits. |
 | `IAP_AUDIENCE`, `IAP_JWKS_URL` | unset | Identity-Aware Proxy check for `/preview/`, in servers that have it: the backend service audience, and the key set URL (default Google's). Per deployment, so never in the image. |

@@ -83,10 +83,10 @@ build() { # log-name args...
     exit 1
   fi
 }
-build build-demo -t "$IMG" --secret id=SANITY_READ_TOKEN,src="$WORK/sanity-token" "$CTX"
+build build-demo -t "$IMG" --build-arg SITE_CACHE_ID="$TAG-demo" --secret id=SANITY_READ_TOKEN,src="$WORK/sanity-token" "$CTX"
 ok "image builds from the committed tree"
 echo "building $IMG_SITE (site from a named build context)"
-build build-site -t "$IMG_SITE" --build-context site="$SITE" \
+build build-site -t "$IMG_SITE" --build-context site="$SITE" --build-arg SITE_CACHE_ID="$TAG-site" \
   --secret id=SANITY_READ_TOKEN,src="$WORK/sanity-token" "$CTX"
 ok "image builds with --build-context site=<staged dir>"
 if grep -q -F "SANITY_READ_TOKEN secret mounted (${#CANARY} bytes)" "$WORK/build-site.log"; then
@@ -102,7 +102,7 @@ fi
 
 echo "building the unstaged site checkout (must be refused)"
 if "$DOCKER" build --progress=plain --target site-build --build-context site="$SITE_SRC" \
-    "$CTX" >"$WORK/build-raw.log" 2>&1; then
+    --build-arg SITE_CACHE_ID="$TAG-raw" "$CTX" >"$WORK/build-raw.log" 2>&1; then
   fail "the build accepted a site context holding .git, .env and keys"
 elif grep -q 'site context holds secret-like files' "$WORK/build-raw.log"; then
   ok "the build refuses a site context holding .git, .env and keys"
@@ -113,6 +113,16 @@ fi
 
 size=$("$DOCKER" image inspect -f '{{.Size}}' "$IMG")
 echo "info image size: $size bytes ($((size / 1024 / 1024)) MiB)"
+
+echo "building without SITE_CACHE_ID (must be refused)"
+if "$DOCKER" build --progress=plain --target site-build "$CTX" >"$WORK/build-noid.log" 2>&1; then
+  fail "the build accepted a missing SITE_CACHE_ID"
+elif grep -q 'set --build-arg SITE_CACHE_ID' "$WORK/build-noid.log"; then
+  ok "the build requires SITE_CACHE_ID"
+else
+  tail -n 30 "$WORK/build-noid.log"
+  fail "the build without SITE_CACHE_ID failed for another reason"
+fi
 
 # ---- static checks on each image -------------------------------------------
 # Every layer as a tar stream, whatever the store compressed it with.

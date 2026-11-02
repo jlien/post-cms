@@ -3,7 +3,7 @@
 # Origin image: the post-cms server binary plus one site's built dist/.
 # Build inputs, runtime settings and checks: README "Container image".
 #
-#   docker build -t my-site .                                  # the demo site in this repo
+#   docker build -t demo --build-arg SITE_CACHE_ID=demo .      # the demo site in this repo
 #   ci/site-context.sh ../my-site /tmp/my-site-ctx            # tracked files only
 #   docker build -t my-site --build-context site=/tmp/my-site-ctx --build-arg SITE_CACHE_ID=my-site .
 #
@@ -76,9 +76,10 @@ COPY --from=engine /out/build-site /usr/local/bin/build-site
 ARG SITE_BASE_URL=""
 ARG SITE_THEME=""
 ARG DRAFTS=""
-# Scopes the model and image cache mounts to one site, so one site's build
-# never reuses entries another site wrote on a shared builder.
-ARG SITE_CACHE_ID=demo
+# Required, one id per site (letters, digits, `.`, `_`, `-`): scopes the model
+# and image cache mounts, so one site's build never reuses entries another
+# site wrote on a shared builder.
+ARG SITE_CACHE_ID
 ARG POSTCMS_EMBED_BATCH=""
 ARG IMAGES_OFFLINE=""
 ARG SANITY_OFFLINE=""
@@ -92,6 +93,9 @@ RUN --mount=type=bind,from=site,target=/site,rw \
     --mount=type=cache,id=post-cms-fastembed-${SITE_CACHE_ID},target=/cache/home \
     --mount=type=cache,id=post-cms-images-${SITE_CACHE_ID},target=/cache/images \
     set -eu; \
+    case "${SITE_CACHE_ID:-}" in \
+      ""|*[!A-Za-z0-9._-]*) echo "set --build-arg SITE_CACHE_ID=<id>, one id per site (letters, digits, . _ -)" >&2; exit 1 ;; \
+    esac; \
     found="$(find /site \( -name .git -o -name .env -o -name '.env.*' -o -name '*.key' -o -name '*.enc' -o -name '*.pem' \) -print | head -n 5)"; \
     if [ -n "$found" ]; then \
       echo "site context holds secret-like files (stage it with ci/site-context.sh):" >&2; \

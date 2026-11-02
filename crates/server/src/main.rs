@@ -77,7 +77,9 @@ Environment:
   PORT          port to listen on (default 8787)
   POSTCMS_HOST  IP address to listen on when --host is not given
   POSTCMS_HEADER_READ_TIMEOUT_SECS  seconds to send a request head (default 10)
+  POSTCMS_BODY_READ_TIMEOUT_SECS    seconds to send a POST body (default 15)
   POSTCMS_SHUTDOWN_TIMEOUT_SECS     seconds connections get after SIGTERM (default 25)
+  POSTCMS_MAX_CONNECTIONS           connections open at once (default 512)
   IAP_AUDIENCE  serve /preview/ (the DRAFTS=1 build) only to requests with a
                 verified x-goog-iap-jwt-assertion for this audience
                 (/projects/<number>/global/backendServices/<id>). Unset:
@@ -249,6 +251,8 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+
+    let _ = BODY_READ_TIMEOUT.set(timeouts.body_read);
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -953,11 +957,84 @@ fn mcp_call_tool(state: &StaticDir, req: &serde_json::Value) -> Result<serde_jso
     }
 }
 
+// ---- Request bodies --------------------------------------------------------
+//
+// The two POST routes read their JSON body themselves, after any check that
+// needs no body (the /api/ask rate limit and in-flight cap), with a size cap
+// and a total read timeout, so a slow-drip or stalled body cannot hold a
+// connection or an /api/ask slot.
+
+/// Largest /api/ask body (a question).
+const ASK_BODY_LIMIT: usize = 16 * 1024;
+/// Largest /mcp body (one JSON-RPC request).
+const MCP_BODY_LIMIT: usize = 256 * 1024;
+/// POSTCMS_BODY_READ_TIMEOUT_SECS, set once at startup.
+static BODY_READ_TIMEOUT: OnceLock<std::time::Duration> = OnceLock::new();
+
+fn body_error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({ "error": msg }))).into_response()
+}
+
+/// Read and parse a JSON body: 415 without a JSON content type, 413 over
+/// `limit` bytes (by Content-Length up front, or while reading), 408 when the
+/// whole body has not arrived within the body-read timeout, 400 when it is
+/// not the expected JSON.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<T, Response> {
+    let json_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|m| {
+            let m = m.trim().to_ascii_lowercase();
+            m == "application/json" || (m.starts_with("application/") && m.ends_with("+json"))
+        })
+        .unwrap_or(false);
+    if !json_type {
+        return Err(body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "expected Content-Type: application/json"));
+    }
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Err(body_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"));
+    }
+    let wait = BODY_READ_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(std::time::Duration::from_secs(serve::DEFAULT_BODY_READ_TIMEOUT_SECS));
+    let bytes = match tokio::time::timeout(wait, axum::body::to_bytes(body, limit)).await {
+        Err(_) => return Err(body_error(StatusCode::REQUEST_TIMEOUT, "request body not received in time")),
+        Ok(Err(e)) => {
+            let too_large = e
+                .into_inner()
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some();
+            return Err(if too_large {
+                body_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+            } else {
+                body_error(StatusCode::BAD_REQUEST, "request body could not be read")
+            });
+        }
+        Ok(Ok(b)) => b,
+    };
+    serde_json::from_slice(&bytes).map_err(|_| body_error(StatusCode::BAD_REQUEST, "invalid JSON body"))
+}
+
 /// POST /mcp — JSON-RPC 2.0 request in, JSON-RPC response out.
 async fn mcp_endpoint(
     State(s): State<StaticDir>,
-    Json(req): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: axum::body::Body,
 ) -> Response {
+    let req: serde_json::Value = match read_json(&headers, body, MCP_BODY_LIMIT).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // Notifications take no response body (HTTP 202 per streamable-http).
@@ -1252,14 +1329,10 @@ async fn ask(
     State(s): State<StaticDir>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Json<AskBody>,
+    body: axum::body::Body,
 ) -> Response {
-    let question = body.question.trim();
-    if question.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
-    }
-
-    // Abuse protection: per-IP fixed window + global in-flight cap.
+    // Abuse protection: per-IP fixed window + global in-flight cap, both
+    // before the body is read, so slow or stalled bodies count against them.
     let ip = client_ip(&headers, addr);
     let (allowed, _remaining, retry_after) = rate_limit(ip);
     if !allowed {
@@ -1286,6 +1359,14 @@ async fn ask(
                 .into_response()
         }
     };
+    let body: AskBody = match read_json(&headers, body, ASK_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let question = body.question.trim();
+    if question.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "question is required" }))).into_response();
+    }
     // Keyless endpoints (e.g. a private GLM server on the tailnet) are fine: no auth header.
     // Only a present-but-empty key is an error.
     let key = env::var("LLM_API_KEY").ok().filter(|k| !k.trim().is_empty());
