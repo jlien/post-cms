@@ -12,6 +12,7 @@ Run:   python3 mcp/server.py            # JSON-RPC server on stdio
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import json
 import os
 import re
@@ -27,6 +28,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT = ROOT / "content" / "posts"
 TEMPLATES_FOR_BUILD = "cargo run -p build"
+
+# Who may call which tool (mcp/authz.py). Loaded by path: this file is run
+# as a script and also loaded by path from http_server.py.
+_authz_spec = importlib.util.spec_from_file_location(
+    "pcms_authz", Path(__file__).with_name("authz.py"))
+assert _authz_spec is not None and _authz_spec.loader is not None
+authz = importlib.util.module_from_spec(_authz_spec)
+_authz_spec.loader.exec_module(authz)
 PROTOCOL_VERSION = "2024-11-05"
 
 TOOLS = [
@@ -1935,6 +1944,19 @@ HANDLERS = {
 
 # --------------------------------------------------------------- protocol
 
+def _caller_role() -> tuple[str | None, bool]:
+    """(role, over_http). Over HTTP the role is the one http_server.py bound
+    with the validated identity; no identity means no role. On stdio the one
+    local user has MCP_STDIO_ROLE (default admin)."""
+    ident = _HTTP_IDENTITY.get()
+    if ident is not None or os.environ.get("PCMS_TRANSPORT") == "http":
+        return (ident or {}).get("role"), True
+    try:
+        return authz.stdio_role(), False
+    except authz.Forbidden:
+        return None, False
+
+
 def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     method = req.get("method")
     req_id = req.get("id")
@@ -1949,7 +1971,9 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+        role, http = _caller_role()
+        return {"jsonrpc": "2.0", "id": req_id, "result": {
+            "tools": authz.visible_tools(TOOLS, role, http=http)}}
     if method == "tools/call":
         params = req.get("params", {})
         name = params.get("name")
@@ -1958,6 +1982,13 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
         if handler is None:
             return {"jsonrpc": "2.0", "id": req_id, "error": {
                 "code": -32601, "message": f"unknown tool: {name}"}}
+        role, http = _caller_role()
+        refusal = authz.allowed(role, name, http=http,
+                                args=args if isinstance(args, dict) else None)
+        if refusal is not None:
+            return {"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": f"forbidden: {refusal}"}],
+                "isError": True}}
         try:
             result = handler(args)
         except Exception as exc:  # noqa: BLE001 — surfaced as tool error content

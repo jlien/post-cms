@@ -16,6 +16,12 @@ The validated principal is bound into the request context; approve / reject
 gate as the local gh session, minus the shared machine. MCP_ALLOW_APPROVE=0
 still disables merging on the server as a whole.
 
+Authorization (mcp/authz.py): every validated identity must have a role in
+the roles file (MCP_ROLES_FILE, default mcp/roles.json): reader, author,
+approver or admin. GitHub identities match by login, OIDC identities by
+verified email on an allowed domain. No role means 403. The server refuses
+to start without a valid roles file with a non-empty allowed_domains list.
+
 Endpoints:
     POST /mcp                                          JSON-RPC (MCP), auth required
     GET  /.well-known/oauth-protected-resource         RFC 9728 metadata, public
@@ -100,6 +106,7 @@ def _identity_github(token: str) -> dict:
         "login": login,
         "name": u.get("name") or "",
         "email": u.get("email") or "",
+        "kind": "github",
         "source": f"github:{login} via oauth token",
     }
 
@@ -126,6 +133,9 @@ def _identity_oidc(token: str) -> dict:
         "login": login,
         "name": claims.get("name") or "",
         "email": claims.get("email") or "",
+        # Some issuers send the string "true"; anything else is unverified.
+        "email_verified": claims.get("email_verified") in (True, "true"),
+        "kind": "oidc",
         "source": f"oidc:{login} via oauth token",
     }
 
@@ -211,6 +221,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             ident = self._auth()
+            role = authz.role_for(ident, ROLES_CFG) if ROLES_CFG else None
+            if role is None:
+                self._json(403, {"error": "forbidden: this identity has no role "
+                                          "on this server"})
+                return
+            ident = {**ident, "role": role}
         except AuthError as exc:
             self._json(401, {"error": str(exc)}, {
                 "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"',
@@ -254,12 +270,37 @@ class Handler(BaseHTTPRequestHandler):
 
 
 ctx_token = srv._HTTP_IDENTITY
+authz = srv.authz
+
+# Loaded by startup(); None means every request is refused.
+ROLES_CFG: dict | None = None
+
+
+def startup() -> None:
+    """Fail closed before listening: a standard connector, a valid roles
+    file with a non-empty allowed_domains list, and one source of approver
+    rights (the roles file; MCP_APPROVERS is refused)."""
+    global ROLES_CFG
+    if OAUTH_MODE not in ("github", "oidc"):
+        sys.exit("OAUTH_MODE required (github | oidc) — the hosted server "
+                 "refuses to run without a standard connector")
+    if os.environ.get("MCP_APPROVERS", "").strip():
+        sys.exit("MCP_APPROVERS is not read over HTTP: approver rights come "
+                 "from the roles file (role approver or admin). Unset it.")
+    try:
+        ROLES_CFG = authz.load_config(require_domains=True)
+    except authz.ConfigError as exc:
+        sys.exit(f"refusing to start: {exc}")
+    if not authz.approvers(ROLES_CFG):
+        sys.stderr.write("warning: the roles file names no approver or admin; "
+                         "approve, reject and revert are refused for everyone\n")
+    if authz.direct_commit_enabled():
+        sys.stderr.write("warning: MCP_ALLOW_DIRECT_COMMIT=1: admins can commit "
+                         "straight to the shared tree with no review\n")
 
 
 def main() -> int:
-    if not OAUTH_MODE:
-        sys.exit("OAUTH_MODE required (github | oidc) — the hosted server "
-                 "refuses to run without a standard connector")
+    startup()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     sys.stderr.write(f"post-cms MCP over HTTP on http://{HOST}:{PORT}/mcp "
                      f"(oauth: {OAUTH_MODE})\n")

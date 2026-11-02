@@ -301,6 +301,61 @@ python3 mcp/server.py --self-test
 Tools: `list_posts`, `get_post`, `create_draft`, `update_post`, `build_site`,
 `publish_status`. All mutations are git commits.
 
+Unit tests (standard library, no network):
+
+```bash
+python3 -m unittest discover -s mcp -p 'test_*.py'
+```
+
+## MCP roles
+
+Every tool call is checked against the caller's role (`mcp/authz.py`). Roles
+build on each other:
+
+| Role | Tools |
+| --- | --- |
+| reader | `list_posts`, `get_post`, `list_proposals`, `publish_status` |
+| author | reader, plus `propose_change`, `propose_template`, `propose_plugin`, `revise_proposal`, `build_preview` |
+| approver | author, plus `approve_proposal`, `reject_proposal`, `revert_proposal`, and `merge=true` on a `propose_*` tool |
+| admin | everything, plus `create_draft`, `update_post`, `set_theme`, `build_site`, `add_media` |
+
+`create_draft`, `update_post` and `set_theme` commit straight to the shared
+tree with no review. Over HTTP they are off, even for admins, unless
+`MCP_ALLOW_DIRECT_COMMIT=1`. `tools/list` shows only the tools the caller may
+call.
+
+**stdio** (`python3 mcp/server.py`): one local user, who already holds the
+checkout. The default role is admin; set `MCP_STDIO_ROLE=reader|author|approver`
+to narrow it. No roles file is read.
+
+**HTTP** (`mcp/http_server.py`): roles come from a JSON file,
+`MCP_ROLES_FILE` (default `mcp/roles.json`, gitignored):
+
+```json
+{
+  "allowed_domains": ["example.com"],
+  "users": [
+    {"email": "alice@example.com", "role": "admin"},
+    {"email": "bob@example.com", "role": "approver"},
+    {"github": "octocat", "role": "author"}
+  ]
+}
+```
+
+- `OAUTH_MODE=oidc` matches `email` entries only, and only when the token's
+  `email_verified` claim is true and the domain is on `allowed_domains`.
+- `OAUTH_MODE=github` matches `github` entries by login only. A GitHub profile
+  email is not verified, so it never grants a role.
+- An identity with no entry gets HTTP 403 on every request, including
+  `initialize`. A valid GitHub or OIDC token alone grants nothing.
+- The server refuses to start when the file is missing, is not valid JSON,
+  has an unknown key or role, lists one identity twice, lists an email outside
+  `allowed_domains`, or has no non-empty `allowed_domains` (fail closed; the
+  list is required in GitHub mode too).
+- Approver rights come only from this file: the server refuses to start when
+  `MCP_APPROVERS` is set. With no approver or admin listed it warns at
+  startup, and approve, reject and revert are refused for everyone.
+
 ## Deploy + CDN purge
 
 ```bash
