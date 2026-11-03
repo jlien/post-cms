@@ -200,8 +200,11 @@ fn public_build_has_no_draft_only_file() {
     build(root, true);
     let draft = fs::read_to_string(root.join("dist/preview/drafts/notes/soon/index.html")).unwrap();
     let secret = ids_in(&draft, "preview/drafts/assets/img")[0].clone();
+    // E75: a drafts build marks its dist so a public origin refuses it.
+    assert!(root.join("dist/.post-cms-drafts").is_file());
 
     build(root, false);
+    assert!(!root.join("dist/.post-cms-drafts").exists());
     assert!(!root.join("dist/preview").exists());
     let all: Vec<String> = files(&root.join("dist"))
         .iter()
