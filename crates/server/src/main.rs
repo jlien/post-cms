@@ -236,7 +236,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{EMBED_OFF_NO_HOME}");
     }
     // Draft preview: fail closed. No IAP_AUDIENCE, no preview; a malformed
-    // value refuses to start.
+    // value refuses to start. Without IAP_AUDIENCE this is a public origin,
+    // and a dist holding drafts refuses to start.
     let iap_cfg = iap::IapConfig::from_env(|k| env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match iap_cfg {
@@ -249,9 +250,7 @@ fn main() -> anyhow::Result<()> {
             iap::install(Some(std::sync::Arc::new(v)));
         }
         None => {
-            if dist.join("preview").is_dir() {
-                eprintln!("{PREVIEW_OFF_NO_AUDIENCE}");
-            }
+            refuse_public_drafts(&dist)?;
             iap::install(None);
         }
     }
@@ -826,7 +825,7 @@ fn serve_with(policy: &CachePolicy, root: &PathBuf, rel: &str, accept_gzip: bool
         return redirect_response(r);
     }
     // Reject traversal and empty segments, and the build marker.
-    if rel == DIST_MARKER || rel.split('/').any(|seg| {
+    if rel == DIST_MARKER || rel == DRAFTS_MARKER || rel.split('/').any(|seg| {
         seg.is_empty() || seg == "." || seg == ".." || seg.contains('\0')
     }) {
         return not_found(root.clone());
@@ -1162,10 +1161,52 @@ async fn mcp_endpoint(
     }
 }
 
-/// Logged once at startup when dist/preview/ exists but IAP_AUDIENCE is unset.
-const PREVIEW_OFF_NO_AUDIENCE: &str = "warning: dist/preview/ exists but IAP_AUDIENCE is unset, \
-     so draft previews are off: every /preview/ request returns 404. Set IAP_AUDIENCE \
-     to the preview backend service (/projects/<number>/global/backendServices/<id>).";
+/// Marker a `DRAFTS=1` build writes in dist/ (see build-site). Never served.
+/// It survives a deploy step that strips `preview/` (the public pages of a
+/// drafts build differ too: plugins are skipped), so the public origin still
+/// sees that the dist came from a drafts build.
+const DRAFTS_MARKER: &str = ".post-cms-drafts";
+
+/// What in `dist` only a drafts or preview build writes: `preview` (a
+/// directory, file or symlink, any letter case, since a case-insensitive
+/// file system would serve `Preview/` for `/preview/`) and [`DRAFTS_MARKER`].
+/// One read of the top level, so the check costs nothing at startup. A dist
+/// that cannot be listed is an error: the caller refuses to start.
+fn draft_entries(dist: &StdPath) -> std::io::Result<Vec<String>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dist)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case("preview") || name.eq_ignore_ascii_case(DRAFTS_MARKER) {
+            found.push(name.into_owned());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Startup check for a public origin (one without `IAP_AUDIENCE`): refuse
+/// a dist that holds drafts. Whether the origin is public comes from its
+/// configuration only, never a request, and anything short of a valid
+/// `IAP_AUDIENCE` (unset, empty, a misspelled name) counts as public, so a
+/// config mistake fails closed. A drafts build behind a CDN would otherwise
+/// be cached for as long as the cache policy allows.
+fn refuse_public_drafts(dist: &StdPath) -> anyhow::Result<()> {
+    let found = draft_entries(dist)
+        .with_context(|| format!("refusing to start: cannot list {} to check it for drafts", dist.display()))?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = found.iter().map(|n| format!("dist/{n}")).collect();
+    anyhow::bail!(
+        "refusing to start: {} holds a drafts or preview build ({}) and IAP_AUDIENCE is unset, \
+         so this is a public origin, which must never serve drafts. Rebuild without DRAFTS \
+         and SITE_PREVIEW_THEMES for the public service, or set IAP_AUDIENCE on the preview \
+         service (/projects/<number>/global/backendServices/<id>).",
+        dist.display(),
+        names.join(", ")
+    )
+}
 
 /// Headers on every /preview/ response, served or refused.
 const PREVIEW_CACHE_CONTROL: &str = "private, no-store";
@@ -2124,6 +2165,68 @@ headers:
             assert_eq!(serve(&dist, p, false).status(), StatusCode::NOT_FOUND, "{p}");
         }
         assert_eq!(serve(&dist, "/app.js", false).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn drafts_marker_is_never_served() {
+        let dist = temp_dist("drafts-marker");
+        std::fs::write(dist.join(DRAFTS_MARKER), "drafts").unwrap();
+        for p in ["/.post-cms-drafts", ".post-cms-drafts", "/.post-cms-drafts/", "/.POST-CMS-DRAFTS"] {
+            assert_eq!(serve(&dist, p, false).status(), StatusCode::NOT_FOUND, "{p}");
+        }
+    }
+
+    // ---- Public origin refuses a drafts dist (E75) ------------------------
+
+    #[test]
+    fn a_clean_dist_passes_the_public_check() {
+        let dist = temp_dist("public-clean");
+        // Names that only look like the preview are not drafts.
+        std::fs::create_dir_all(dist.join("previews")).unwrap();
+        std::fs::write(dist.join("preview.html"), "x").unwrap();
+        std::fs::create_dir_all(dist.join("blog/preview")).unwrap();
+        assert_eq!(draft_entries(&dist).unwrap(), Vec::<String>::new());
+        refuse_public_drafts(&dist).unwrap();
+    }
+
+    #[test]
+    fn a_public_origin_refuses_any_drafts_entry() {
+        type Case = (&'static str, fn(&StdPath));
+        let cases: &[Case] = &[
+            ("preview-dir", |d| std::fs::create_dir_all(d.join("preview/drafts")).unwrap()),
+            ("preview-empty", |d| std::fs::create_dir(d.join("preview")).unwrap()),
+            ("preview-file", |d| std::fs::write(d.join("preview"), "x").unwrap()),
+            ("preview-case", |d| std::fs::create_dir(d.join("Preview")).unwrap()),
+            ("marker-only", |d| std::fs::write(d.join(DRAFTS_MARKER), "x").unwrap()),
+            ("marker-dir", |d| std::fs::create_dir(d.join(DRAFTS_MARKER)).unwrap()),
+        ];
+        for (name, make) in cases {
+            let dist = temp_dist(name);
+            make(&dist);
+            let err = format!("{:#}", refuse_public_drafts(&dist).unwrap_err());
+            assert!(err.starts_with("refusing to start:"), "{name}: {err}");
+            assert!(err.contains("IAP_AUDIENCE is unset"), "{name}: {err}");
+            assert!(err.contains("must never serve drafts"), "{name}: {err}");
+            assert!(err.contains("dist/"), "{name}: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_symlink_counts_as_drafts() {
+        let dist = temp_dist("preview-link");
+        let elsewhere = temp_dist("preview-target");
+        std::os::unix::fs::symlink(&*elsewhere, dist.join("preview")).unwrap();
+        assert_eq!(draft_entries(&dist).unwrap(), vec!["preview".to_string()]);
+        assert!(refuse_public_drafts(&dist).is_err());
+    }
+
+    #[test]
+    fn an_unlistable_dist_refuses_to_start() {
+        let dist = temp_dist("public-missing");
+        let gone = dist.join("not-here");
+        let err = format!("{:#}", refuse_public_drafts(&gone).unwrap_err());
+        assert!(err.contains("cannot list"), "{err}");
     }
 
     #[test]
