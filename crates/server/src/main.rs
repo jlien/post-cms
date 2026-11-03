@@ -2069,7 +2069,8 @@ headers:
 
     #[test]
     fn a_public_origin_refuses_any_drafts_entry() {
-        let cases: &[(&str, fn(&StdPath))] = &[
+        type Case = (&'static str, fn(&StdPath));
+        let cases: &[Case] = &[
             ("preview-dir", |d| std::fs::create_dir_all(d.join("preview/drafts")).unwrap()),
             ("preview-empty", |d| std::fs::create_dir(d.join("preview")).unwrap()),
             ("preview-file", |d| std::fs::write(d.join("preview"), "x").unwrap()),
