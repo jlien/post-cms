@@ -649,16 +649,90 @@ mod iap_e2e {
         assert!(!r.to_ascii_lowercase().contains("x-robots-tag"), "{r}");
     }
 
+    /// Runs the server to exit (it must not start) and returns its exit
+    /// code and stderr.
+    fn refused(cmd: &mut Command, site: &Path) -> (Option<i32>, String) {
+        let mut child = cmd
+            .env("SITE_ROOT", site)
+            .env("PORT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let code = wait_exit(&mut child);
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        (code, err)
+    }
+
+    /// E75: without IAP_AUDIENCE the origin is public, and a public origin
+    /// over a drafts build exits 1 naming the problem before it listens.
+    /// Empty or misspelled audience variables count as unset.
     #[test]
-    fn unset_audience_warns_once_and_serves_no_preview() {
-        let site = preview_site("iap-off");
-        let k = key();
+    fn public_origin_refuses_a_drafts_dist() {
+        let site = preview_site("public-drafts");
+        for env in [
+            vec![],
+            vec![("IAP_AUDIENCE", "")],
+            vec![("IAP_AUDIENCE", "   ")],
+            vec![("IAP_AUDIENSE", AUD)],
+            vec![("iap_audience", AUD)],
+        ] {
+            let mut cmd = server();
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let (code, err) = refused(&mut cmd, site.path());
+            assert_eq!(code, Some(1), "{env:?}: {err}");
+            assert!(err.contains("refusing to start"), "{env:?}: {err}");
+            assert!(err.contains("dist/preview"), "{env:?}: {err}");
+            assert!(err.contains("IAP_AUDIENCE is unset"), "{env:?}: {err}");
+            assert!(!err.contains("origin serving"), "{err}");
+        }
+    }
+
+    /// The drafts marker alone is enough: a deploy that strips preview/
+    /// still ships the public pages of a drafts build.
+    #[test]
+    fn public_origin_refuses_the_drafts_marker_alone() {
+        let site = temp_site("public-marker");
+        std::fs::write(site.path().join("dist/.post-cms-drafts"), "drafts build\n").unwrap();
+        let (code, err) = refused(&mut server(), site.path());
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("dist/.post-cms-drafts"), "{err}");
+        assert!(!err.contains("origin serving"), "{err}");
+    }
+
+    #[test]
+    fn public_origin_starts_on_a_clean_dist() {
+        let site = temp_site("public-clean");
         let (_srv, addr, lines, _rest) = start_cmd(server(), site.path());
-        let warnings: Vec<_> = lines.iter().filter(|l| l.contains("IAP_AUDIENCE is unset")).collect();
-        assert_eq!(warnings.len(), 1, "{lines:?}");
-        let r = get_with(addr, "/preview/drafts/", "preview.example.com", Some(&token("k1", &k)));
+        assert!(!lines.iter().any(|l| l.contains("refusing")), "{lines:?}");
+        let r = get_with(addr, "/preview/drafts/", "www.example.com", None);
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        let r = get_with(addr, "/", "www.example.com", None);
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    }
+
+    /// The preview service (IAP_AUDIENCE set) starts over the same drafts
+    /// dist, including the marker, and still gates /preview on the token.
+    #[test]
+    fn preview_origin_starts_on_a_drafts_dist() {
+        let site = preview_site("preview-drafts");
+        std::fs::write(site.path().join("dist/.post-cms-drafts"), "drafts build\n").unwrap();
+        let k = key();
+        let (url, _hits) = jwks_server(jwks("k1", &k));
+        let mut cmd = server();
+        cmd.env("IAP_AUDIENCE", AUD).env("IAP_JWKS_URL", &url).env("IAP_JWKS_ALLOW_HTTP", "1");
+        let (_srv, addr, _lines, _rest) = start_cmd(cmd, site.path());
+        let r = get_with(addr, "/preview/drafts/", "preview.example.com", None);
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
         assert!(!r.contains("secret draft"));
+        let r = get_with(addr, "/preview/drafts/", "preview.example.com", Some(&token("k1", &k)));
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains("secret draft"));
+        let r = get_with(addr, "/.post-cms-drafts", "preview.example.com", Some(&token("k1", &k)));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
     #[test]

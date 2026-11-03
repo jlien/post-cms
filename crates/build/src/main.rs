@@ -773,6 +773,11 @@ fn main() -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if drafts_on {
+        // Marks the whole dist as a drafts build: its public pages differ too
+        // (no plugins), and a public origin refuses to start over it even if
+        // a deploy step strips preview/.
+        fs::write(dist.join(DRAFTS_MARKER), DRAFTS_MARKER_BODY)
+            .with_context(|| format!("write {}", dist.join(DRAFTS_MARKER).display()))?;
         let draft_root = dist.join("preview").join("drafts");
         copy_theme_assets(&theme_dir, &draft_root, &theme_name)?;
         // Images only drafts use go under the preview too (DRAFT_IMAGES_DIR),
@@ -1507,6 +1512,10 @@ const DIST_MARKER: &str = ".post-cms-build";
 /// unpublished image is never public by URL.
 const DRAFT_IMAGES_DIR: &str = "preview/drafts";
 const DIST_MARKER_BODY: &str = "Written by post-cms build-site. This directory is build output: the next build deletes and recreates it.\n";
+/// File a DRAFTS=1 build writes in dist/. The server, started without
+/// IAP_AUDIENCE (a public origin), refuses to start when it is present.
+const DRAFTS_MARKER: &str = ".post-cms-drafts";
+const DRAFTS_MARKER_BODY: &str = "Written by post-cms build-site with DRAFTS=1. This dist holds drafts: only a preview origin (IAP_AUDIENCE set) serves it.\n";
 
 #[derive(Debug, Default, PartialEq)]
 struct BuildOpts {

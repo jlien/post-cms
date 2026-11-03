@@ -120,7 +120,9 @@ fn public_files(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             let rel = p.strip_prefix(base).unwrap().to_path_buf();
-            if rel.starts_with("preview") {
+            // preview/ and the drafts marker are never public (the origin
+            // refuses or gates them).
+            if rel.starts_with("preview") || rel == Path::new(".post-cms-drafts") {
                 continue;
             }
             if p.is_dir() {
@@ -215,6 +217,8 @@ fn drafts_leave_the_public_build_unchanged() {
     build(&drafts, true);
     assert!(!plain.join("dist/preview").exists(), "a plain build wrote preview/");
     assert!(drafts.join("dist/preview/drafts/notes/soon/index.html").exists());
+    assert!(drafts.join("dist/.post-cms-drafts").is_file(), "a DRAFTS=1 build wrote no drafts marker");
+    assert!(!plain.join("dist/.post-cms-drafts").exists(), "a plain build wrote the drafts marker");
     let a = public_files(&plain.join("dist"));
     let b = public_files(&drafts.join("dist"));
     assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());

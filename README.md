@@ -255,7 +255,7 @@ It listens on 127.0.0.1 only by default, so a dev or CI run is not reachable fro
 | `PORT` | `8787` | Port to listen on. `0` lets the OS pick a free one; the startup line prints the address actually bound. |
 | `--host ADDR` | `127.0.0.1` | IP address to listen on (`--host 0.0.0.0` or `--host=::`). Only IP literals and `localhost` are accepted, never other host names. |
 | `POSTCMS_HOST` | unset | Same as `--host`, for environments configured by env vars; `--host` wins when both are set. |
-| `IAP_AUDIENCE` | unset | Turns on the draft preview behind Identity-Aware Proxy (IAP): the preview backend service, `/projects/<number>/global/backendServices/<id>`. Unset: `/preview/` is always 404. |
+| `IAP_AUDIENCE` | unset | Turns on the draft preview behind Identity-Aware Proxy (IAP): the preview backend service, `/projects/<number>/global/backendServices/<id>`. Unset: `/preview/` is always 404, and a dist holding drafts refuses to start (see Startup below). |
 | `IAP_JWKS_URL` | `https://www.gstatic.com/iap/verify/public_key-jwk` | IAP signing keys (JWK set). Must be `https`. |
 | `IAP_JWKS_MAX_STALE_SECS` | `86400` | How long past the 1 h cache life the key set is still used while every refresh fails. After that every preview token is refused and the server logs an error. |
 | `IAP_JWKS_ALLOW_HTTP` | unset | `1` allows an `http` `IAP_JWKS_URL` on a loopback host only. For tests; never set it in a deploy. |
@@ -276,7 +276,8 @@ Keys are fetched with a 5 s timeout, a 64 KB cap, no redirects, and https only, 
 - Stale set: the first request after the hour fetches at once; while fetches fail, retries are at least 30 s apart and the cached keys keep working for up to `IAP_JWKS_MAX_STALE_SECS`.
 - Unknown `kid` on a fresh set: at most one fetch per 30 s, and a `kid` the last fetch showed missing is remembered for 5 minutes and fetches nothing. A flood of forged `kid`s therefore cannot hammer the key endpoint or delay the stale-set refresh.
 
-Startup: with `IAP_AUDIENCE` unset and a `dist/preview/` present, the server logs one warning (`warning: dist/preview/ exists but IAP_AUDIENCE is unset ...`) and serves no preview. A set but malformed `IAP_AUDIENCE`, or an `IAP_JWKS_URL` that is not https, refuses to start. Handlers that need the signed-in user (for example an approval step) take the `iap::VerifiedIdentity` extractor, which holds the verified `email` and `sub`, or `None`.
+Startup: a server without `IAP_AUDIENCE` is a public origin, and a public origin refuses to start (exit 1, before it listens) over a dist that holds drafts: a `dist/preview` entry of any kind or letter case (`DRAFTS=1` and `SITE_PREVIEW_THEMES` builds write it), or `dist/.post-cms-drafts`, the marker every `DRAFTS=1` build writes so a deploy that strips `preview/` is still caught (the public pages of a drafts build differ too: plugins are skipped). The message names what it found: `refusing to start: <dist> holds a drafts or preview build (dist/preview) and IAP_AUDIENCE is unset, so this is a public origin, which must never serve drafts. ...`. Public or preview comes from configuration only, never a request, and anything short of a valid `IAP_AUDIENCE` (unset, empty, a misspelled name) counts as public, so a config mistake fails closed. Set `IAP_AUDIENCE` on the preview service only. A set but malformed `IAP_AUDIENCE`, or an `IAP_JWKS_URL` that is not https, refuses to start. Handlers that need the signed-in user (for example an approval step) take the `iap::VerifiedIdentity` extractor, which holds the verified `email` and `sub`, or `None`.
+
 
 **Upstream errors.** When the model call fails, `/api/ask` returns a fixed message and never the upstream's own error text, which can name `LLM_BASE_URL`, internal hosts or headers:
 
