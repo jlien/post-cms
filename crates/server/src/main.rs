@@ -311,6 +311,9 @@ fn router(state: StaticDir) -> Router {
         // /mcp and /api/ask, including the 405 the router sends for other
         // methods. Runs after everything site.yaml sets.
         .layer(axum::middleware::from_fn(private_response_headers))
+        // nosniff on every response, and the SVG sandbox policy whatever
+        // site.yaml set. Outermost, so it runs last.
+        .layer(axum::middleware::from_fn(content_headers))
         .with_state(state)
 }
 
@@ -622,6 +625,8 @@ fn with_site_headers(cfg: &SiteHeaders, path: &str, mut resp: Response) -> Respo
     for (name, value) in cfg.resolve(path) {
         resp.headers_mut().insert(name, value);
     }
+    // A site-wide Content-Security-Policy must not replace the SVG sandbox.
+    enforce_content_headers(resp.headers_mut());
     resp
 }
 
@@ -744,13 +749,60 @@ fn harden(resp: &mut Response) {
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin"));
     headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    // An SVG opened directly is a document: no script, no outside loads.
-    if headers.get(header::CONTENT_TYPE).is_some_and(|v| v == "image/svg+xml") {
-        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(SVG_CSP));
+    enforce_content_headers(headers);
+}
+
+/// The policy every SVG response carries. An SVG opened directly (address
+/// bar, `<iframe>`, `<object>`) is a document that can run script with the
+/// site's origin; as `<img>` or a CSS image the browser ignores the response
+/// CSP and already runs no script, so rendering there does not change.
+/// - `default-src 'none'`: no script, fetch, frames, fonts or outside images.
+/// - `style-src 'unsafe-inline'`: `<style>` and `style=""` keep drawing the
+///   icon the same way when it is opened directly; CSS cannot run script.
+/// - `img-src data:`: rasters embedded as `data:` URIs (common in exported
+///   logos) still show; nothing loads from the network.
+/// - `sandbox` with no tokens: an opaque origin, so even a later loosening
+///   of a fetch directive gives the file no cookies, storage, forms, popups
+///   or top-level navigation.
+const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
+
+/// True when a Content-Type names SVG, whatever its case or parameters.
+fn is_svg(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("image/svg+xml"))
+}
+
+/// Headers no site rule or handler may drop: `nosniff` on every response,
+/// and on an SVG the sandbox policy as the first Content-Security-Policy.
+/// A policy site.yaml set for the same path stays as a second header;
+/// browsers enforce every CSP header they get, so the result is never looser
+/// than [`SVG_CSP`]. Idempotent.
+fn enforce_content_headers(headers: &mut HeaderMap) {
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if !is_svg(headers.get(header::CONTENT_TYPE)) {
+        return;
+    }
+    let others: Vec<HeaderValue> = headers
+        .get_all(header::CONTENT_SECURITY_POLICY)
+        .iter()
+        .filter(|v| *v != SVG_CSP)
+        .cloned()
+        .collect();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(SVG_CSP));
+    for v in others {
+        headers.append(header::CONTENT_SECURITY_POLICY, v);
     }
 }
 
-const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
+/// Router layer, outermost: [`enforce_content_headers`] on every response,
+/// whatever produced it (routes, the static fallback, previews, 404s, 405s).
+async fn content_headers(req: Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    enforce_content_headers(resp.headers_mut());
+    resp
+}
 
 /// Serve a file under dist/. A bare path that resolves to a directory is
 /// treated as ".../index.html" (so /about/ and /about both work). Path
@@ -1742,6 +1794,76 @@ mod tests {
         assert!(png.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
     }
 
+    fn csps(resp: &Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Plain and precompressed SVG alike: image/svg+xml, nosniff, sandbox.
+    #[test]
+    fn svg_responses_carry_type_nosniff_and_sandbox() {
+        let root = test_dir("postcms-svg-gz-");
+        std::fs::write(root.join("x.svg"), "<svg/>").unwrap();
+        std::fs::write(root.join("x.svg.gz"), "gz").unwrap();
+        for gzip in [false, true] {
+            let r = serve(&root, "/x.svg", gzip);
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(r.headers()[header::CONTENT_TYPE], "image/svg+xml");
+            assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(csps(&r), [SVG_CSP], "gzip {gzip}");
+        }
+        assert_eq!(serve(&root, "/x.svg", true).headers()[header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[test]
+    fn svg_detection_ignores_case_and_parameters() {
+        for v in ["image/svg+xml", "IMAGE/SVG+XML", "image/svg+xml; charset=utf-8", " image/svg+xml ;x=1"] {
+            assert!(is_svg(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
+        }
+        for v in ["image/svg", "image/png", "text/html; charset=utf-8", "image/svg+xmlx"] {
+            assert!(!is_svg(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
+        }
+        assert!(!is_svg(None));
+    }
+
+    /// A site-wide policy (a common page CSP that allows scripts from
+    /// 'self') would let an SVG opened directly run script if it replaced
+    /// the sandbox. It is kept only as a second policy, which can only
+    /// tighten.
+    #[test]
+    fn site_csp_cannot_replace_the_svg_sandbox() {
+        let dist = class_dist("svg-site");
+        let yaml = "headers:\n  default:\n    Content-Security-Policy: \"default-src 'self'; script-src 'self'\"\n  \
+                    rules:\n    - path: /assets/*\n      headers:\n        X-Frame-Options: DENY\n";
+        let cfg = SiteHeaders::from_site_yaml(yaml).unwrap();
+        for p in ["/assets/site/icon.svg", "/assets/img/0123456789abcdef.svg"] {
+            let r = with_site_headers(&cfg, p, serve(&dist, p, false));
+            assert_eq!(csps(&r), [SVG_CSP, "default-src 'self'; script-src 'self'"], "{p}");
+            assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(r.headers()["x-frame-options"], "DENY");
+            // Applying again (router layer after site headers) changes nothing.
+            let mut h = r.headers().clone();
+            enforce_content_headers(&mut h);
+            assert_eq!(&h, r.headers(), "{p}");
+        }
+        // Pages keep the site policy alone.
+        let page = with_site_headers(&cfg, "/signup/", serve(&dist, "/signup/", false));
+        assert_eq!(csps(&page), ["default-src 'self'; script-src 'self'"]);
+    }
+
+    /// A site rule that sets exactly the sandbox policy is not sent twice.
+    #[test]
+    fn identical_site_csp_is_not_duplicated() {
+        let dist = class_dist("svg-same");
+        let yaml = format!("headers:\n  default:\n    Content-Security-Policy: \"{SVG_CSP}\"\n");
+        let cfg = SiteHeaders::from_site_yaml(&yaml).unwrap();
+        let r = with_site_headers(&cfg, "/assets/site/icon.svg", serve(&dist, "/assets/site/icon.svg", false));
+        assert_eq!(csps(&r), [SVG_CSP]);
+    }
+
     #[test]
     fn redirect_targets_allow_paths_and_urls() {
         assert!(valid_redirect_target("/platform/ops"));
@@ -2216,6 +2338,28 @@ headers:
         assert_eq!(resp.headers()["x-robots-tag"], "noindex, nofollow");
     }
 
+    /// A draft-only SVG (written under preview/ by the image pipeline) gets
+    /// the same sandbox as a public one, and keeps the draft headers.
+    #[tokio::test]
+    async fn draft_svg_under_preview_is_sandboxed() {
+        let dist = preview_dist("pv-svg");
+        std::fs::create_dir_all(dist.join("preview/drafts/assets/img")).unwrap();
+        std::fs::write(dist.join("preview/drafts/assets/img/0123456789abcdef.svg"), "<svg/>").unwrap();
+        let yaml = "headers:\n  rules:\n    - path: /preview/*\n      headers:\n        \
+                    Content-Security-Policy: \"script-src 'self'\"\n";
+        let cfg = SiteHeaders::from_site_yaml(yaml).unwrap();
+        let key = iap::test_keys::TestKey::new("k1");
+        let v = preview_verifier(&key);
+        let t = preview_token(&key, PREVIEW_AUD);
+        let req = preview_req("/preview/drafts/assets/img/0123456789abcdef.svg", "preview.example.com", Some(&t));
+        let resp = serve_preview(Some(&v), Some(&cfg), &dist, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_preview_headers(&resp);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(csps(&resp), [SVG_CSP, "script-src 'self'"]);
+    }
+
     #[test]
     fn preview_paths_cover_every_spelling_serve_resolves() {
         for p in ["/preview", "/preview/", "/preview/drafts/", "//preview/drafts/x", "/preview//x"] {
@@ -2411,6 +2555,46 @@ headers:
             .body(axum::body::Body::empty())
             .unwrap();
         router(StaticDir(dist.to_path_buf())).oneshot(req).await.unwrap()
+    }
+
+    /// Every response the router sends carries nosniff: files, 404s, 405s,
+    /// health, previews and the JSON routes.
+    #[tokio::test]
+    async fn every_router_response_is_nosniff() {
+        for (method, path) in [
+            ("GET", "/"),
+            ("GET", "/signup/"),
+            ("GET", "/missing"),
+            ("GET", "/missing.svg"),
+            ("GET", "/health"),
+            ("GET", "/mcp"),
+            ("POST", "/mcp"),
+            ("OPTIONS", "/api/ask"),
+            ("GET", "/preview/drafts/"),
+            ("PUT", "/assets/site/icon.svg"),
+            ("GET", "/signup"),
+        ] {
+            let r = call(method, path).await;
+            assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{method} {path} {}", r.status());
+        }
+    }
+
+    /// Direct SVG requests through the router, GET and HEAD, get the type,
+    /// nosniff and the sandbox; other files get no CSP from the server.
+    #[tokio::test]
+    async fn router_serves_svg_with_the_sandbox() {
+        for method in ["GET", "HEAD"] {
+            for path in ["/assets/site/icon.svg", "/assets/img/0123456789abcdef.svg"] {
+                let r = call(method, path).await;
+                assert_eq!(r.status(), StatusCode::OK, "{method} {path}");
+                assert_eq!(r.headers()[header::CONTENT_TYPE], "image/svg+xml");
+                assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(csps(&r), [SVG_CSP], "{method} {path}");
+            }
+        }
+        for path in ["/assets/site/logo.png", "/assets/site/app.css", "/signup/"] {
+            assert!(csps(&call("GET", path).await).is_empty(), "{path}");
+        }
     }
 
     /// /mcp and /api/ask are never cacheable, whatever the method or result.
