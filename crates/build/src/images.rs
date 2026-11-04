@@ -328,7 +328,9 @@ impl ImagesCfg {
     /// output name, so a settings change never reuses a cached file name.
     fn settings(&self) -> String {
         format!(
-            "v2|webp{}|avif{}s{}|jpeg{}p|png",
+            // v3: every width resized from the source (v2 chained widths, so
+            // its cached variants depended on cache state and are not reused)
+            "v3|webp{}|avif{}s{}|jpeg{}p|png",
             self.webp_quality, self.avif_quality, self.avif_speed, self.jpeg_quality
         )
     }
@@ -1214,12 +1216,12 @@ fn encode_animation(bytes: &[u8], widths: &[u32], loop_count: u32, cfg: &ImagesC
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(decode_budget(cfg));
     dec.set_limits(limits).map_err(|e| format!("decode: {e}"))?;
-    // largest first, each frame resized from the previous step
-    let mut order: Vec<usize> = (0..widths.len()).collect();
-    order.sort_by(|a, b| widths[*b].cmp(&widths[*a]));
-    let mut writers = order
+    // each width's frame is resized from the source frame, never from another
+    // width, so a variant's bytes do not depend on which widths are encoded
+    // together (that is, on what was already cached)
+    let mut writers = widths
         .iter()
-        .map(|&i| AnimWriter::new(widths[i], scaled_height(w, h, widths[i]), loop_count, cfg.webp_quality))
+        .map(|&wd| AnimWriter::new(wd, scaled_height(w, h, wd), loop_count, cfg.webp_quality))
         .collect::<Result<Vec<_>, _>>()?;
     let mut t: i64 = 0;
     let mut n: u32 = 0;
@@ -1232,19 +1234,23 @@ fn encode_animation(bytes: &[u8], widths: &[u32], loop_count: u32, cfg: &ImagesC
         let (num, den) = frame.delay().numer_denom_ms();
         let ms = num as i64 / den.max(1) as i64;
         let ms = if ms <= 10 { 100 } else { ms };
-        let mut cur = frame.into_buffer();
-        let opaque = cur.pixels().all(|p| p.0[3] == 255);
+        let mut src = frame.into_buffer();
+        let opaque = src.pixels().all(|p| p.0[3] == 255);
         if !opaque {
-            premultiply(&mut cur);
+            premultiply(&mut src);
         }
         for wr in writers.iter_mut() {
-            if cur.width() != wr.width || cur.height() != wr.height {
-                cur = image::imageops::resize(&cur, wr.width, wr.height, image::imageops::FilterType::Lanczos3);
-            }
+            let resized;
+            let cur = if src.width() == wr.width && src.height() == wr.height {
+                &src
+            } else {
+                resized = image::imageops::resize(&src, wr.width, wr.height, image::imageops::FilterType::Lanczos3);
+                &resized
+            };
             if opaque {
                 wr.add(cur.as_raw(), t as i32)?;
             } else {
-                wr.add(gif_alpha(&cur).as_raw(), t as i32)?;
+                wr.add(gif_alpha(cur).as_raw(), t as i32)?;
             }
         }
         t += ms;
@@ -1255,11 +1261,7 @@ fn encode_animation(bytes: &[u8], widths: &[u32], loop_count: u32, cfg: &ImagesC
     if n == 0 {
         return Err("decode: no frames".into());
     }
-    let mut out: Vec<Option<Vec<u8>>> = vec![None; widths.len()];
-    for (wr, i) in writers.into_iter().zip(order) {
-        out[i] = Some(wr.finish(t as i32)?);
-    }
-    Ok(out.into_iter().map(Option::unwrap).collect())
+    writers.into_iter().map(|wr| wr.finish(t as i32)).collect()
 }
 
 /// True when some pixel is not fully opaque. No copy for 8-bit RGBA.
@@ -2174,20 +2176,25 @@ impl Pipeline {
             let raw = self.source_bytes(s)?;
             let img = normalize(decode(&raw, &self.cfg).map_err(|e| format!("decode: {e}"))?);
             drop(raw);
-            // largest first, each resize from the previous step (fewer pixels to filter)
-            let mut by_width: BTreeMap<std::cmp::Reverse<u32>, Vec<Enc>> = BTreeMap::new();
+            // Every width is resized from the decoded source, never from another
+            // width: a chain would make a variant's bytes depend on which
+            // widths were already cached, so cold and warm builds would differ.
+            let mut by_width: BTreeMap<u32, Vec<Enc>> = BTreeMap::new();
             for o in &missing {
-                by_width.entry(std::cmp::Reverse(o.width)).or_default().push(o.enc);
+                by_width.entry(o.width).or_default().push(o.enc);
             }
-            let mut cur = img;
-            for (std::cmp::Reverse(w), encs) in by_width {
+            for (w, encs) in by_width {
                 let h = Self::height_for(s, w);
-                if cur.width() != w || cur.height() != h {
-                    cur = cur.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
-                }
+                let resized;
+                let cur = if img.width() == w && img.height() == h {
+                    &img
+                } else {
+                    resized = img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
+                    &resized
+                };
                 for enc in encs {
                     let o = Out { width: w, enc };
-                    let bytes = encode(&cur, enc, &self.cfg).map_err(|e| format!("encode {w}w: {e}"))?;
+                    let bytes = encode(cur, enc, &self.cfg).map_err(|e| format!("encode {w}w: {e}"))?;
                     self.store_variant(&self.out_name(s, o), &bytes)?;
                     have.insert(o, bytes);
                 }

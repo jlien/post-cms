@@ -508,6 +508,84 @@ fn changed_settings_change_output_names() {
     assert_ne!(ha, hb);
 }
 
+/// Deterministic noise in `[0, 256)`: detail that resizing from another width
+/// instead of the source would visibly change.
+fn noise(seed: u32) -> impl FnMut() -> u8 {
+    let mut s = seed;
+    move || {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (s >> 16) as u8
+    }
+}
+
+fn noisy_png(w: u32, h: u32) -> Vec<u8> {
+    let mut n = noise(7);
+    let img = image::RgbImage::from_fn(w, h, |_, _| image::Rgb([n(), n(), n()]));
+    let mut b = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(img).write_to(&mut b, ImageFormat::Png).unwrap();
+    b.into_inner()
+}
+
+fn noisy_gif(w: u32, h: u32, frames: u32) -> Vec<u8> {
+    const PALETTE: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
+    let mut n = noise(11);
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        enc.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+        for _ in 0..frames {
+            let buf = image::RgbaImage::from_fn(w, h, |_, _| {
+                let [r, g, b] = PALETTE[(n() % 4) as usize];
+                image::Rgba([r, g, b, 255])
+            });
+            let d = image::Delay::from_numer_denom_ms(100, 1);
+            enc.encode_frame(image::Frame::from_parts(buf, 0, 0, d)).unwrap();
+        }
+    }
+    out
+}
+
+/// Every output file in dist, name to bytes.
+fn out_bytes(f: &Fixture) -> BTreeMap<String, Vec<u8>> {
+    f.out_files()
+        .into_iter()
+        .map(|n| {
+            let b = std::fs::read(f.dist.join("assets/img").join(&n)).unwrap();
+            (n, b)
+        })
+        .collect()
+}
+
+#[test]
+fn variants_are_byte_identical_whatever_the_cache_already_held() {
+    const ALL: &str = "[60, 120, 180, 300]";
+    let still = format!("https://{HOST}/still.png");
+    let anim = format!("https://{HOST}/anim.gif");
+    let files = || vec![(still.as_str(), ok(noisy_png(400, 240))), (anim.as_str(), ok(noisy_gif(320, 200, 3)))];
+    // Build with each width list in turn on one cache; the last list is ALL.
+    let build = |seeds: &[&str]| {
+        let f = Fixture::new();
+        for widths in seeds.iter().chain([&ALL]) {
+            std::fs::remove_dir_all(&f.dist).unwrap();
+            std::fs::create_dir_all(&f.dist).unwrap();
+            let p = f.pipeline(cfg_yaml(&format!("  widths: {widths}\n")), false, files());
+            let body = format!("{}{}", p.request_img(img(&still)), p.request_img(img(&anim)));
+            f.render(&p, &body);
+        }
+        out_bytes(&f)
+    };
+    let cold = build(&[]);
+    assert_eq!(cold.len(), 9, "{:?}", cold.keys());
+    // partial caches seeded smallest first, largest first, and with gaps
+    for seeds in [&["[60]", "[180]"][..], &["[300]", "[120]"], &["[180, 60]"], &["[120, 300]", "[60]"], &[ALL]] {
+        let warm = build(seeds);
+        assert_eq!(cold.keys().collect::<Vec<_>>(), warm.keys().collect::<Vec<_>>(), "seeds {seeds:?}");
+        for (name, bytes) in &cold {
+            assert!(warm[name] == *bytes, "{name} differs after seeding the cache with {seeds:?}");
+        }
+    }
+}
+
 // ---- local files and traversal ----
 
 #[test]
