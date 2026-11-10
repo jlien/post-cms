@@ -335,6 +335,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "libwebp-sys",
+ "memchr",
  "pulldown-cmark",
  "rav1d",
  "serde",

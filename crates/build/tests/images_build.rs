@@ -172,18 +172,32 @@ fn a_second_build_of_the_same_site_is_refused() {
     assert!(run(root).status.success(), "the lock is released with its holder");
 }
 
-/// A placeholder left in a page (here one from another build) fails the
-/// build with the page named, and the dist/ it wrote is removed.
+/// Page text that quotes a placeholder from another build is content, not a
+/// leftover: the build succeeds and keeps it.
 #[test]
-fn a_leftover_placeholder_fails_the_build_and_removes_dist() {
+fn page_text_that_quotes_a_placeholder_builds() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    small_site(root, "<img src=\"__postcms_img_0123456789ab_3__\" alt=\"\">");
+    small_site(root, "<code>__postcms_img_0123456789ab_3__</code> <code>__postcms_img_</code>");
+    let out = run(root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let page = fs::read_to_string(root.join("dist/about/index.html")).unwrap();
+    assert!(page.contains("<code>__postcms_img_0123456789ab_3__</code>"), "{page}");
+}
+
+/// A theme .gz that does not decompress fails the build with the file
+/// named, and the dist/ it wrote is removed.
+#[test]
+fn a_gz_that_does_not_decompress_fails_the_build_and_removes_dist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    small_site(root, "");
+    fs::write(root.join("themes/astra/assets/broken.css.gz"), b"\x1f\x8b\x08\x00 cut off").unwrap();
     let out = run(root);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
-    assert!(stderr.contains("dist/about/index.html: image placeholder from another build"), "{stderr}");
-    assert!(stderr.contains("dist/about/index.html.gz (precompressed copy)"), "{stderr}");
+    assert!(stderr.contains("dist/assets/astra/broken.css.gz: does not decompress"), "{stderr}");
     assert!(stderr.contains("so no partial site is served"), "{stderr}");
     assert!(!root.join("dist").exists(), "partial dist/ left behind");
 }

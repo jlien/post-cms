@@ -1595,19 +1595,90 @@ fn verify_names_the_page_and_source_of_a_placeholder_left_in_a_gz_copy() {
 }
 
 #[test]
-fn verify_flags_placeholders_from_another_build_and_cut_off_ones() {
+fn verify_flags_a_cut_off_placeholder_of_this_build_only_in_text_files() {
     let f = Fixture::new();
     let p = f.pipeline(cfg_yaml(""), false, vec![]);
-    std::fs::write(f.dist.join("a.html"), "<img src=\"__postcms_img_0123456789ab_7__\">").unwrap();
-    std::fs::write(f.dist.join("b.json"), "{\"x\": \"__postcms_img_01\"}").unwrap();
+    let prefix = format!("{MARKER_PREFIX}{}_", p.nonce);
+    std::fs::write(f.dist.join("b.json"), format!("{{\"x\": \"{prefix}1\"}}")).unwrap();
     // images and other binary output are not scanned
-    std::fs::write(f.dist.join("c.webp"), "__postcms_img_0123456789ab_7__").unwrap();
+    std::fs::write(f.dist.join("c.webp"), format!("{prefix}7__")).unwrap();
     let e = verify_dist(&f.dist, Some(&p)).unwrap_err();
-    assert!(e.starts_with("2 unreplaced"), "{e}");
-    assert!(e.contains("dist/a.html: image placeholder from another build (nonce 0123456789ab)"), "{e}");
+    assert!(e.starts_with("1 unreplaced"), "{e}");
     assert!(e.contains("dist/b.json: a cut-off image placeholder"), "{e}");
-    // without a pipeline (images off) a placeholder is still an error
-    assert!(verify_dist(&f.dist, None).unwrap_err().contains("another build"));
+}
+
+/// Page text that mentions the placeholder syntax, or quotes one from
+/// another build, is content: it used to fail the build as "cut-off" or
+/// "from another build".
+#[test]
+fn verify_passes_page_text_that_mentions_the_placeholder_syntax() {
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![]);
+    let text = "<p>Placeholders look like <code>__postcms_img_</code>, \
+        for example <code>__postcms_img_0123456789ab_7__</code> or __postcms_img_01.</p>";
+    std::fs::write(f.dist.join("a.html"), text).unwrap();
+    std::fs::write(f.dist.join("a.html.gz"), gz(text)).unwrap();
+    std::fs::write(f.dist.join("b.md"), "`__postcms_img_<nonce>_<n>__`").unwrap();
+    verify_dist(&f.dist, Some(&p)).unwrap();
+    // without a pipeline (images off) nothing printed a placeholder
+    std::fs::write(f.dist.join("c.html"), format!("{MARKER_PREFIX}{}_3__", p.nonce)).unwrap();
+    verify_dist(&f.dist, None).unwrap();
+}
+
+/// A placeholder in the second gzip member of a .gz: a browser decodes every
+/// member, but a single-member decoder stopped after the first.
+#[test]
+fn verify_finds_a_placeholder_in_a_later_gzip_member() {
+    let f = Fixture::new();
+    let url = format!("https://{HOST}/photo.png");
+    let p = f.pipeline(cfg_yaml(""), false, vec![(&url, ok(png(500, 250)))]);
+    let m = p.request_img(img(&url));
+    f.render(&p, &format!("<p>{m}</p>"));
+    let mut two = gz("<p>first member</p>");
+    two.extend(gz(&format!("<p>{m}</p>")));
+    std::fs::write(f.dist.join("page.html.gz"), two).unwrap();
+    let e = verify_dist(&f.dist, Some(&p)).unwrap_err();
+    assert!(e.contains(&format!("dist/page.html.gz (precompressed copy): image placeholder for {url}")), "{e}");
+}
+
+/// A .gz that does not decompress cannot be checked, so it fails the build
+/// instead of being skipped with whatever placeholders it holds.
+#[test]
+fn verify_fails_on_a_gz_that_does_not_decompress() {
+    let f = Fixture::new();
+    let p = f.pipeline(cfg_yaml(""), false, vec![]);
+    let full = gz(&format!("<p>{MARKER_PREFIX}{}_0__</p>{}", p.nonce, "x".repeat(4096)));
+    std::fs::write(f.dist.join("page.html.gz"), &full[..full.len() / 2]).unwrap();
+    let e = verify_dist(&f.dist, Some(&p)).unwrap_err();
+    assert!(e.contains("dist/page.html.gz: does not decompress"), "{e}");
+    std::fs::write(f.dist.join("page.html.gz"), b"not gzip at all").unwrap();
+    assert!(verify_dist(&f.dist, Some(&p)).unwrap_err().contains("does not decompress"));
+}
+
+/// Hits that straddle read boundaries are found whole: the same text read
+/// one byte at a time gives the same hits as read at once.
+#[test]
+fn find_markers_finds_hits_split_across_reads() {
+    struct OneByte<'a>(&'a [u8]);
+    impl std::io::Read for OneByte<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.len().min(out.len()).min(1);
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+    let prefix = format!("{MARKER_PREFIX}abc_");
+    let finder = memchr::memmem::Finder::new(prefix.as_bytes());
+    let text = format!(
+        "\u{ff}{prefix}12__ x {prefix}3_ y {prefix}{prefix}45__ {}{prefix}99999999999999999999999__ {prefix}7",
+        "z".repeat(70_000)
+    );
+    let want: Vec<Option<usize>> = vec![Some(12), None, None, Some(45), None, None];
+    let (whole, total) = find_markers(text.as_bytes(), &finder).unwrap();
+    assert_eq!(whole, want);
+    assert_eq!(total, text.len() as u64);
+    assert_eq!(find_markers(OneByte(text.as_bytes()), &finder).unwrap().0, want);
 }
 
 #[cfg(unix)]
