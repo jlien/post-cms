@@ -2248,22 +2248,6 @@ pub const MARKER_PREFIX: &str = "__postcms_img_";
 /// the text formats a step after rendering may copy pages into.
 const MARKER_TEXT_EXTS: [&str; 9] = ["html", "htm", "xml", "json", "txt", "md", "js", "css", "svg"];
 
-/// One placeholder found in a file: `(nonce, n)`, or `None` for text that
-/// starts like one but is cut off or malformed.
-fn parse_marker(after_prefix: &str) -> (Option<(String, usize)>, usize) {
-    let hex = after_prefix.bytes().take_while(u8::is_ascii_hexdigit).count();
-    let rest = &after_prefix[hex..];
-    if hex == 0 || !rest.starts_with('_') {
-        return (None, hex);
-    }
-    let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
-    let len = hex + 1 + digits;
-    match (rest[1..1 + digits].parse::<usize>(), rest[1 + digits..].starts_with("__")) {
-        (Ok(n), true) => (Some((after_prefix[..hex].to_string(), n)), len + 2),
-        _ => (None, len),
-    }
-}
-
 /// Every directory under `dist`, depth first. A directory that cannot be
 /// read is an error: a skipped directory would hide its placeholders.
 fn walk_files(dist: &Path) -> Result<Vec<PathBuf>, String> {
@@ -2351,16 +2335,31 @@ fn marker_report(mut errors: Vec<String>) -> String {
     msg
 }
 
-/// Check the finished `dist` for any image placeholder left behind: in a
-/// page, any other text file, or a precompressed `.gz` copy. Returns an
-/// error naming each page and the image source (`pipeline` maps this
-/// build's placeholders back to their source; a placeholder from another
-/// build means another build-site process wrote the same dist).
+/// Check the finished `dist` for any image placeholder of this build left
+/// behind: in a page, any other text file, or a precompressed `.gz` copy.
+/// Returns an error naming each page and the image source.
+///
+/// Only text that starts with this build's placeholder prefix (with its
+/// random nonce) counts, so a page that mentions `__postcms_img_` in its
+/// content, or quotes a placeholder from another build, is not an error.
+/// Concurrent builds of one dist are refused by the build lock, so another
+/// build's nonce can only be page text. Without a pipeline (images off)
+/// nothing printed a placeholder and there is nothing to check.
+///
+/// Files are searched as raw bytes, a chunk at a time, so memory stays
+/// small for any file and text that is not UTF-8 is never copied. A `.gz`
+/// is read through every gzip member up to a cap, and one that does not
+/// decompress fails the build, since its contents cannot be checked.
 pub fn verify_dist(dist: &Path, pipeline: Option<&Pipeline>) -> Result<(), String> {
-    let (nonce, srcs) = match pipeline {
-        Some(p) => (Some(p.nonce.clone()), p.sources()),
-        None => (None, Vec::new()),
+    // a .gz past this is refused, so a hostile one in the theme cannot keep
+    // the build decompressing
+    const MAX_GZ_TEXT: u64 = 256 << 20;
+    let Some(pipeline) = pipeline else {
+        return Ok(());
     };
+    let srcs = pipeline.sources();
+    let prefix = format!("{MARKER_PREFIX}{}_", pipeline.nonce);
+    let finder = memchr::memmem::Finder::new(prefix.as_bytes());
     let mut errors = Vec::new();
     for p in walk_files(dist)? {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -2370,43 +2369,79 @@ pub fn verify_dist(dist: &Path, pipeline: Option<&Pipeline>) -> Result<(), Strin
         if !MARKER_TEXT_EXTS.contains(&ext.as_str()) {
             continue;
         }
-        let raw = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-        let bytes = if gz {
-            // capped, so a hostile .gz in the theme cannot exhaust memory
-            const MAX_GZ_TEXT: u64 = 256 << 20;
-            let mut out = Vec::new();
-            let mut r = std::io::Read::take(flate2::read::GzDecoder::new(&raw[..]), MAX_GZ_TEXT + 1);
-            // a .gz that does not decompress is not a page this check can read
-            if std::io::Read::read_to_end(&mut r, &mut out).is_err() {
-                continue;
-            }
-            if out.len() as u64 > MAX_GZ_TEXT {
+        let file = std::fs::File::open(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        let hits = if gz {
+            // every member: a placeholder in a later member is still served
+            let r = std::io::Read::take(flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file)), MAX_GZ_TEXT + 1);
+            let (hits, total) = find_markers(r, &finder).map_err(|e| {
+                format!("{}: does not decompress ({e}), so it cannot be checked for image placeholders", rel(dist, &p))
+            })?;
+            if total > MAX_GZ_TEXT {
                 return Err(format!("{}: over {MAX_GZ_TEXT} bytes uncompressed; too large to check", rel(dist, &p)));
             }
-            out
+            hits
         } else {
-            raw
+            find_markers(file, &finder).map_err(|e| format!("read {}: {e}", p.display()))?.0
         };
-        let text = String::from_utf8_lossy(&bytes);
-        let mut rest: &str = &text;
-        while let Some(at) = rest.find(MARKER_PREFIX) {
-            let after = &rest[at + MARKER_PREFIX.len()..];
-            let (m, len) = parse_marker(after);
-            let what = match &m {
-                Some((n, i)) if Some(n) == nonce.as_ref() => {
-                    format!("image placeholder for {}", srcs.get(*i).map_or("an unknown source", String::as_str))
-                }
-                Some((n, _)) => format!(
-                    "image placeholder from another build (nonce {n}): another build-site process wrote this dist at the same time"
-                ),
+        let copy = if gz { " (precompressed copy)" } else { "" };
+        for n in hits {
+            let what = match n {
+                Some(i) => format!("image placeholder for {}", srcs.get(i).map_or("an unknown source", String::as_str)),
+                // this build's nonce, so not page text: a placeholder cut off
                 None => "a cut-off image placeholder".to_string(),
             };
-            let copy = if gz { " (precompressed copy)" } else { "" };
             errors.push(format!("{}{copy}: {what}", rel(dist, &p)));
-            rest = &after[len.min(after.len())..];
         }
     }
     if errors.is_empty() { Ok(()) } else { Err(marker_report(errors)) }
+}
+
+/// Search `r` for the placeholder prefix in `finder`, one chunk at a time,
+/// so memory stays one chunk however large the text, and bytes that are not
+/// UTF-8 are never converted. Returns each hit's request number (`None` for
+/// one that is cut off or malformed) and the number of bytes read.
+fn find_markers(mut r: impl std::io::Read, finder: &memchr::memmem::Finder) -> std::io::Result<(Vec<Option<usize>>, u64)> {
+    const CHUNK: usize = 64 << 10;
+    // the longest text after the prefix that decides a hit: 20 digits and "__"
+    const TAIL: usize = 22;
+    let plen = finder.needle().len();
+    let mut chunk = vec![0u8; CHUNK];
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + plen + TAIL);
+    let mut hits = Vec::new();
+    let mut total = 0u64;
+    loop {
+        let n = loop {
+            match r.read(&mut chunk) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                read => break read?,
+            }
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        total += n as u64;
+        let eof = n == 0;
+        let mut pos = 0;
+        let mut pending = false;
+        while let Some(at) = finder.find(&buf[pos..]) {
+            let at = pos + at;
+            let after = &buf[at + plen..];
+            let digits = after.iter().take_while(|b| b.is_ascii_digit()).count();
+            // the rest of this hit may be in the next chunk
+            if !eof && after.len() < TAIL && after.len() <= digits + 1 {
+                pos = at;
+                pending = true;
+                break;
+            }
+            let n = std::str::from_utf8(&after[..digits]).ok().and_then(|d| d.parse::<usize>().ok());
+            hits.push(n.filter(|_| after[digits..].starts_with(b"__")));
+            pos = at + plen + digits;
+        }
+        if eof {
+            return Ok((hits, total));
+        }
+        // keep only what could still be the start of a placeholder
+        let keep = if pending { pos } else { buf.len().saturating_sub(plen - 1).max(pos) };
+        buf.drain(..keep);
+    }
 }
 
 // ---- Tera ------------------------------------------------------------------
