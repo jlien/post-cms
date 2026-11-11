@@ -2969,13 +2969,15 @@ fn llms_txt(
     }
     // Same rule as the sitemap: collections with no published items are
     // skipped; the index page is listed when the collection renders one.
+    // A section with no entries (no index page and every item no_index)
+    // is left out rather than printed as a bare heading.
     for coll in collections {
         if !coll.items.iter().any(|i| i.published) {
             continue;
         }
-        out.push_str(&format!("## {}\n\n", coll.title));
+        let mut lines = String::new();
         if coll.index {
-            out.push_str(&llms_entry(
+            lines.push_str(&llms_entry(
                 &coll.title,
                 &format!("{site_base}{}", page_url(&coll.url_prefix)),
                 "",
@@ -2987,12 +2989,17 @@ fn llms_txt(
                 Some(d) => format!("({d})"),
                 None => item.description.clone(),
             };
-            out.push_str(&llms_entry(
+            lines.push_str(&llms_entry(
                 &item.title,
                 &format!("{site_base}{}", page_url(&coll.item_path(&item.slug))),
                 &desc,
             ));
         }
+        if lines.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## {}\n\n", coll.title));
+        out.push_str(&lines);
         out.push('\n');
     }
     // MCP discovery section: agents reading llms.txt learn there is a
@@ -4238,6 +4245,33 @@ mod tests {
         pages[1].meta.fields.insert("no_index".into(), false.into());
         colls[0].items[0].fields.insert("no_index".into(), "true".into());
         assert_eq!(llms_txt(&cfg, "https://example.com", &[], &pages, &colls), before);
+    }
+
+    #[test]
+    fn llms_skips_a_collection_whose_items_are_all_no_index() {
+        let cfg = test_cfg("title: Example\nbuiltin_pages: false\n");
+        let (pages, mut colls) = sample_content();
+        for item in &mut colls[0].items {
+            item.fields.insert("no_index".into(), true.into());
+        }
+        // With no index page there is nothing to list: no bare heading.
+        colls[0].index = false;
+        let out = llms_txt(&cfg, "https://example.com", &[], &pages, &colls);
+        assert!(!out.contains("## Speakers"), "{out}");
+        assert!(!out.contains("/events/speakers/"), "{out}");
+        assert!(!out.contains("\n\n\n"), "{out}");
+        for (i, line) in out.lines().enumerate() {
+            if line.starts_with("## ") {
+                let next = out.lines().nth(i + 2).unwrap_or("");
+                assert!(next.starts_with("- ["), "empty section {line:?}:\n{out}");
+            }
+        }
+
+        // With an index page the section stays, listing only that page,
+        // as the sitemap does.
+        colls[0].index = true;
+        let out = llms_txt(&cfg, "https://example.com", &[], &pages, &colls);
+        assert!(out.contains("## Speakers\n\n- [Speakers](https://example.com/events/speakers/)\n\n"), "{out}");
     }
 
     #[test]
