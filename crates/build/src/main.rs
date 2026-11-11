@@ -776,8 +776,7 @@ fn main() -> Result<()> {
         // Marks the whole dist as a drafts build: its public pages differ too
         // (no plugins), and a public origin refuses to start over it even if
         // a deploy step strips preview/.
-        fs::write(dist.join(DRAFTS_MARKER), DRAFTS_MARKER_BODY)
-            .with_context(|| format!("write {}", dist.join(DRAFTS_MARKER).display()))?;
+        write_marker(&dist, DRAFTS_MARKER, DRAFTS_MARKER_BODY)?;
         let draft_root = dist.join("preview").join("drafts");
         copy_theme_assets(&theme_dir, &draft_root, &theme_name)?;
         // Images only drafts use go under the preview too (DRAFT_IMAGES_DIR),
@@ -1631,9 +1630,33 @@ fn prepare_dist(root: &Path, force_clean: bool) -> Result<PathBuf> {
         }
     }
     fs::create_dir_all(&dist).with_context(|| format!("mkdir {}", dist.display()))?;
-    fs::write(dist.join(DIST_MARKER), DIST_MARKER_BODY)
-        .with_context(|| format!("write {}", dist.join(DIST_MARKER).display()))?;
+    write_marker(&dist, DIST_MARKER, DIST_MARKER_BODY)?;
     Ok(dist)
+}
+
+/// Create the marker file `<dist>/<name>` as a new regular file.
+/// `create_new` (O_CREAT | O_EXCL) fails on any existing entry, and on Unix
+/// O_NOFOLLOW is added too, so a symlink planted at the marker path between
+/// creating dist/ and this write is refused instead of followed: the build
+/// never writes through it to a file outside dist/.
+fn write_marker(dist: &Path, name: &str, body: &str) -> Result<()> {
+    use std::io::Write;
+    let path = dist.join(name);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(&path).with_context(|| {
+        format!(
+            "create {}: refusing to write the marker over an existing entry (a symlink or file planted after dist/ was created)",
+            path.display()
+        )
+    })?;
+    f.write_all(body.as_bytes()).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 fn load_posts(dir: &Path) -> Result<Vec<Post>> {
@@ -4514,5 +4537,34 @@ mod tests {
         prepare_dist(root, true).unwrap();
         assert!(!dist.join("mine.txt").exists());
         assert!(dist.join(DIST_MARKER).is_file());
+    }
+
+    /// A symlink planted at the marker path after dist/ exists (the window
+    /// between create_dir_all and the marker write) is refused, never
+    /// followed: the file it points at keeps its contents.
+    #[cfg(unix)]
+    #[test]
+    fn marker_write_refuses_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        fs::create_dir(&dist).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dist.join(DIST_MARKER)).unwrap();
+        let err = format!("{:#}", write_marker(&dist, DIST_MARKER, DIST_MARKER_BODY).unwrap_err());
+        assert!(err.contains(DIST_MARKER), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(fs::symlink_metadata(dist.join(DIST_MARKER)).unwrap().file_type().is_symlink());
+        // a dangling symlink is refused too, so no file is created at its target
+        let absent = tmp.path().join("absent.txt");
+        std::os::unix::fs::symlink(&absent, dist.join(DRAFTS_MARKER)).unwrap();
+        assert!(write_marker(&dist, DRAFTS_MARKER, DRAFTS_MARKER_BODY).is_err());
+        assert!(!absent.exists());
+        // and the build refuses a dist whose only entry is a planted marker symlink
+        let root = tmp.path();
+        fs::remove_file(dist.join(DRAFTS_MARKER)).unwrap();
+        let err = format!("{:#}", prepare_dist(root, false).unwrap_err());
+        assert!(err.contains("refusing"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
     }
 }
