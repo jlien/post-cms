@@ -1213,10 +1213,13 @@ const PREVIEW_CACHE_CONTROL: &str = "private, no-store";
 const PREVIEW_ROBOTS: &str = "noindex, nofollow";
 
 /// True for /preview and everything under it, in the form `serve` resolves
-/// (surrounding slashes stripped, so `//preview/x` counts too).
+/// (surrounding slashes stripped, so `//preview/x` counts too). The first
+/// segment matches in any case: a `Preview/` folder on disk, or a
+/// case-insensitive filesystem, must never let a draft skip the token check.
 fn is_preview_path(path: &str) -> bool {
     let rel = path.trim_matches('/');
-    rel == "preview" || rel.starts_with("preview/")
+    let first = rel.split('/').next().unwrap_or_default();
+    first.eq_ignore_ascii_case("preview")
 }
 
 /// Mark a preview response private and unindexable. Applied after site.yaml
@@ -2465,10 +2468,19 @@ headers:
 
     #[test]
     fn preview_paths_cover_every_spelling_serve_resolves() {
-        for p in ["/preview", "/preview/", "/preview/drafts/", "//preview/drafts/x", "/preview//x"] {
+        for p in [
+            "/preview",
+            "/preview/",
+            "/preview/drafts/",
+            "//preview/drafts/x",
+            "/preview//x",
+            "/Preview/",
+            "/PREVIEW/drafts/",
+            "/pReViEw",
+        ] {
             assert!(is_preview_path(p), "{p}");
         }
-        for p in ["/", "/previews/", "/about/preview/", "/preview.html", "/blog/"] {
+        for p in ["/", "/previews/", "/Previews/", "/about/preview/", "/about/Preview/", "/preview.html", "/blog/"] {
             assert!(!is_preview_path(p), "{p}");
         }
     }
@@ -2658,6 +2670,26 @@ headers:
             .body(axum::body::Body::empty())
             .unwrap();
         router(StaticDir(dist.to_path_buf())).oneshot(req).await.unwrap()
+    }
+
+    /// A preview folder in any case goes through the token check: a
+    /// `Preview/` folder on disk is refused without a token, with the draft
+    /// headers, and never served as a public page.
+    #[tokio::test]
+    async fn preview_in_any_case_needs_the_token() {
+        use tower::ServiceExt;
+        let dist = temp_dist("pv-case");
+        for dir in ["Preview/drafts", "PREVIEW/drafts"] {
+            std::fs::create_dir_all(dist.join(dir)).unwrap();
+            std::fs::write(dist.join(dir).join("index.html"), "<p>draft</p>").unwrap();
+        }
+        for path in ["/Preview/drafts/", "/PREVIEW/drafts/", "//Preview/drafts/", "/Preview/drafts/index.html"] {
+            let req = axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap();
+            let resp = router(StaticDir(dist.to_path_buf())).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_preview_headers(&resp);
+            assert!(!body_text(resp).await.contains("draft"), "{path}");
+        }
     }
 
     /// Every response the router sends carries nosniff: files, 404s, 405s,
