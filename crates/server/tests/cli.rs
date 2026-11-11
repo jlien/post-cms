@@ -141,6 +141,26 @@ fn unknown_flag_is_a_usage_error() {
 }
 
 #[test]
+fn bad_port_is_a_usage_error_before_listening() {
+    let site = temp_site("badport");
+    for port in ["abc", "70000", "65536", "-1"] {
+        let mut child = server()
+            .env("SITE_ROOT", site.path())
+            .env("PORT", port)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(wait_exit(&mut child), Some(2), "{port}");
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.starts_with(&format!("server: PORT {port:?} is not a port number")), "{port}: {stderr}");
+        assert!(stderr.contains("Usage: server"), "{port}: {stderr}");
+        assert!(!stderr.contains("origin serving"), "{port}: {stderr}");
+    }
+}
+
+#[test]
 fn bad_env_host_is_a_usage_error() {
     let site = temp_site("badenv");
     let mut child = server()
@@ -243,8 +263,10 @@ const SHARED_CACHE: &str = "/tmp/.cache/post-cms-fastembed";
 
 /// Plants a symlink at [`SHARED_CACHE`] when nothing is there, pointing at a
 /// private directory holding a fake model file; removes what it created on
-/// drop. When the path already exists (an older server left it), it is left
-/// alone and only watched for changes.
+/// drop. A link left by an earlier run that was killed before its drop ran
+/// (it points at a `post-cms-planted-*` directory in the temp dir) is
+/// replaced. Any other existing path (an older server left it) is left alone
+/// and only watched for changes.
 struct Planted {
     _target: tempfile::TempDir,
     created_link: bool,
@@ -258,6 +280,9 @@ impl Planted {
         let link = Path::new(SHARED_CACHE);
         let parent = link.parent().unwrap();
         let created_parent = std::fs::create_dir(parent).is_ok();
+        if is_stale_plant(link) {
+            let _ = std::fs::remove_file(link);
+        }
         let created_link = std::os::unix::fs::symlink(target.path(), link).is_ok();
         Planted { _target: target, created_link, created_parent }
     }
@@ -281,6 +306,16 @@ impl Planted {
         v.sort();
         v
     }
+}
+
+/// True when `link` is a symlink to a `post-cms-planted-*` directory directly
+/// in the temp dir: only [`Planted`] makes those.
+fn is_stale_plant(link: &Path) -> bool {
+    let is_link = std::fs::symlink_metadata(link).map_or(false, |m| m.file_type().is_symlink());
+    let Ok(target) = std::fs::read_link(link) else { return false };
+    is_link
+        && target.parent() == Some(std::env::temp_dir().as_path())
+        && target.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("post-cms-planted-"))
 }
 
 impl Drop for Planted {
@@ -309,11 +344,25 @@ fn no_home_turns_embeddings_off_and_never_reads_the_shared_cache() {
     .unwrap();
     let planted = Planted::new();
     let before = planted.listing();
+    // An empty listing would make the "unchanged" check below pass whatever
+    // the server does, so it is never a pass.
+    if planted.created_link {
+        assert!(!before.is_empty(), "the planted model file is missing from {SHARED_CACHE}");
+    } else if before.is_empty() {
+        eprintln!(
+            "skip: {SHARED_CACHE} already exists and lists nothing (not ours, or unreadable), \
+             so a server using it could not be detected; remove it to run this test"
+        );
+        return;
+    }
     // A closed port, so the upstream call fails fast after retrieval ran.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
 
-    for home in [None, Some("")] {
+    // A relative HOME is treated like no HOME: "." would otherwise put the
+    // cache under the server's working directory (the site root here).
+    for home in [None, Some(""), Some("."), Some("rel/home")] {
         let mut cmd = server();
+        cmd.current_dir(root);
         match home {
             None => cmd.env_remove("HOME"),
             Some(h) => cmd.env("HOME", h),
@@ -323,7 +372,7 @@ fn no_home_turns_embeddings_off_and_never_reads_the_shared_cache() {
             .env_remove("LLM_API_KEY");
         let (mut server, addr, startup, rest) = start_cmd(cmd, root);
         assert!(
-            startup.iter().any(|l| l.starts_with("embeddings: HOME is not set; semantic retrieval is off")),
+            startup.iter().any(|l| l.starts_with("embeddings: HOME is not set to an absolute path; semantic retrieval is off")),
             "{home:?}: {startup:?}"
         );
 
@@ -348,6 +397,8 @@ fn no_home_turns_embeddings_off_and_never_reads_the_shared_cache() {
         assert!(later.contains("retrieval failed (no embedding model)"), "{home:?}: {later}");
         assert!(!later.contains("model unavailable"), "{home:?}: {later}");
         assert_eq!(planted.listing(), before, "{home:?}: the shared cache path was used");
+        assert!(!root.join(".cache").exists(), "{home:?}: a cache was made under the working directory");
+        assert!(!root.join("rel").exists(), "{home:?}: a cache was made under the working directory");
     }
 }
 

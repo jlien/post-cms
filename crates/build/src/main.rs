@@ -2388,7 +2388,7 @@ fn render_embeddings(
         return Ok(());
     }
 
-    // Without HOME there is no per-user cache, so the weights go to a private
+    // Without an absolute HOME there is no per-user cache, so the weights go to a private
     // per-run directory (removed when `_scratch` drops) instead of a fixed
     // path under /tmp that another user could pre-plant.
     let mut _scratch: Option<tempfile::TempDir> = None;
@@ -2398,7 +2398,7 @@ fn render_embeddings(
             let t = private_temp_builder("postcms-fastembed-")
                 .tempdir()
                 .context("create a private temp directory for the embedding model")?;
-            eprintln!("embeddings: HOME is not set; caching the model in a private per-run directory");
+            eprintln!("embeddings: HOME is not set to an absolute path; caching the model in a private per-run directory");
             let dir = t.path().to_path_buf();
             _scratch = Some(t);
             dir
@@ -2547,14 +2547,15 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// Where fastembed caches downloaded ONNX weights (shared by build + server):
-/// ~/.cache/post-cms-fastembed, or None when HOME is unset or empty.
+/// ~/.cache/post-cms-fastembed, or None when HOME is unset, empty or relative
+/// (a relative HOME would put the model under the build's working directory).
 fn embed_cache_dir() -> Option<PathBuf> {
     embed_cache_dir_for(std::env::var_os("HOME"))
 }
 
 fn embed_cache_dir_for(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let home = home.filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".cache").join("post-cms-fastembed"))
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| home.join(".cache").join("post-cms-fastembed"))
 }
 
 /// Emit per-post markdown next to each rendered post (posts/<slug>/index.md),
@@ -3411,6 +3412,13 @@ mod tests {
         );
         assert_eq!(embed_cache_dir_for(None), None);
         assert_eq!(embed_cache_dir_for(Some("".into())), None);
+    }
+
+    #[test]
+    fn relative_home_is_treated_like_no_home() {
+        for home in [".", "./", "..", "home/u", ".cache"] {
+            assert_eq!(embed_cache_dir_for(Some(home.into())), None, "{home}");
+        }
     }
 
     #[test]

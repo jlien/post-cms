@@ -81,7 +81,7 @@ Options:
 
 Environment:
   SITE_ROOT     site directory (default: the current directory)
-  PORT          port to listen on (default 8787)
+  PORT          port to listen on, 0 to 65535 (default 8787; 0 picks a free port)
   POSTCMS_HOST  IP address to listen on when --host is not given
   POSTCMS_HEADER_READ_TIMEOUT_SECS  seconds to send a request head (default 10)
   POSTCMS_BODY_READ_TIMEOUT_SECS    seconds to send a POST body (default 15)
@@ -164,6 +164,18 @@ fn env_host_value(raw: Option<std::ffi::OsString>) -> Result<Option<String>, Str
     }
 }
 
+/// Listen port from `PORT`: unset or empty means 8787. Anything that is not
+/// a number from 0 to 65535 (including non-UTF-8) is a usage error, never a
+/// silent fallback to the default port.
+fn port_value(raw: Option<std::ffi::OsString>) -> Result<u16, String> {
+    let Some(raw) = raw.filter(|p| !p.is_empty()) else {
+        return Ok(8787);
+    };
+    let text = raw.to_str().ok_or_else(|| format!("PORT {raw:?} is not valid UTF-8"))?;
+    text.parse::<u16>()
+        .map_err(|_| format!("PORT {text:?} is not a port number (0 to 65535)"))
+}
+
 /// Command-line arguments as text; a non-UTF-8 argument is a usage error.
 fn utf8_args<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Result<Vec<String>, String> {
     args.into_iter()
@@ -206,6 +218,13 @@ fn main() -> anyhow::Result<()> {
         .and_then(|env_host| resolve_host(host_flag.as_deref(), env_host.as_deref()))
     {
         Ok(h) => h,
+        Err(e) => {
+            eprint!("server: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let port = match port_value(env::var_os("PORT")) {
+        Ok(p) => p,
         Err(e) => {
             eprint!("server: {e}\n\n{USAGE}");
             std::process::exit(2);
@@ -265,11 +284,6 @@ fn main() -> anyhow::Result<()> {
 
     let _ = BODY_READ_TIMEOUT.set(timeouts.body_read);
     let _ = TRUSTED_PROXY_HOPS.set(timeouts.trusted_proxy_hops);
-
-    let port: u16 = env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8787);
 
     let app = router(StaticDir(dist.clone()));
 
@@ -1364,12 +1378,13 @@ fn embed_model() -> Option<&'static std::sync::Mutex<Option<fastembed::TextEmbed
     Some(m)
 }
 
-/// Logged when HOME is unset or empty: semantic retrieval is off.
-const EMBED_OFF_NO_HOME: &str = "embeddings: HOME is not set; semantic retrieval is off and \
-     /api/ask inlines the corpus (set HOME to cache the model in $HOME/.cache/post-cms-fastembed)";
+/// Logged when HOME is unset, empty or relative: semantic retrieval is off.
+const EMBED_OFF_NO_HOME: &str = "embeddings: HOME is not set to an absolute path; semantic retrieval is off and \
+     /api/ask inlines the corpus (set HOME to an absolute path to cache the model in $HOME/.cache/post-cms-fastembed)";
 
 /// Where fastembed caches downloaded ONNX weights (same path as the build
-/// crate), or `None` when HOME is unset or empty. The build then uses a
+/// crate), or `None` when HOME is unset, empty or relative (a relative HOME
+/// would put the model under whatever directory the server runs in). The build then uses a
 /// private per-run directory; the long-running server turns embeddings off
 /// instead (see README, "Embeddings without HOME").
 fn embed_cache_dir() -> Option<PathBuf> {
@@ -1377,8 +1392,8 @@ fn embed_cache_dir() -> Option<PathBuf> {
 }
 
 fn embed_cache_dir_for(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let home = home.filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".cache").join("post-cms-fastembed"))
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| home.join(".cache").join("post-cms-fastembed"))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -2315,6 +2330,26 @@ headers:
         );
         assert_eq!(embed_cache_dir_for(None), None);
         assert_eq!(embed_cache_dir_for(Some("".into())), None);
+    }
+
+    #[test]
+    fn relative_home_means_no_embed_cache_dir() {
+        for home in [".", "./", "..", "home/u", ".cache"] {
+            assert_eq!(embed_cache_dir_for(Some(home.into())), None, "{home}");
+        }
+    }
+
+    #[test]
+    fn port_must_be_a_port_number() {
+        assert_eq!(port_value(None), Ok(8787));
+        assert_eq!(port_value(Some("".into())), Ok(8787));
+        assert_eq!(port_value(Some("0".into())), Ok(0));
+        assert_eq!(port_value(Some("8080".into())), Ok(8080));
+        assert_eq!(port_value(Some("65535".into())), Ok(65535));
+        for bad in ["abc", "70000", "65536", "-1", " 8080", "80.0", "0x50"] {
+            let err = port_value(Some(bad.into())).unwrap_err();
+            assert!(err.starts_with("PORT ") && err.contains("not a port number"), "{bad}: {err}");
+        }
     }
 
     #[test]
