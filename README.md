@@ -596,6 +596,11 @@ ORIGIN_TARGET=./deploy-target bash ci/deploy.sh   # build + rsync
 bash ci/purge.sh                                  # stub purge, appends ci/purge.log
 ```
 
+`ci/deploy.sh` ships to a public origin only.
+It refuses (exit 1, before anything is copied) when `DRAFTS` or `SITE_PREVIEW_THEMES` is set, and again when the built `dist/` holds a top-level `preview` entry or the `.post-cms-drafts` marker in any letter case, naming what it found.
+The origin server makes the same check only at startup, and a running origin serves whatever lands in its directory, so the deploy checks before the copy.
+Build drafts and theme previews for a preview origin (`IAP_AUDIENCE` set) instead.
+
 ## Security
 
 Dependency audit commands and the accepted unmaintained-crate warnings are in
