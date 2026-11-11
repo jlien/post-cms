@@ -364,13 +364,18 @@ fn ask_site(name: &str) -> tempfile::TempDir {
 /// /api/ask, stops the server, and returns the full HTTP response and the
 /// stderr printed after the "serving" line.
 fn ask_once(site: &Path, base: &str, key: Option<&str>) -> (String, String) {
-    use std::io::Write;
     let mut cmd = server();
     cmd.env("LLM_BASE_URL", base).env("LLM_MODEL", "test");
     match key {
         Some(k) => cmd.env("LLM_API_KEY", k),
         None => cmd.env_remove("LLM_API_KEY"),
     };
+    ask_cmd(cmd, site)
+}
+
+/// Like [`ask_once`] for a prepared command.
+fn ask_cmd(cmd: Command, site: &Path) -> (String, String) {
+    use std::io::Write;
     let (mut server, addr, _startup, rest) = start_cmd(cmd, site);
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -488,6 +493,84 @@ fn upstream_error_status_and_body_stay_in_the_log() {
     // The upstream echoed the API key; the log has it redacted.
     assert!(line.contains("Bearer [redacted]"), "{line}");
     assert!(!log.contains(api_key), "API key in the log: {log}");
+}
+
+#[test]
+fn not_configured_503s_are_generic_and_the_cause_is_logged() {
+    let site = ask_site("unconfigured");
+    let empty = temp_site("noposts");
+    type Env = &'static [(&'static str, Option<&'static str>)];
+    let full: Env = &[("LLM_BASE_URL", Some("http://127.0.0.1:9/v1")), ("LLM_MODEL", Some("m")), ("LLM_API_KEY", None)];
+    let cases: [(&str, &Path, Env, &str, &str); 6] = [
+        ("empty key", site.path(), &[("LLM_API_KEY", Some(" "))], "assistant not configured", "LLM_API_KEY is set but empty"),
+        ("no base", site.path(), &[("LLM_BASE_URL", None)], "assistant not configured", "LLM_BASE_URL and LLM_MODEL"),
+        ("empty base", site.path(), &[("LLM_BASE_URL", Some(""))], "assistant not configured", "LLM_BASE_URL and LLM_MODEL"),
+        ("no model", site.path(), &[("LLM_MODEL", None)], "assistant not configured", "LLM_BASE_URL and LLM_MODEL"),
+        ("empty model", site.path(), &[("LLM_MODEL", Some(" "))], "assistant not configured", "LLM_BASE_URL and LLM_MODEL"),
+        ("no posts", empty.path(), &[], "assistant unavailable", "dist/posts has no markdown"),
+    ];
+    for (name, root, overrides, error, cause) in cases {
+        let mut cmd = server();
+        for (k, v) in full.iter().chain(overrides.iter()) {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        let (resp, log) = ask_cmd(cmd, root);
+        assert!(resp.starts_with("HTTP/1.1 503"), "{name}: {resp}");
+        assert_eq!(body_of(&resp), format!(r#"{{"error":"{error}"}}"#), "{name}: {resp}");
+        for leak in ["LLM_", "dist", "127.0.0.1"] {
+            assert!(!body_of(&resp).contains(leak), "{name}: response leaks {leak:?}: {resp}");
+        }
+        assert!(
+            log.lines().any(|l| l.starts_with(&format!("ask: {error}: ")) && l.contains(cause)),
+            "{name}: no log line with {cause:?}: {log}"
+        );
+    }
+}
+
+#[test]
+fn base_url_query_string_stays_after_the_path() {
+    use std::io::Write;
+    let site = ask_site("query");
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = upstream.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut c, _) = upstream.accept().unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let request_line = loop {
+            let n = c.read(&mut chunk).unwrap_or(0);
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                let len = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                    .unwrap_or(0);
+                if rest.len() >= len || n == 0 {
+                    break head.lines().next().unwrap_or("").to_string();
+                }
+            } else if n == 0 {
+                break String::new();
+            }
+        };
+        let body = r#"{"choices":[{"message":{"content":"an answer"}}]}"#;
+        write!(
+            c,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        request_line
+    });
+    let (resp, log) = ask_once(site.path(), &format!("http://{up}/v1/?api-version=2024-06-01"), None);
+    let request_line = handle.join().unwrap();
+    assert_eq!(request_line, "POST /v1/chat/completions?api-version=2024-06-01 HTTP/1.1", "{log}");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(body_of(&resp).contains("an answer"), "{resp}");
 }
 
 // ---- Draft preview behind IAP (E6), end to end ------------------------------
