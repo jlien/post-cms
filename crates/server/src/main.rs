@@ -1388,11 +1388,80 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
 }
 
+/// One chunk of dist/embeddings.json, parsed once.
+struct Chunk {
+    title: String,
+    url: String,
+    text: String,
+    vec: Vec<f32>,
+}
+
+/// What identifies one version of embeddings.json on disk: path, length,
+/// modification time and (on Unix) inode, so an edit in place or an atomic
+/// rename over it both count as a change.
+#[derive(PartialEq)]
+struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    ino: u64,
+}
+
+impl FileStamp {
+    fn of(path: &StdPath) -> std::io::Result<FileStamp> {
+        let m = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&m);
+        #[cfg(not(unix))]
+        let ino = 0;
+        Ok(FileStamp { path: path.to_path_buf(), len: m.len(), modified: m.modified().ok(), ino })
+    }
+}
+
+/// The parsed embeddings.json and the stamp it was read at. Reading and
+/// parsing the file (about 10 MB on a large site) on every /api/ask cost more
+/// than the rest of retrieval, so it is done once and again only when the
+/// file changes (a redeploy of dist/ without a restart).
+static CHUNKS: std::sync::Mutex<Option<(FileStamp, std::sync::Arc<Vec<Chunk>>)>> =
+    std::sync::Mutex::new(None);
+
+/// The chunks in `path`, from the cache when the file is unchanged. A file
+/// that cannot be read or parsed is an error and is not cached, so the next
+/// request tries again.
+fn load_chunks(path: &StdPath) -> anyhow::Result<std::sync::Arc<Vec<Chunk>>> {
+    // Held while parsing, so concurrent requests after a change parse once.
+    let mut cache = CHUNKS.lock().map_err(|_| anyhow::anyhow!("embeddings cache mutex poisoned"))?;
+    let stamp = FileStamp::of(path)?;
+    if let Some((cached, chunks)) = cache.as_ref() {
+        if *cached == stamp {
+            return Ok(chunks.clone());
+        }
+    }
+    let raw = std::fs::read(path)?;
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&raw)?;
+    let chunks: Vec<Chunk> = values
+        .iter()
+        .filter_map(|c| {
+            let vec = c["vec"].as_array()?;
+            Some(Chunk {
+                title: c["meta"]["title"].as_str().unwrap_or("").to_string(),
+                url: c["meta"]["url"].as_str().unwrap_or("").to_string(),
+                text: c["text"].as_str().unwrap_or("").to_string(),
+                vec: vec.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect(),
+            })
+        })
+        .collect();
+    let chunks = std::sync::Arc::new(chunks);
+    // Stamp taken before the read: a write during the read leaves a stamp
+    // that no longer matches, so the next request reads again.
+    *cache = Some((stamp, chunks.clone()));
+    Ok(chunks)
+}
+
 /// Embed the question, score all chunks, return the top-k as (context, sources).
 fn retrieve(dist: &StdPath, question: &str) -> anyhow::Result<(String, Vec<Source>)> {
     let model = embed_model().ok_or_else(|| anyhow::anyhow!("no embedding model"))?;
-    let raw = std::fs::read_to_string(dist.join("embeddings.json"))?;
-    let chunks: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+    let chunks = load_chunks(&dist.join("embeddings.json"))?;
 
     let mut guard = model.lock().map_err(|_| anyhow::anyhow!("embed mutex poisoned"))?;
     let model = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no embedding model"))?;
@@ -1403,22 +1472,13 @@ fn retrieve(dist: &StdPath, question: &str) -> anyhow::Result<(String, Vec<Sourc
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty query embedding"))?;
 
-    let mut scored: Vec<(f32, &serde_json::Value)> = chunks
-        .iter()
-        .filter_map(|c| {
-            let vec = c["vec"].as_array()?;
-            let v: Vec<f32> = vec.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
-            Some((cosine(&qvec, &v), c))
-        })
-        .collect();
+    let mut scored: Vec<(f32, &Chunk)> = chunks.iter().map(|c| (cosine(&qvec, &c.vec), c)).collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut context = String::from("## RETRIEVED SITE EXCERPTS\n\n");
     let mut sources: Vec<Source> = Vec::new();
     for (score, c) in scored.iter().take(6) {
-        let title = c["meta"]["title"].as_str().unwrap_or("");
-        let url = c["meta"]["url"].as_str().unwrap_or("");
-        let text = c["text"].as_str().unwrap_or("");
+        let (title, url, text) = (c.title.as_str(), c.url.as_str(), c.text.as_str());
         context.push_str(&format!("--- {title} (relevance {score:.3}) ---\n{text}\n\n"));
         if !sources.iter().any(|s| s.url == url) {
             sources.push(Source { title: title.to_string(), url: url.to_string() });
@@ -2357,6 +2417,35 @@ headers:
         );
         assert!(!f.log.contains("SECRET1"), "{}", f.log);
         assert!(f.log.contains("<unparseable LLM_BASE_URL>"), "{}", f.log);
+    }
+
+    #[test]
+    fn embeddings_are_parsed_once_and_again_when_the_file_changes() {
+        let dir = test_dir("postcms-embeddings-cache-");
+        let path = dir.join("embeddings.json");
+        let chunk = |url: &str| format!(r#"{{"meta":{{"title":"T","url":"{url}"}},"text":"x","vec":[1.0,0.5]}}"#);
+        std::fs::write(&path, format!("[{}]", chunk("/a/"))).unwrap();
+        let first = load_chunks(&path).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].url.as_str(), first[0].vec.as_slice()), ("/a/", &[1.0f32, 0.5][..]));
+        // Unchanged file: the same parsed copy, not a new read.
+        assert!(std::sync::Arc::ptr_eq(&first, &load_chunks(&path).unwrap()));
+        // Replaced by rename (new inode, maybe the same length): read again.
+        let tmp = dir.join("embeddings.json.new");
+        std::fs::write(&tmp, format!("[{}]", chunk("/b/"))).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let second = load_chunks(&path).unwrap();
+        assert_eq!(second[0].url, "/b/");
+        // Rewritten in place with a different length: read again.
+        std::fs::write(&path, format!("[{},{}]", chunk("/c/"), chunk("/d/"))).unwrap();
+        assert_eq!(load_chunks(&path).unwrap().len(), 2);
+        // A broken file is an error and is not cached; a fixed one loads.
+        std::fs::write(&path, "[{").unwrap();
+        assert!(load_chunks(&path).is_err());
+        std::fs::write(&path, format!("[{}]", chunk("/e/"))).unwrap();
+        assert_eq!(load_chunks(&path).unwrap()[0].url, "/e/");
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_chunks(&path).is_err());
     }
 
     #[test]
