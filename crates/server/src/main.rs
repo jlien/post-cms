@@ -1553,7 +1553,7 @@ async fn ask(
     // Only a present-but-empty key is an error.
     let key = env::var("LLM_API_KEY").ok().filter(|k| !k.trim().is_empty());
     if env::var("LLM_API_KEY").map_or(false, |k| k.trim().is_empty()) {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "LLM_API_KEY is empty" }))).into_response();
+        return ask_unavailable(NOT_CONFIGURED, "LLM_API_KEY is set but empty (unset it for a keyless endpoint)");
     }
 
     let base = env::var("LLM_BASE_URL").ok().filter(|b| !b.trim().is_empty());
@@ -1563,18 +1563,14 @@ async fn ask(
     let (base, model) = match (base, model) {
         (Some(b), Some(m)) => (b, m),
         _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "LLM not configured: set LLM_BASE_URL and LLM_MODEL to enable /api/ask" })),
-            )
-                .into_response()
+            return ask_unavailable(NOT_CONFIGURED, "LLM_BASE_URL and LLM_MODEL must both be set to enable /api/ask")
         }
     };
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let url = chat_completions_url(&base);
 
     let corpus = load_corpus(&s.0);
     if corpus.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "dist/posts has no markdown — rebuild with `cargo run -p build`" }))).into_response();
+        return ask_unavailable(UNAVAILABLE, "dist/posts has no markdown; rebuild with `cargo run -p build`");
     }
 
     // Tier 3 when embeddings exist (retrieve top-k chunks, cite only those
@@ -1639,6 +1635,38 @@ async fn ask(
             upstream_failure(UpstreamFailure::status(&url, status, &text, key.as_deref()))
         }
         Err(e) => upstream_failure(UpstreamFailure::send(&url, e)),
+    }
+}
+
+// ---- /api/ask unavailable (503) ----
+//
+// The client gets a generic message; the specific cause (which variable is
+// missing, an empty corpus) goes only to the server log, so a public origin
+// does not describe its configuration to anyone who asks.
+
+/// 503 message when the LLM settings are missing or empty.
+const NOT_CONFIGURED: &str = "assistant not configured";
+/// 503 message when the site has nothing for the assistant to answer from.
+const UNAVAILABLE: &str = "assistant unavailable";
+
+/// Logs `cause` and returns a 503 with the generic `error`.
+fn ask_unavailable(error: &'static str, cause: &str) -> Response {
+    eprintln!("ask: {error}: {cause}");
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": error }))).into_response()
+}
+
+/// `{LLM_BASE_URL}/chat/completions`, joined onto the URL's path so a query
+/// string (such as `?api-version=...`) stays after the path. A value that is
+/// not a hierarchical URL is joined as text, as before; the request then
+/// fails and is logged like any unreachable upstream.
+fn chat_completions_url(base: &str) -> String {
+    match reqwest::Url::parse(base) {
+        Ok(mut u) if !u.cannot_be_a_base() => {
+            let path = format!("{}/chat/completions", u.path().trim_end_matches('/'));
+            u.set_path(&path);
+            u.to_string()
+        }
+        _ => format!("{}/chat/completions", base.trim_end_matches('/')),
     }
 }
 
@@ -2332,6 +2360,24 @@ headers:
         drop(a);
         drop(b);
         assert!(!pa.exists() && !pb.exists());
+    }
+
+    #[test]
+    fn chat_completions_url_keeps_the_query_after_the_path() {
+        let cases = [
+            ("http://h/v1", "http://h/v1/chat/completions"),
+            ("http://h/v1/", "http://h/v1/chat/completions"),
+            ("http://h", "http://h/chat/completions"),
+            ("http://h:8080/", "http://h:8080/chat/completions"),
+            ("https://h/openai/deployments/d?api-version=2024-06-01", "https://h/openai/deployments/d/chat/completions?api-version=2024-06-01"),
+            ("https://h/v1/?a=1&b=2", "https://h/v1/chat/completions?a=1&b=2"),
+            ("https://h/v1?a=1#f", "https://h/v1/chat/completions?a=1#f"),
+        ];
+        for (base, want) in cases {
+            assert_eq!(chat_completions_url(base), want, "{base}");
+        }
+        // Not a hierarchical URL: joined as text, unchanged from before.
+        assert_eq!(chat_completions_url("not a url/"), "not a url/chat/completions");
     }
 
     #[test]

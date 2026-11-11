@@ -202,7 +202,7 @@ fn stalled_bodies_do_not_take_the_ask_slots() {
     // No model is configured, so a request that gets a slot ends at that check.
     let resp = ask(&srv.addr, None);
     assert!(!resp.contains("server busy"), "{resp}");
-    assert!(resp.contains("LLM not configured"), "{resp}");
+    assert!(resp.contains("assistant not configured"), "{resp}");
 }
 
 #[test]

@@ -279,6 +279,16 @@ Keys are fetched with a 5 s timeout, a 64 KB cap, no redirects, and https only, 
 Startup: a server without `IAP_AUDIENCE` is a public origin, and a public origin refuses to start (exit 1, before it listens) over a dist that holds drafts: a `dist/preview` entry of any kind or letter case (`DRAFTS=1` and `SITE_PREVIEW_THEMES` builds write it), or `dist/.post-cms-drafts`, the marker every `DRAFTS=1` build writes so a deploy that strips `preview/` is still caught (the public pages of a drafts build differ too: plugins are skipped). The message names what it found: `refusing to start: <dist> holds a drafts or preview build (dist/preview) and IAP_AUDIENCE is unset, so this is a public origin, which must never serve drafts. ...`. Public or preview comes from configuration only, never a request, and anything short of a valid `IAP_AUDIENCE` (unset, empty, a misspelled name) counts as public, so a config mistake fails closed. Set `IAP_AUDIENCE` on the preview service only. A set but malformed `IAP_AUDIENCE`, or an `IAP_JWKS_URL` that is not https, refuses to start. Handlers that need the signed-in user (for example an approval step) take the `iap::VerifiedIdentity` extractor, which holds the verified `email` and `sub`, or `None`.
 
 
+**Not configured.** `/api/ask` answers 503 with a generic body and logs the specific cause as one `ask: ` line on stderr, so a public origin never tells a caller which setting is missing:
+
+| Cause (logged) | Body |
+|---|---|
+| `LLM_API_KEY` is set but empty | `{"error":"assistant not configured"}` |
+| `LLM_BASE_URL` or `LLM_MODEL` unset or empty | `{"error":"assistant not configured"}` |
+| `dist/posts` has no markdown | `{"error":"assistant unavailable"}` |
+
+The request goes to `LLM_BASE_URL` with `/chat/completions` added to its path, so a query string stays at the end: `https://llm.example.com/v1?api-version=1` posts to `https://llm.example.com/v1/chat/completions?api-version=1`.
+
 **Upstream errors.** When the model call fails, `/api/ask` returns a fixed message and never the upstream's own error text, which can name `LLM_BASE_URL`, internal hosts or headers:
 
 | Failure | Status | Body |
