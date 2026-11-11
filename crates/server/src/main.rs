@@ -37,10 +37,16 @@ fn cache_policy() -> &'static CachePolicy {
 #[derive(Clone)]
 struct StaticDir(PathBuf);
 
-/// Map a dist file extension to its content type. Cache-Control comes from
-/// [`cache::CachePolicy::class_for_file`].
+/// A file's extension in ASCII lowercase, so `.SVG` and `.svg` are served
+/// alike.
+fn lower_ext(path: &StdPath) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
+}
+
+/// Map a dist file extension, in any case, to its content type.
+/// Cache-Control comes from [`cache::CachePolicy::class_for_file`].
 fn content_type_for(path: &StdPath) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
+    match lower_ext(path).as_deref() {
         Some("html") | Some("htm") => "text/html; charset=utf-8",
         Some("xml") => "application/xml",
         Some("txt") => "text/plain; charset=utf-8",
@@ -51,7 +57,9 @@ fn content_type_for(path: &StdPath) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("js") => "application/javascript",
         Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
+        // `.svgz` is gzip-compressed SVG: sent with `Content-Encoding: gzip`
+        // (see [`serve_with`]), so it gets the same type and sandbox as `.svg`.
+        Some("svg") | Some("svgz") => "image/svg+xml",
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
@@ -310,7 +318,7 @@ fn router(state: StaticDir) -> Router {
         // /mcp and /api/ask, including the 405 the router sends for other
         // methods. Runs after everything site.yaml sets.
         .layer(axum::middleware::from_fn(private_response_headers))
-        // nosniff on every response, and the SVG sandbox policy whatever
+        // nosniff on every response, and the SVG/XML sandbox policy whatever
         // site.yaml set. Outermost, so it runs last.
         .layer(axum::middleware::from_fn(content_headers))
         .with_state(state)
@@ -624,7 +632,7 @@ fn with_site_headers(cfg: &SiteHeaders, path: &str, mut resp: Response) -> Respo
     for (name, value) in cfg.resolve(path) {
         resp.headers_mut().insert(name, value);
     }
-    // A site-wide Content-Security-Policy must not replace the SVG sandbox.
+    // A site-wide Content-Security-Policy must not replace the SVG/XML sandbox.
     enforce_content_headers(resp.headers_mut());
     resp
 }
@@ -751,10 +759,12 @@ fn harden(resp: &mut Response) {
     enforce_content_headers(headers);
 }
 
-/// The policy every SVG response carries. An SVG opened directly (address
-/// bar, `<iframe>`, `<object>`) is a document that can run script with the
-/// site's origin; as `<img>` or a CSS image the browser ignores the response
+/// The policy every SVG or XML response carries. An SVG opened directly
+/// (address bar, `<iframe>`, `<object>`) is a document that can run script
+/// with the site's origin, and so is XML that uses the SVG or XHTML
+/// namespace; as `<img>` or a CSS image the browser ignores the response
 /// CSP and already runs no script, so rendering there does not change.
+/// Feed readers and crawlers ignore CSP, so feeds and sitemaps read the same.
 /// - `default-src 'none'`: no script, fetch, frames, fonts or outside images.
 /// - `style-src 'unsafe-inline'`: `<style>` and `style=""` keep drawing the
 ///   icon the same way when it is opened directly; CSS cannot run script.
@@ -765,22 +775,25 @@ fn harden(resp: &mut Response) {
 ///   or top-level navigation.
 const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
 
-/// True when a Content-Type names SVG, whatever its case or parameters.
-fn is_svg(content_type: Option<&HeaderValue>) -> bool {
+/// True when a Content-Type names an XML document a browser may render as
+/// one, whatever its case or parameters: `image/svg+xml`, `application/xml`,
+/// `text/xml`, and any other `+xml` type (RSS, Atom, XHTML).
+fn is_xml_document(content_type: Option<&HeaderValue>) -> bool {
     content_type
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').next())
-        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("image/svg+xml"))
+        .map(|essence| essence.trim().to_ascii_lowercase())
+        .is_some_and(|e| e == "application/xml" || e == "text/xml" || e.ends_with("+xml"))
 }
 
 /// Headers no site rule or handler may drop: `nosniff` on every response,
-/// and on an SVG the sandbox policy as the first Content-Security-Policy.
+/// and on SVG or XML the sandbox policy as the first Content-Security-Policy.
 /// A policy site.yaml set for the same path stays as a second header;
 /// browsers enforce every CSP header they get, so the result is never looser
 /// than [`SVG_CSP`]. Idempotent.
 fn enforce_content_headers(headers: &mut HeaderMap) {
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    if !is_svg(headers.get(header::CONTENT_TYPE)) {
+    if !is_xml_document(headers.get(header::CONTENT_TYPE)) {
         return;
     }
     let others: Vec<HeaderValue> = headers
@@ -847,12 +860,10 @@ fn serve_with(policy: &CachePolicy, root: &PathBuf, rel: &str, accept_gzip: bool
 
     // Prefer the precompressed sibling when the client can decode gzip.
     let gz_path = PathBuf::from(format!("{}.gz", file.display()));
-    let compressible = file
-        .extension()
-        .and_then(|e| e.to_str())
-        .map_or(false, |e| {
-            ["html", "htm", "css", "js", "json", "xml", "txt", "svg", "md"].contains(&e)
-        });
+    let ext = lower_ext(&file);
+    let compressible = ext.as_deref().is_some_and(|e| {
+        ["html", "htm", "css", "js", "json", "xml", "txt", "svg", "md"].contains(&e)
+    });
     if accept_gzip && compressible && gz_path.exists() && exact_case(root, &format!("{file_rel}.gz")) {
         match std::fs::read(&gz_path) {
             Ok(bytes) => {
@@ -874,6 +885,9 @@ fn serve_with(policy: &CachePolicy, root: &PathBuf, rel: &str, accept_gzip: bool
             let headers = resp.headers_mut();
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
             headers.insert(header::CACHE_CONTROL, cache_control);
+            if ext.as_deref() == Some("svgz") {
+                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            }
             harden(&mut resp);
             resp
         }
@@ -1862,12 +1876,75 @@ mod tests {
     #[test]
     fn svg_detection_ignores_case_and_parameters() {
         for v in ["image/svg+xml", "IMAGE/SVG+XML", "image/svg+xml; charset=utf-8", " image/svg+xml ;x=1"] {
-            assert!(is_svg(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
+            assert!(is_xml_document(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
         }
-        for v in ["image/svg", "image/png", "text/html; charset=utf-8", "image/svg+xmlx"] {
-            assert!(!is_svg(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
+        for v in ["application/xml", "Text/XML; charset=utf-8", "application/rss+xml", "application/atom+xml"] {
+            assert!(is_xml_document(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
         }
-        assert!(!is_svg(None));
+        for v in ["image/svg", "image/png", "text/html; charset=utf-8", "image/svg+xmlx", "application/xmlx", "application/json"] {
+            assert!(!is_xml_document(Some(&HeaderValue::from_str(v).unwrap())), "{v}");
+        }
+        assert!(!is_xml_document(None));
+    }
+
+    /// Extensions match in any case: `.SVG` and `.Svg` are SVG, with nosniff
+    /// and the sandbox, plain or precompressed.
+    #[test]
+    fn svg_extension_case_does_not_matter() {
+        assert_eq!(content_type_for(StdPath::new("a/B.PNG")), "image/png");
+        assert_eq!(content_type_for(StdPath::new("a/b.HTML")), "text/html; charset=utf-8");
+        let root = test_dir("postcms-svg-case-");
+        for name in ["X.SVG", "y.Svg"] {
+            std::fs::write(root.join(name), "<svg/>").unwrap();
+            std::fs::write(root.join(format!("{name}.gz")), "gz").unwrap();
+            for gzip in [false, true] {
+                let r = serve(&root, name, gzip);
+                assert_eq!(r.status(), StatusCode::OK, "{name}");
+                assert_eq!(r.headers()[header::CONTENT_TYPE], "image/svg+xml", "{name}");
+                assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(csps(&r), [SVG_CSP], "{name} gzip {gzip}");
+            }
+            assert_eq!(serve(&root, name, true).headers()[header::CONTENT_ENCODING], "gzip", "{name}");
+        }
+    }
+
+    /// `.svgz` (any case) is gzip-compressed SVG: sent as SVG with
+    /// `Content-Encoding: gzip`, nosniff and the sandbox, whatever the
+    /// client's Accept-Encoding, since there is no plain copy to send.
+    #[test]
+    fn svgz_is_gzip_encoded_svg_with_the_sandbox() {
+        let root = test_dir("postcms-svgz-");
+        for name in ["x.svgz", "Y.SVGZ"] {
+            std::fs::write(root.join(name), "gz").unwrap();
+            for gzip in [false, true] {
+                let r = serve(&root, name, gzip);
+                assert_eq!(r.status(), StatusCode::OK, "{name}");
+                assert_eq!(r.headers()[header::CONTENT_TYPE], "image/svg+xml", "{name}");
+                assert_eq!(r.headers()[header::CONTENT_ENCODING], "gzip", "{name}");
+                assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(csps(&r), [SVG_CSP], "{name} gzip {gzip}");
+            }
+        }
+    }
+
+    /// XML (feeds, sitemaps, files in public/) can carry SVG or XHTML that
+    /// runs script when opened directly, so it gets the same sandbox, plain
+    /// or precompressed, in any extension case.
+    #[test]
+    fn xml_responses_carry_the_sandbox() {
+        let root = test_dir("postcms-xml-");
+        for name in ["feed.xml", "Sitemap.XML"] {
+            std::fs::write(root.join(name), "<x/>").unwrap();
+            std::fs::write(root.join(format!("{name}.gz")), "gz").unwrap();
+            for gzip in [false, true] {
+                let r = serve(&root, name, gzip);
+                assert_eq!(r.status(), StatusCode::OK, "{name}");
+                assert_eq!(r.headers()[header::CONTENT_TYPE], "application/xml", "{name}");
+                assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(csps(&r), [SVG_CSP], "{name} gzip {gzip}");
+            }
+            assert_eq!(serve(&root, name, true).headers()[header::CONTENT_ENCODING], "gzip", "{name}");
+        }
     }
 
     /// A site-wide policy (a common page CSP that allows scripts from
@@ -2682,8 +2759,8 @@ headers:
         }
     }
 
-    /// Direct SVG requests through the router, GET and HEAD, get the type,
-    /// nosniff and the sandbox; other files get no CSP from the server.
+    /// Direct SVG and XML requests through the router, GET and HEAD, get the
+    /// type, nosniff and the sandbox; other files get no CSP from the server.
     #[tokio::test]
     async fn router_serves_svg_with_the_sandbox() {
         for method in ["GET", "HEAD"] {
@@ -2695,7 +2772,13 @@ headers:
                 assert_eq!(csps(&r), [SVG_CSP], "{method} {path}");
             }
         }
-        for path in ["/assets/site/logo.png", "/assets/site/app.css", "/signup/"] {
+        for method in ["GET", "HEAD"] {
+            let r = call(method, "/sitemap.xml").await;
+            assert_eq!(r.status(), StatusCode::OK, "{method}");
+            assert_eq!(r.headers()[header::CONTENT_TYPE], "application/xml");
+            assert_eq!(csps(&r), [SVG_CSP], "{method} /sitemap.xml");
+        }
+        for path in ["/assets/site/logo.png", "/assets/site/app.css", "/signup/", "/robots.txt"] {
             assert!(csps(&call("GET", path).await).is_empty(), "{path}");
         }
     }
