@@ -9,48 +9,31 @@ cargo audit                                  # RustSec advisory database
 osv-scanner scan source --lockfile Cargo.lock
 ```
 
-A vulnerability is fixed by upgrading the crate. Two unmaintained-crate
-warnings remain and are accepted for now; the reasoning is below. Review them
+A vulnerability is fixed by upgrading the crate. One unmaintained-crate
+warning remains and is accepted for now; the reasoning is below. Review it
 whenever a dependency named here gets a release.
 
-### Accepted: `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained)
+### YAML parser: `yaml_serde`
 
-- Pulled in by `serde_yaml` 0.9 (also deprecated), used by both crates to read
-  `site.yaml`, `redirects.yaml`, collection schemas and front matter.
-- Exposure: `build-site` and `server` parse YAML from files under the site
-  root (`site.yaml`, `redirects.yaml`, schemas, each item's `meta.yaml`).
-  Neither parses YAML from a request body or an upload. Two writers put
-  outside text into those files before `build-site` reads them back:
-  - CMS content. A Sanity source fetches documents as JSON and writes each
-    document's fields to `<collection>/<slug>/meta.yaml` with
-    `serde_yaml::to_string` (`crates/build/src/sanity.rs`); the same build
-    then parses those files (`crates/build/src/main.rs`). CMS editors control
-    the string contents, but the serializer emits them as quoted or escaped
-    scalars, so libyaml receives YAML the engine generated, with editor text
-    only inside scalar values. Editors cannot add keys, tags, anchors or
-    documents; `materialize_escapes_cms_strings_in_meta_yaml` in
-    `sanity.rs` checks this with strings shaped like YAML structure.
-  - MCP tools. `mcp/server.py` writes `meta.yaml` from values the calling
-    agent supplies, an agent that already has write access to the site
-    repository. Scalars are JSON-quoted (`_yaml_value`); list items are
-    written unquoted.
-- Why not replace it now: the drop-in forks (`serde_yaml_ng`, `serde_norway`)
-  still run the same c2rust translation of libyaml (`serde_yaml_ng` uses this
-  very crate; `unsafe-libyaml-norway` has had no release since 2024-12), so
-  they move the warning without removing the code it is about. The safe-Rust
-  parsers the advisory suggests (`serde-saphyr`, `noyalib`) have no
-  `serde_yaml::Value` equivalent, so switching touches every YAML call site in
-  both crates and can change how existing sites parse (tags, anchors,
-  duplicate keys, number and boolean forms). That belongs in its own change,
-  checked by comparing parsed output over real site data.
-- Replace `serde_yaml` (or revisit this note) when any of these holds:
-  - YAML from outside the site repository reaches the parser as raw text
-    (a request, an upload, a fetched `.yaml` file, a CMS field copied into
-    YAML verbatim).
-  - CMS-controlled or other outside strings are written into YAML without
-    escaping, including through a new writer.
-  - A RustSec advisory reports an actual bug in `unsafe-libyaml`.
-  - The YAML layer is replaced for other reasons.
+- `serde_yaml` 0.9 is deprecated and pulled in `unsafe-libyaml`
+  (RUSTSEC-2024-0449, unmaintained). The workspace now uses `yaml_serde`, the
+  YAML Organization's maintained continuation of `serde_yaml`, with its
+  maintained `libyaml-rs` parser. The workspace dependency keeps the name
+  `serde_yaml` (`package = "yaml_serde"`), so call sites are unchanged.
+- It is the same libyaml translation with the same `Value` API, so existing
+  sites parse the same way; the switch was checked by building a real site
+  with the old and new engine and comparing `dist/` byte for byte.
+- Exposure is unchanged: `build-site` and `server` parse YAML only from files
+  under the site root (`site.yaml`, `redirects.yaml`, schemas, each item's
+  `meta.yaml`), never from a request body or an upload. A Sanity source
+  writes CMS fields into `meta.yaml` with `serde_yaml::to_string`
+  (`crates/build/src/sanity.rs`), which emits editor text only inside quoted
+  or escaped scalars; `materialize_escapes_cms_strings_in_meta_yaml` checks
+  this. `mcp/server.py` writes `meta.yaml` from values an agent with write
+  access to the site repository supplies.
+- Revisit if YAML from outside the site repository reaches the parser as raw
+  text, if outside strings are written into YAML without escaping, or if an
+  advisory names `yaml_serde` or `libyaml-rs`.
 
 ### Accepted: `paste` (RUSTSEC-2024-0436, unmaintained)
 
@@ -58,7 +41,8 @@ whenever a dependency named here gets a release.
   and ships no code in `build-site` or `server`.
 - Pulled in transitively by `image` (through `exr` and `pulp`, and through
   `ravif` and `rav1e`), `rav1d`, and `fastembed` (through `tokenizers`).
-  post-cms does not depend on it directly, and each of those is at its latest
-  release compatible with our version requirements.
+  post-cms does not depend on it directly. The latest releases of `pulp`,
+  `rav1e`, `rav1d` and `tokenizers` all still require `paste`, so no upgrade
+  removes it, and `tokenizers` is required by `fastembed` (semantic search).
 - Revisit when: those crates move to `pastey` or drop the macro; then
   `cargo update` removes it.
