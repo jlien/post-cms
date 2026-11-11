@@ -68,7 +68,7 @@ The origin server never serves the marker file.
 
 ### Embeddings
 
-`dist/embeddings.json` holds one vector per text chunk (about 700 characters) of every published post and indexable collection item. The build sends the chunks to the model `POSTCMS_EMBED_BATCH` at a time (default 32, a whole number from 1 to 128), so peak memory follows the batch size, not the number of chunks. An invalid `POSTCMS_EMBED_BATCH` fails the build before `dist/` is touched. The vectors are the same at any batch size within float rounding (under 1e-6 per component).
+`dist/embeddings.json` holds one vector per text chunk (about 700 characters) of every published post and indexable collection item. The build sends the chunks to the model `POSTCMS_EMBED_BATCH` at a time (default 32, a whole number from 1 to 128), so peak memory follows the batch size, not the number of chunks. An invalid `POSTCMS_EMBED_BATCH` fails the build before `dist/` is touched. The vectors are the same at any batch size within float rounding (under 1e-6 per component). The server parses `dist/embeddings.json` once, on the first `/api/ask` that uses it, and again only when the file changes (its length, modification time or inode), so a `dist/` replaced without a restart is still picked up.
 
 Memory grows about linearly with the batch, and above 16 the speed stays about the same. Peak RSS of a whole build of a 2,879-chunk site on an Apple Silicon Mac (`/usr/bin/time -l`):
 
