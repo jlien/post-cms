@@ -549,7 +549,18 @@ fn client_ip(headers: &HeaderMap, addr: SocketAddr, hops: usize) -> IpAddr {
     entries[entries.len() - hops].parse().unwrap_or(addr.ip())
 }
 
-/// Fixed-window counter per client IP. Returns (allowed, remaining, retry_after_secs).
+/// Rate-limit bucket for a client address. An IPv6 client is usually given a
+/// whole /64 and can rotate through it freely, so IPv6 shares one bucket per
+/// /64 prefix. IPv4, including IPv4-mapped IPv6 (::ffff:a.b.c.d), keys on the
+/// full IPv4 address.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+    }
+}
+
+/// Fixed-window counter per client (see `rate_key`). Returns (allowed, remaining, retry_after_secs).
 fn rate_limit(ip: IpAddr) -> (bool, u32, u64) {
     let limit = rate_limit_per_min();
     let map = RATE_BUCKETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -559,7 +570,7 @@ fn rate_limit(ip: IpAddr) -> (bool, u32, u64) {
     if map.len() > 10_000 {
         map.retain(|_, (_, window_start)| now.duration_since(*window_start).as_secs() < RATE_WINDOW_SECS);
     }
-    let entry = map.entry(ip).and_modify(|(count, start)| {
+    let entry = map.entry(rate_key(ip)).and_modify(|(count, start)| {
         if now.duration_since(*start).as_secs() >= RATE_WINDOW_SECS {
             *count = 0;
             *start = now;
@@ -1793,6 +1804,36 @@ mod tests {
         assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
         h.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip, 35.191.0.1"));
         assert_eq!(super::client_ip(&h, peer, 2), peer.ip());
+    }
+
+    #[test]
+    fn rate_key_groups_ipv6_by_slash_64_and_keeps_ipv4() {
+        let key = |s: &str| super::rate_key(s.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("198.51.100.7"), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_ne!(key("198.51.100.7"), key("198.51.100.8"));
+        // IPv4-mapped IPv6 is the IPv4 address, not the ::ffff:0:0/64 bucket.
+        assert_eq!(key("::ffff:198.51.100.7"), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_ne!(key("::ffff:198.51.100.7"), key("::ffff:198.51.100.8"));
+    }
+
+    #[test]
+    fn rate_limit_shares_one_bucket_across_an_ipv6_slash_64() {
+        // Addresses unique to this test, so the shared bucket map is not touched by others.
+        let (ok, first, _) = super::rate_limit("2001:db8:e74:1::1".parse().unwrap());
+        assert!(ok);
+        let (ok, second, _) = super::rate_limit("2001:db8:e74:1:dead:beef:0:2".parse().unwrap());
+        assert!(ok);
+        assert_eq!(second + 1, first);
+        // Another /64 starts its own bucket.
+        let (_, other, _) = super::rate_limit("2001:db8:e74:2::1".parse().unwrap());
+        assert_eq!(other, first);
+        // IPv4 addresses stay separate buckets.
+        let (_, v4a, _) = super::rate_limit("192.0.2.74".parse().unwrap());
+        let (_, v4b, _) = super::rate_limit("192.0.2.75".parse().unwrap());
+        assert_eq!(v4a, v4b);
     }
 
     use super::*;
